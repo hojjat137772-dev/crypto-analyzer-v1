@@ -527,6 +527,153 @@ def money(v):
         return f"{v:.4f}"
     return f"{v:.8f}"
 
+
+# -------------------- Market Scanner --------------------
+
+STABLE_BASES = {
+    "USDT", "USDC", "FDUSD", "BUSD", "DAI", "TUSD", "USDE", "USDD",
+    "USD", "EUR", "TRY", "IRT", "RLS"
+}
+
+
+def base_asset(symbol):
+    s = str(symbol).upper().replace("-", "").replace("_", "")
+    for q in ["USDT", "USDC", "FDUSD", "BUSD", "USDE", "USDD", "TUSD", "IRT", "RLS"]:
+        if s.endswith(q) and len(s) > len(q):
+            return s[:-len(q)], q
+    return s, ""
+
+
+def scanner_candidates(exchange, markets, limit=20):
+    """Return a stable, reasonably sized universe for the scanner."""
+    cleaned = []
+    for m in markets:
+        m = str(m).upper().replace("-", "").replace("_", "")
+        base, quote = base_asset(m)
+        if not base or base in STABLE_BASES:
+            continue
+        # For local exchanges prefer USDT/IRT markets; for Binance prefer USDT.
+        if exchange == "Binance" and quote != "USDT":
+            continue
+        if exchange in {"والکس", "نوبیتکس", "تبدیل"} and quote not in {"USDT", "IRT", "RLS"}:
+            continue
+        cleaned.append(m)
+
+    # Keep common liquid symbols first, then fill from the exchange list.
+    preferred = [
+        "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "BNBUSDT",
+        "DOGEUSDT", "ADAUSDT", "AVAXUSDT", "LINKUSDT", "TRXUSDT",
+        "DOTUSDT", "MATICUSDT", "LTCUSDT", "SHIBUSDT", "ATOMUSDT",
+    ]
+    ordered = [x for x in preferred if x in cleaned]
+    ordered += [x for x in cleaned if x not in ordered]
+    return ordered[:limit]
+
+
+def scanner_action(score):
+    if score is None:
+        return "داده ناکافی"
+    if score >= 80:
+        return "🟢 شرایط صعودی قوی"
+    if score >= 68:
+        return "🟡 شرایط صعودی مشروط"
+    if score <= 35:
+        return "🔴 شرایط نزولی"
+    return "⚪ خنثی"
+
+
+def scan_one_market(exchange, symbol, scan_tfs):
+    """Analyze one market without changing the main analyzer state."""
+    scores = []
+    tf_scores = {}
+    latest_price = np.nan
+    atr_value = np.nan
+    support = np.nan
+    resistance = np.nan
+
+    for tf_name, weight in scan_tfs:
+        try:
+            df = get_candles(exchange, symbol, tf_name)
+            score, _, ind = timeframe_score(df)
+            if len(ind) < 10:
+                continue
+            scores.append((score, weight))
+            tf_scores[tf_name] = score
+            last = ind.iloc[-1]
+            latest_price = float(last["close"])
+            atr_value = float(last["atr"])
+            support, resistance = support_resistance(ind, 60)
+        except Exception:
+            tf_scores[tf_name] = None
+
+    if not scores:
+        raise RuntimeError("داده تکنیکال کافی نیست")
+
+    score = round(sum(s * w for s, w in scores) / sum(w for _, w in scores))
+    try:
+        latest_price = float(get_price(exchange, symbol))
+    except Exception:
+        pass
+
+    if not np.isfinite(latest_price):
+        raise RuntimeError("قیمت در دسترس نیست")
+
+    if not np.isfinite(atr_value) or atr_value <= 0:
+        atr_value = latest_price * 0.02
+    if not np.isfinite(support) or support <= 0:
+        support = latest_price - 1.5 * atr_value
+    if not np.isfinite(resistance) or resistance <= 0:
+        resistance = latest_price + 2.0 * atr_value
+
+    sl = max(support * 0.995, latest_price - 1.5 * atr_value)
+    if sl >= latest_price:
+        sl = latest_price * 0.97
+    risk = max(latest_price - sl, latest_price * 0.01)
+    tp1 = latest_price + 1.5 * risk
+    tp2 = latest_price + 2.5 * risk
+    if resistance > latest_price and resistance < tp1:
+        tp1 = max(latest_price + risk, resistance * 0.995)
+
+    return {
+        "بازار": symbol,
+        "امتیاز": score,
+        "وضعیت": scanner_action(score),
+        "قیمت": latest_price,
+        "ورود مرجع": latest_price,
+        "حدضرر": sl,
+        "حدسود 1": tp1,
+        "حدسود 2": tp2,
+        "حمایت": support,
+        "مقاومت": resistance,
+        "15m": tf_scores.get("15m"),
+        "1h": tf_scores.get("1h"),
+        "4h": tf_scores.get("4h"),
+        "1d": tf_scores.get("1d"),
+    }
+
+
+def run_scanner(exchange, markets, scan_tfs, limit):
+    candidates = scanner_candidates(exchange, markets, limit)
+    rows = []
+    progress = st.progress(0, text="شروع اسکن بازار...")
+    total = len(candidates)
+    for i, symbol in enumerate(candidates, 1):
+        try:
+            rows.append(scan_one_market(exchange, symbol, scan_tfs))
+        except Exception as exc:
+            rows.append({
+                "بازار": symbol,
+                "امتیاز": None,
+                "وضعیت": f"خطا: {str(exc)[:45]}",
+            })
+        progress.progress(i / max(total, 1), text=f"اسکن {symbol} — {i}/{total}")
+    progress.empty()
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    df["امتیاز_sort"] = pd.to_numeric(df["امتیاز"], errors="coerce")
+    return df.sort_values("امتیاز_sort", ascending=False, na_position="last").drop(columns=["امتیاز_sort"])
+
 # -------------------- UI / Dropdowns --------------------
 
 with st.sidebar:
@@ -577,10 +724,70 @@ with st.sidebar:
     analyze = st.button("🚀 تحلیل حرفه‌ای", use_container_width=True)
 
     st.divider()
+    st.header("🔎 اسکن بازار")
+    scan_count = st.slider("تعداد بازارها", min_value=5, max_value=30, value=15, step=5)
+    scan_mode = st.selectbox(
+        "نوع اسکن",
+        ["سریع (1h + 4h)", "چندتایم‌فریمی کامل (15m + 1h + 4h + 1d)"],
+        index=0,
+    )
+    scan_button = st.button("🔎 شروع اسکن", use_container_width=True)
+
+    st.divider()
     st.caption(
         "🔒 فقط داده عمومی بازار استفاده می‌شود. "
         "این نسخه سفارش خرید/فروش ثبت نمی‌کند."
     )
+
+if scan_button:
+    if not markets:
+        st.error("لیست بازارهای این صرافی در دسترس نیست؛ اسکن انجام نشد.")
+    else:
+        scan_tfs = [("1h", 0.45), ("4h", 0.55)]
+        if scan_mode.startswith("چندتایم‌فریمی"):
+            scan_tfs = [("15m", 0.15), ("1h", 0.25), ("4h", 0.35), ("1d", 0.25)]
+
+        st.markdown("## 🔎 اسکن بازار")
+        st.caption(
+            f"صرافی: {exchange} | تعداد بازار: {scan_count} | "
+            f"تایم‌فریم: {', '.join(tf for tf, _ in scan_tfs)}"
+        )
+        with st.spinner("در حال دریافت داده و محاسبه امتیاز بازارها..."):
+            scan_df = run_scanner(exchange, markets, scan_tfs, scan_count)
+
+        if scan_df.empty:
+            st.warning("نتیجه‌ای برای اسکن به دست نیامد.")
+        else:
+            valid_scan = scan_df[pd.to_numeric(scan_df["امتیاز"], errors="coerce").notna()].copy()
+            if not valid_scan.empty:
+                st.success(f"اسکن تمام شد؛ {len(valid_scan)} بازار با داده معتبر بررسی شد.")
+
+                # Highlight the three highest-scoring markets without claiming a trading recommendation.
+                top = valid_scan.head(3)
+                st.markdown("### 📌 ۳ بازار با بالاترین امتیاز محاسباتی")
+                cols = st.columns(min(3, len(top)))
+                for col, (_, row) in zip(cols, top.iterrows()):
+                    with col:
+                        st.markdown(f"**{row['بازار']}**")
+                        st.metric("امتیاز", f"{int(row['امتیاز'])}/100")
+                        st.write(row["وضعیت"])
+                        if pd.notna(row.get("قیمت")):
+                            st.caption(f"قیمت: {money(float(row['قیمت']))}")
+
+            display_cols = [
+                "بازار", "امتیاز", "وضعیت", "قیمت", "ورود مرجع",
+                "حدضرر", "حدسود 1", "حدسود 2", "حمایت", "مقاومت",
+            ]
+            display_cols = [c for c in display_cols if c in scan_df.columns]
+            view = scan_df[display_cols].copy()
+            for c in ["قیمت", "ورود مرجع", "حدضرر", "حدسود 1", "حدسود 2", "حمایت", "مقاومت"]:
+                if c in view.columns:
+                    view[c] = view[c].apply(lambda x: money(float(x)) if pd.notna(x) else "-")
+            st.dataframe(view, use_container_width=True, hide_index=True)
+            st.caption(
+                "امتیاز اسکن بر پایه اندیکاتورهای تکنیکال و تایم‌فریم‌های انتخاب‌شده است؛ "
+                "نتیجه اسکن به‌تنهایی تضمین‌کننده نتیجه معامله نیست."
+            )
 
 if not symbol:
     st.warning("یک بازار انتخاب کن.")

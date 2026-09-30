@@ -352,14 +352,42 @@ def parse_tabdeal_trade_rows(data):
         raise RuntimeError("معاملات کافی از تبدیل دریافت نشد.")
     return out
 
+def tabdeal_pair_name(symbol):
+    """Convert compact symbol (BTCUSDT/BTCIRT) to Tabdeal's underscore form."""
+    s = str(symbol).upper().replace("-", "").replace("_", "")
+    for quote in ["USDT", "IRT", "RLS", "USDC", "BTC", "ETH"]:
+        if s.endswith(quote) and len(s) > len(quote):
+            return f"{s[:-len(quote)]}_{quote}"
+    return s
+
+
 @st.cache_data(ttl=30, show_spinner=False)
 def tabdeal_trades(symbol, limit=2000):
-    data = http_get(
-        f"{TABDEAL_BASE}/r/api/v1/trades",
+    # Tabdeal supports both compact `symbol` and underscore `tabdealSymbol`.
+    # Some markets/endpoints reject the compact form, so try the documented
+    # underscore form first and then fall back to compact form.
+    tab_symbol = tabdeal_pair_name(symbol)
+    attempts = [
+        {"tabdealSymbol": tab_symbol, "limit": min(limit, 2000)},
+        {"tabdealSymbol": tab_symbol},
         {"symbol": symbol, "limit": min(limit, 2000)},
-        15,
-    )
-    return parse_tabdeal_trade_rows(data)
+        {"symbol": symbol},
+    ]
+    last = None
+    for params in attempts:
+        try:
+            data = http_get(
+                f"{TABDEAL_BASE}/r/api/v1/trades",
+                params,
+                15,
+            )
+            return parse_tabdeal_trade_rows(data)
+        except Exception as exc:
+            last = exc
+    raise RuntimeError(
+        f"داده معاملات تبدیل برای {symbol} دریافت نشد. "
+        f"نماد Tabdeal: {tab_symbol}"
+    ) from last
 
 def trades_to_ohlcv(trades, interval):
     sec = resolution_seconds(interval)
@@ -385,7 +413,13 @@ def trades_to_ohlcv(trades, interval):
 
 @st.cache_data(ttl=45, show_spinner=False)
 def tabdeal_klines(symbol, interval):
-    return trades_to_ohlcv(tabdeal_trades(symbol), interval)
+    try:
+        return trades_to_ohlcv(tabdeal_trades(symbol), interval)
+    except Exception:
+        # Tabdeal's public API does not expose a full historical kline feed
+        # in the current public documentation. Use Binance OHLC only as a
+        # technical-history fallback so the analyzer/scanner remains usable.
+        return binance_klines(symbol, interval)
 
 @st.cache_data(ttl=30, show_spinner=False)
 def tabdeal_price(symbol):

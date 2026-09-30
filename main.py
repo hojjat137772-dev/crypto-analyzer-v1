@@ -9,7 +9,7 @@ import requests
 from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 
-APP_VERSION = "1.2.1"
+APP_VERSION = "1.4.0"
 BINANCE_URLS = [
     "https://api.binance.com",
     "https://api.binance.us",
@@ -92,44 +92,34 @@ def get_nobitex_symbols():
     return rows
 
 def get_wallex_symbols():
-    candidates = [
-        ("/hector/web/v1/markets", {}),
-        ("/v1/markets", {}),
-    ]
-    for path, params in candidates:
-        try:
-            r = SESSION.get(WALLEX_BASE + path, params=params, timeout=15)
-            r.raise_for_status()
-            data = r.json()
-            result = data.get("result") if isinstance(data, dict) else None
-            markets = None
-            if isinstance(result, dict):
-                markets = result.get("markets") or result.get("symbols")
-            if isinstance(markets, dict):
-                markets = list(markets.values())
-            rows = []
-            for m in markets or []:
-                if not isinstance(m, dict):
-                    continue
-                raw_symbol = str(m.get("symbol") or m.get("name") or m.get("pair") or "").upper()
-                base = str(m.get("baseAsset") or m.get("base_asset") or m.get("baseCurrency") or m.get("base") or "").upper()
-                quote = str(m.get("quoteAsset") or m.get("quote_asset") or m.get("quoteCurrency") or m.get("quote") or "").upper()
-                compact = raw_symbol.replace("/", "").replace("-", "").replace("_", "")
-                if not base and compact.endswith("USDT"):
-                    base = compact[:-4]
-                if not quote and compact.endswith("USDT"):
-                    quote = "USDT"
-                is_spot = m.get("is_spot", m.get("isSpot", True))
-                if quote == "USDT" and base and is_spot is not False:
-                    symbol = base + "USDT"
-                    row = _normalize_market(base, "USDT", symbol, "Wallex")
-                    row["market_symbol"] = raw_symbol or symbol
-                    rows.append(row)
-            if rows:
-                return rows
-        except Exception:
-            continue
-    return []
+    # Wallex public spot markets. Use the documented /v1/markets response
+    # where result.symbols is a mapping keyed by the exact market symbol.
+    try:
+        r = SESSION.get(WALLEX_BASE + "/v1/markets", timeout=15)
+        r.raise_for_status()
+        data = r.json()
+        symbols = ((data.get("result") or {}).get("symbols") or {}) if isinstance(data, dict) else {}
+        rows = []
+        if isinstance(symbols, dict):
+            items = symbols.items()
+        elif isinstance(symbols, list):
+            items = [(None, x) for x in symbols]
+        else:
+            items = []
+        for key, m in items:
+            if not isinstance(m, dict):
+                continue
+            raw_symbol = str(m.get("symbol") or key or "").upper().strip()
+            base = str(m.get("baseAsset") or "").upper().strip()
+            quote = str(m.get("quoteAsset") or "").upper().strip()
+            if not raw_symbol or not base or quote != "USDT":
+                continue
+            # Keep the exact Wallex market symbol for the UDF request.
+            rows.append(_normalize_market(base, quote, raw_symbol, "Wallex"))
+            rows[-1]["market_symbol"] = raw_symbol
+        return rows
+    except Exception:
+        return []
 
 def get_all_symbols(source="auto"):
     now = time.time()
@@ -252,28 +242,27 @@ def get_binance_history(symbol: str, interval: str, limit: int):
     return df[["time","open","high","low","close","volume"]].dropna().reset_index(drop=True)
 
 
-def get_history(symbol: str, interval: str = DEFAULT_INTERVAL, limit: int = 300, source: str = "auto"):
+def get_history_with_source(symbol: str, interval: str = DEFAULT_INTERVAL, limit: int = 300, source: str = "auto"):
     symbol = clean_symbol(symbol)
     limit = max(100, min(int(limit), 1000))
     key = f"{source}:{symbol}:{interval}:{limit}"
     now = time.time()
     if key in CACHE and now - CACHE[key]["time"] < CACHE_TTL:
-        return CACHE[key]["df"].copy()
+        cached = CACHE[key]
+        return cached["df"].copy(), cached.get("source", source)
 
-    funcs = {"Binance": get_binance_history, "Wallex": get_wallex_history, "Nobitex": get_nobitex_history}
+    funcs = {
+        "Binance": get_binance_history,
+        "Wallex": get_wallex_history,
+        "Nobitex": get_nobitex_history,
+    }
+
+    # In v1.4, the selected exchange is preferred, but if its candle endpoint
+    # fails, the app automatically tries the other public sources as fallback.
     if source in funcs:
-        order = [source]
+        order = [source] + [x for x in ["Binance", "Wallex", "Nobitex"] if x != source]
     else:
-        # Automatic mode: try every exchange that lists this symbol.
-        # A missing candle series on one exchange must not block the others.
-        rows = [x for x in get_all_symbols("auto") if x["symbol"] == symbol]
-        order = []
-        for row in rows:
-            name = row.get("source")
-            if name in funcs and name not in order:
-                order.append(name)
-        if not order:
-            order = list(funcs.keys())
+        order = ["Binance", "Wallex", "Nobitex"]
 
     errors = []
     for name in order:
@@ -282,15 +271,23 @@ def get_history(symbol: str, interval: str = DEFAULT_INTERVAL, limit: int = 300,
             matches = [x for x in get_all_symbols(name) if x["symbol"] == symbol]
             if matches:
                 market_symbol = matches[0].get("market_symbol", symbol)
+
             df = funcs[name](market_symbol, interval, limit)
             if len(df) >= 50:
-                CACHE[key] = {"time": now, "df": df.copy()}
-                return df
+                CACHE[key] = {"time": now, "df": df.copy(), "source": name}
+                return df, name
         except Exception as exc:
             errors.append(f"{name}: {exc}")
-            if source in funcs:
-                break
-    raise ValueError("داده کندلی از منبع انتخاب‌شده دریافت نشد. " + " | ".join(errors[-3:]))
+
+    raise ValueError(
+        "داده کندلی قابل‌استفاده پیدا نشد. "
+        "هر سه منبع عمومی بررسی شدند. " + " | ".join(errors[-3:])
+    )
+
+
+def get_history(symbol: str, interval: str = DEFAULT_INTERVAL, limit: int = 300, source: str = "auto"):
+    df, _ = get_history_with_source(symbol, interval, limit, source)
+    return df
 
 def ema(s, n):
     return s.ewm(span=n, adjust=False).mean()
@@ -429,7 +426,7 @@ def build_signal(df):
 
 
 def analyze_symbol(symbol: str, interval: str, source: str = "auto"):
-    df = get_history(symbol, interval, 300, source)
+    df, actual_source = get_history_with_source(symbol, interval, 300, source)
 
     df["ema20"] = ema(df["close"], 20)
     df["ema50"] = ema(df["close"], 50)
@@ -447,15 +444,15 @@ def analyze_symbol(symbol: str, interval: str, source: str = "auto"):
 
     result = build_signal(df)
     result["symbol"] = clean_symbol(symbol)
-    result["source"] = source
+    result["source"] = actual_source
+    result["requested_source"] = source
     result["interval"] = interval
     result["interval_text"] = interval_to_text(interval)
     result["updated_at"] = datetime.now(timezone.utc).isoformat()
     return result
 
-
 def run_backtest(symbol: str, interval: str, limit: int = 300, source: str = "auto"):
-    df = get_history(symbol, interval, limit, source)
+    df, actual_source = get_history_with_source(symbol, interval, limit, source)
     df["ema10"] = ema(df["close"], 10)
     df["ema20"] = ema(df["close"], 20)
     df["rsi"] = rsi(df["close"], 14)
@@ -520,7 +517,7 @@ def run_backtest(symbol: str, interval: str, limit: int = 300, source: str = "au
         return {
             "symbol": clean_symbol(symbol),
             "interval": interval,
-            "source": source,
+            "source": actual_source,
             "trades": 0,
             "win_rate": 0,
             "avg_return": 0,
@@ -543,7 +540,7 @@ def run_backtest(symbol: str, interval: str, limit: int = 300, source: str = "au
     return {
         "symbol": clean_symbol(symbol),
         "interval": interval,
-        "source": source,
+        "source": actual_source,
         "trades": len(trades),
         "win_rate": win_rate,
         "avg_return": avg_return,
@@ -553,6 +550,82 @@ def run_backtest(symbol: str, interval: str, limit: int = 300, source: str = "au
         "note": "بک‌تست با کارمزد، اسلیپیج و محدودیت نقدشوندگی محاسبه نشده است.",
     }
 
+
+def _cluster_levels(values, current, side, max_levels=2):
+    vals = sorted([float(v) for v in values if np.isfinite(v)])
+    if side == "support":
+        vals = [v for v in vals if v < current]
+        vals = sorted(vals, reverse=True)
+    else:
+        vals = [v for v in vals if v > current]
+        vals = sorted(vals)
+
+    levels = []
+    tolerance = max(abs(current) * 0.006, 1e-12)
+    for value in vals:
+        if not levels or abs(value - levels[-1]) > tolerance:
+            levels.append(value)
+        if len(levels) >= max_levels:
+            break
+    return levels
+
+
+def chart_payload(symbol: str, interval: str, source: str = "auto"):
+    raw, actual_source = get_history_with_source(symbol, interval, 320, source)
+    df = raw.copy().sort_values("time").reset_index(drop=True)
+
+    if len(df) < 60:
+        raise ValueError("داده کافی برای رسم نمودار وجود ندارد.")
+
+    recent = df.tail(180).copy()
+    current = float(recent["close"].iloc[-1])
+
+    lows = []
+    highs = []
+    w = 3
+    for i in range(w, len(recent) - w):
+        lo = float(recent["low"].iloc[i])
+        hi = float(recent["high"].iloc[i])
+        if lo <= float(recent["low"].iloc[i-w:i+w+1].min()):
+            lows.append(lo)
+        if hi >= float(recent["high"].iloc[i-w:i+w+1].max()):
+            highs.append(hi)
+
+    support_levels = _cluster_levels(lows, current, "support", 2)
+    resistance_levels = _cluster_levels(highs, current, "resistance", 2)
+
+    if not support_levels:
+        support_levels = [float(recent["low"].tail(40).min())]
+    if not resistance_levels:
+        resistance_levels = [float(recent["high"].tail(40).max())]
+
+    # Historical entry/exit markers from the same backtest rules.
+    bt = run_backtest(symbol, interval, limit=320, source=source)
+    trades = bt.get("trades_detail", [])
+
+    candles = []
+    for _, row in recent.iterrows():
+        candles.append({
+            "t": int(pd.Timestamp(row["time"]).timestamp() * 1000),
+            "o": float(row["open"]),
+            "h": float(row["high"]),
+            "l": float(row["low"]),
+            "c": float(row["close"]),
+        })
+
+    return {
+        "symbol": clean_symbol(symbol),
+        "interval": interval,
+        "interval_text": interval_to_text(interval),
+        "source": actual_source,
+        "candles": candles,
+        "support_levels": support_levels,
+        "resistance_levels": resistance_levels,
+        "current_price": current,
+        "trades": trades,
+        "trade_count": len(trades),
+        "note": "نقاط سبز/قرمز مربوط به معاملات تاریخی همین منطق بک‌تست هستند؛ نقطه سبز آخر نیز ورود مرجع فعلی را نشان می‌دهد.",
+    }
 
 def html_page():
     return """<!doctype html>
@@ -579,7 +652,7 @@ button.secondary{background:#344256}
 .row{display:grid;grid-template-columns:2fr 1fr;gap:10px}
 .good{color:#16815c}.bad{color:#c33}.neutral{color:#555}
 ul{line-height:2}
-.small{font-size:12px;color:#6b7280}
+.small{font-size:11px;color:#6b7280}\n.chartbox{background:#0f1722;border-radius:16px;padding:6px;overflow:hidden}\ncanvas{display:block;width:100%;height:380px;touch-action:none}\n.legend{display:flex;gap:12px;flex-wrap:wrap;padding:8px 2px 2px;font-size:11px;color:#cbd5e1}\n.dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-left:4px}.green{background:#16c784}.red{background:#ef5350}.support{background:#38bdf8}.resist{background:#f59e0b}\n.levels{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px}.level{background:#f8fafc;border:1px solid #e7ebf0;border-radius:12px;padding:9px;font-size:11px}\n@media(max-width:600px){canvas{height:320px}}
 pre{white-space:pre-wrap;direction:ltr;text-align:left}
 @media(max-width:600px){.grid,.row{grid-template-columns:1fr}}
 </style>
@@ -588,7 +661,7 @@ pre{white-space:pre-wrap;direction:ltr;text-align:left}
 <div class="wrap">
 <div class="card">
 <h1>تحلیل‌گر بازار کریپتو 🪙</h1>
-<div class="sub">نسخه 1.2.1 — تحلیل تکنیکال، سه منبع داده، مدیریت ریسک و بک‌تست</div>
+<div class="sub">نسخه 1.4.0 — نمودار حرفه‌ای، ورود/خروج، حمایت و مقاومت</div>
 </div>
 
 <div class="card">
@@ -609,8 +682,8 @@ pre{white-space:pre-wrap;direction:ltr;text-align:left}
 <option value="1d">روزانه</option>
 </select>
 </div>
-<div class="small" style="margin-top:8px">فهرست بازارها از Binance، والکس و نوبیتکس جمع می‌شود. تحلیل فقط از داده کندلی قابل‌دریافت استفاده می‌کند.</div>
-<button onclick="analyze()">🔎 تحلیل ارز</button>
+<div class="small" style="margin-top:8px">در حالت خودکار، اگر یک صرافی داده کندلی نداشته باشد، برنامه به منبع بعدی می‌رود. انتخاب مستقیم صرافی فقط همان منبع را بررسی می‌کند.</div>
+<button onclick="analyze()">🔎 تحلیل</button>\n<button onclick="loadChart()">📈 نمودار</button>
 <button class="secondary" onclick="backtest()">🧪 بک‌تست</button>
 <button onclick="scan()">🔍 اسکن بازار</button>
 </div>
@@ -624,6 +697,110 @@ function n(x,d=2){
   return Number(x).toLocaleString("en-US",{maximumFractionDigits:d});
 }
 function card(label,value){return `<div class="item"><div class="label">${label}</div><div class="value">${value}</div></div>`}
+function esc(s){
+  return String(s ?? "").replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[m]));
+}
+async function api(url){
+  const r=await fetch(url);
+  const j=await r.json();
+  if(!r.ok) throw new Error(j.detail||"خطا");
+  return j;
+}
+
+async function loadChart(silent=false){
+  const market=selectedMarket();
+  const i=document.getElementById("interval").value;
+  if(!silent) out.innerHTML='<div class="card">در حال ساخت نمودار...</div>';
+  try{
+    const j=await api(`/chart?symbol=${encodeURIComponent(market.symbol)}&interval=${i}&source=${encodeURIComponent(market.source)}`);
+    const chart=`<div class="card">
+      <h2>📈 نمودار ${esc(j.symbol)} — ${esc(j.interval_text)}</h2>
+      <div class="small">منبع واقعی: ${esc(j.source)} • قیمت فعلی: ${n(j.current_price)}</div>
+      <div class="chartbox">
+        <canvas id="priceChart"></canvas>
+        <div class="legend">
+          <span><i class="dot green"></i>ورود</span>
+          <span><i class="dot red"></i>خروج</span>
+          <span><i class="dot support"></i>حمایت</span>
+          <span><i class="dot resist"></i>مقاومت</span>
+        </div>
+      </div>
+      <div class="levels">
+        <div class="level"><b>حمایت‌ها</b><br>${(j.support_levels||[]).map(x=>n(x)).join(" • ")}</div>
+        <div class="level"><b>مقاومت‌ها</b><br>${(j.resistance_levels||[]).map(x=>n(x)).join(" • ")}</div>
+      </div>
+      <div class="small" style="margin-top:7px">نقاط سبز و قرمز معاملات تاریخی همین استراتژی بک‌تست هستند.</div>
+    </div>`;
+    if(silent) out.innerHTML += chart; else out.innerHTML=chart;
+    requestAnimationFrame(()=>drawChart(j));
+  }catch(e){
+    if(!silent) out.innerHTML=`<div class="card"><b>خطا:</b> ${esc(e.message)}</div>`;
+  }
+}
+
+function drawChart(j){
+  const canvas=document.getElementById("priceChart");
+  if(!canvas) return;
+  const dpr=window.devicePixelRatio||1, rect=canvas.getBoundingClientRect();
+  canvas.width=Math.max(320,rect.width*dpr);
+  canvas.height=Math.max(260,rect.height*dpr);
+  const ctx=canvas.getContext("2d"); ctx.scale(dpr,dpr);
+  const W=rect.width,H=rect.height, cs=j.candles||[];
+  if(!cs.length) return;
+  const pad={l:8,r:62,t:18,b:22}, cw=(W-pad.l-pad.r)/cs.length;
+  let hi=Math.max(...cs.map(x=>x.h)), lo=Math.min(...cs.map(x=>x.l));
+  [...(j.support_levels||[]),...(j.resistance_levels||[])].forEach(v=>{hi=Math.max(hi,v);lo=Math.min(lo,v)});
+  const m=(hi-lo)*0.06||1; hi+=m; lo-=m;
+  const X=i=>pad.l+(i+.5)*cw, Y=v=>pad.t+(hi-v)/(hi-lo)*(H-pad.t-pad.b);
+
+  ctx.fillStyle="#0f1722"; ctx.fillRect(0,0,W,H);
+  ctx.strokeStyle="#263445"; ctx.lineWidth=1;
+  for(let k=0;k<5;k++){
+    const yy=pad.t+k*(H-pad.t-pad.b)/4;
+    ctx.beginPath();ctx.moveTo(pad.l,yy);ctx.lineTo(W-pad.r,yy);ctx.stroke();
+    ctx.fillStyle="#91a0b2";ctx.font="10px Arial";
+    ctx.fillText(n(hi-k*(hi-lo)/4),W-pad.r+5,yy+3);
+  }
+
+  function line(v,label,dash){
+    const yy=Y(v);ctx.save();ctx.setLineDash(dash?[5,5]:[]);
+    ctx.strokeStyle=label==="حمایت"?"#38bdf8":"#f59e0b";ctx.lineWidth=1.2;
+    ctx.beginPath();ctx.moveTo(pad.l,yy);ctx.lineTo(W-pad.r,yy);ctx.stroke();ctx.restore();
+    ctx.fillStyle=label==="حمایت"?"#38bdf8":"#f59e0b";ctx.font="10px Arial";ctx.fillText(label,W-pad.r+5,yy-3);
+  }
+  (j.support_levels||[]).forEach(v=>line(v,"حمایت",true));
+  (j.resistance_levels||[]).forEach(v=>line(v,"مقاومت",true));
+
+  cs.forEach((c,i)=>{
+    const xx=X(i),up=c.c>=c.o,bw=Math.max(1,Math.min(7,cw*.62));
+    ctx.strokeStyle=up?"#16c784":"#ef5350";ctx.fillStyle=ctx.strokeStyle;
+    ctx.beginPath();ctx.moveTo(xx,Y(c.h));ctx.lineTo(xx,Y(c.l));ctx.stroke();
+    const top=Y(Math.max(c.o,c.c)),bot=Y(Math.min(c.o,c.c));
+    ctx.fillRect(xx-bw/2,top,bw,Math.max(1,bot-top));
+  });
+
+  const idx=new Map(cs.map((c,i)=>[String(c.t),i]));
+  function marker(ts,price,color,letter){
+    let i=idx.get(String(ts));
+    if(i===undefined){
+      i=0;let best=Infinity;
+      cs.forEach((c,k)=>{const d=Math.abs(c.t-ts);if(d<best){best=d;i=k;}});
+    }
+    const xx=X(i),yy=Y(price);
+    ctx.fillStyle=color;ctx.beginPath();ctx.arc(xx,yy,5,0,Math.PI*2);ctx.fill();
+    ctx.fillStyle="#fff";ctx.font="bold 8px Arial";ctx.textAlign="center";ctx.fillText(letter,xx,yy+3);ctx.textAlign="start";
+  }
+  (j.trades||[]).forEach(t=>{
+    marker(new Date(t.entry_time).getTime(),t.entry,"#16c784","E");
+    marker(new Date(t.exit_time).getTime(),t.exit,"#ef5350","X");
+  });
+
+  const py=Y(j.current_price);
+  ctx.strokeStyle="#e5e7eb";ctx.setLineDash([2,3]);
+  ctx.beginPath();ctx.moveTo(pad.l,py);ctx.lineTo(W-pad.r,py);ctx.stroke();ctx.setLineDash([]);
+  ctx.fillStyle="#e5e7eb";ctx.font="bold 10px Arial";ctx.fillText(n(j.current_price),W-pad.r+5,py+3);
+}
+
 async function loadSymbols(){
   const select=document.getElementById("symbol");
   const src=document.getElementById("source").value;
@@ -674,7 +851,7 @@ async function analyze(){
     const cls=j.status==="صعودی"?"good":j.status==="نزولی"?"bad":"neutral";
     out.innerHTML=`
     <div class="card">
-      <h2>${j.symbol} — ${j.interval_text}</h2>
+      <h2>${j.symbol} — ${j.interval_text}</h2><div class="small">منبع داده: ${j.source||src}</div>
       <div class="grid">
         ${card("وضعیت",`<span class="${cls}">${j.status}</span>`)}
         ${card("امتیاز سیگنال (0 تا 100)",n(j.score,0))}
@@ -703,7 +880,8 @@ async function analyze(){
       </ul>
       <div class="small">این خروجی ابزار تحلیل است و تضمین نتیجه معامله یا سود نیست.</div>
     </div>`;
-  }catch(e){out.innerHTML=`<div class="card"><b>خطا:</b> ${e.message}</div>`}
+    await loadChart(true);
+  }catch(e){out.innerHTML=`<div class="card"><b>خطا:</b> ${esc(e.message)}</div>`}
 }
 async function backtest(){
   const market=selectedMarket();
@@ -727,7 +905,8 @@ async function backtest(){
       </div>
       <p class="small">${j.note}</p>
     </div>`;
-  }catch(e){out.innerHTML=`<div class="card"><b>خطا:</b> ${e.message}</div>`}
+    await loadChart(true);
+  }catch(e){out.innerHTML=`<div class="card"><b>خطا:</b> ${esc(e.message)}</div>`}
 }
 async function scan(){
   out.innerHTML='<div class="card">در حال اسکن ارزهای USDT...</div>';
@@ -784,6 +963,21 @@ def analyze(
         return JSONResponse({"detail": str(exc)}, status_code=502)
 
 
+@app.get("/chart")
+def chart(
+    symbol: str = Query(DEFAULT_SYMBOL),
+    interval: str = Query(DEFAULT_INTERVAL),
+    source: str = Query("auto"),
+):
+    allowed = {"15m", "1h", "4h", "1d"}
+    if interval not in allowed:
+        return JSONResponse({"detail": "تایم‌فریم نامعتبر است."}, status_code=400)
+    try:
+        return chart_payload(symbol, interval, source)
+    except Exception as exc:
+        return JSONResponse({"detail": str(exc)}, status_code=502)
+
+
 @app.get("/backtest")
 def backtest(
     symbol: str = Query(DEFAULT_SYMBOL),
@@ -804,9 +998,10 @@ def backtest(
 def scan(
     interval: str = Query(DEFAULT_INTERVAL),
     limit: int = Query(20, ge=1, le=50),
+    source: str = Query("auto"),
 ):
     try:
-        symbols = get_all_symbols()
+        symbols = get_all_symbols(source)
 
         # A deterministic first group is used to avoid thousands of API calls.
         # The app remains analysis-only; it never places orders.
@@ -822,7 +1017,7 @@ def scan(
         results = []
         for s in selected:
             try:
-                r = analyze_symbol(s, interval, "auto")
+                r = analyze_symbol(s, interval, source)
                 results.append({
                     "symbol": s,
                     "score": r["score"],

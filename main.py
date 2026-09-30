@@ -179,47 +179,59 @@ def get_nobitex_history(symbol, interval, limit):
 
 
 def get_wallex_history(symbol, interval, limit):
-    # Best-effort adapter for public Wallex candle APIs; if unavailable, caller can fall back.
-    resolutions = {"15m": 15, "1h": 60, "4h": 240, "1d": 1440}
+    # Official Wallex UDF candle endpoint.
+    # Wallex documents 1m, 60m and 1D directly; 15m and 4h are built
+    # locally from smaller supported candles.
     symbol = clean_symbol(symbol)
     now = int(time.time())
-    frm = now - resolutions[interval] * 60 * (limit + 10)
-    endpoints = [
-        "/v1/market/candle",
-        "/v1/market/candles",
-        "/v1/market/candles/history",
-    ]
-    last = None
-    for ep in endpoints:
-        try:
-            r = SESSION.get(WALLEX_BASE + ep, params={
-                "symbol": symbol, "resolution": resolutions[interval], "from": frm, "to": now, "limit": limit
-            }, timeout=20)
-            r.raise_for_status()
-            data = r.json()
-            raw = data.get("result") or data.get("candles") or data.get("data")
-            if isinstance(raw, dict):
-                raw = raw.get("candles") or raw.get("items") or raw.get("data")
-            if not isinstance(raw, list) or not raw:
-                continue
-            rows=[]
-            for x in raw:
-                if isinstance(x, dict):
-                    t=x.get("time") or x.get("timestamp") or x.get("openTime")
-                    rows.append([t,x.get("open"),x.get("high"),x.get("low"),x.get("close"),x.get("volume",0)])
-                elif isinstance(x, (list,tuple)) and len(x)>=6:
-                    rows.append(x[:6])
-            if not rows: continue
-            df=pd.DataFrame(rows, columns=["time","open","high","low","close","volume"])
-            for c in ["open","high","low","close","volume"]: df[c]=pd.to_numeric(df[c], errors="coerce")
-            t=pd.to_numeric(df["time"], errors="coerce")
-            unit="ms" if t.dropna().max()>10_000_000_000 else "s"
-            df["time"]=pd.to_datetime(t, unit=unit, utc=True, errors="coerce")
-            return df.dropna().sort_values("time").tail(limit).reset_index(drop=True)
-        except Exception as exc:
-            last=exc
-    raise ValueError("والکس برای این نماد/تایم‌فریم داده کندلی قابل دریافت نداد.")
+    if interval == "15m":
+        resolution = "1"
+        source_minutes = 1
+        fetch_limit = limit * 15 + 20
+    elif interval == "1h":
+        resolution = "60"
+        source_minutes = 60
+        fetch_limit = limit + 20
+    elif interval == "4h":
+        resolution = "60"
+        source_minutes = 60
+        fetch_limit = limit * 4 + 20
+    else:
+        resolution = "1D"
+        source_minutes = 1440
+        fetch_limit = limit + 10
 
+    frm = now - source_minutes * 60 * (fetch_limit + 5)
+    r = SESSION.get(WALLEX_BASE + "/v1/udf/history", params={
+        "symbol": symbol,
+        "resolution": resolution,
+        "from": frm,
+        "to": now,
+        "countback": fetch_limit,
+    }, timeout=20)
+    r.raise_for_status()
+    data = r.json()
+    if data.get("s") != "ok" or not data.get("t"):
+        raise ValueError("والکس برای این نماد/تایم‌فریم داده کافی ندارد.")
+
+    df = pd.DataFrame({
+        "time": pd.to_datetime(data["t"], unit="s", utc=True),
+        "open": pd.to_numeric(data["o"], errors="coerce"),
+        "high": pd.to_numeric(data["h"], errors="coerce"),
+        "low": pd.to_numeric(data["l"], errors="coerce"),
+        "close": pd.to_numeric(data["c"], errors="coerce"),
+        "volume": pd.to_numeric(data.get("v", [0] * len(data["t"])), errors="coerce"),
+    }).dropna().sort_values("time")
+
+    if interval in {"15m", "4h"}:
+        rule = "15min" if interval == "15m" else "4h"
+        df = (df.set_index("time")
+                .resample(rule)
+                .agg({"open":"first", "high":"max", "low":"min", "close":"last", "volume":"sum"})
+                .dropna()
+                .reset_index())
+
+    return df.tail(limit).reset_index(drop=True)
 
 def get_binance_history(symbol: str, interval: str, limit: int):
     raw = get_json("/api/v3/klines", params={"symbol": clean_symbol(symbol), "interval": interval, "limit": limit}, timeout=20)
@@ -591,9 +603,10 @@ function n(x,d=2){
 function card(label,value){return `<div class="item"><div class="label">${label}</div><div class="value">${value}</div></div>`}
 async function loadSymbols(){
   const select=document.getElementById("symbol");
+  const src=document.getElementById("source").value;
   select.innerHTML='<option>در حال دریافت فهرست ارزها...</option>';
   try{
-    const r=await fetch('/symbols');
+    const r=await fetch(`/symbols?source=${encodeURIComponent(src)}`);
     const j=await r.json();
     if(!r.ok) throw new Error(j.detail||"خطا در دریافت فهرست ارزها");
     const rows=Array.isArray(j.symbols)?j.symbols:[];
@@ -601,16 +614,21 @@ async function loadSymbols(){
     rows.forEach(x=>{
       const o=document.createElement("option");
       o.value=x.symbol;
-      o.textContent=`${x.base || x.symbol.replace(/USDT$/,"")} — ${x.symbol}`;
+      const srcText=x.source ? ` — ${x.source}` : "";
+      o.textContent=`${x.base || x.symbol.replace(/USDT$/,"\")} — ${x.symbol}${srcText}`;
       select.appendChild(o);
     });
     const btc=rows.find(x=>x.symbol==="BTCUSDT");
     if(btc) select.value="BTCUSDT";
+    else if(rows.length) select.selectedIndex=0;
   }catch(e){
-    select.innerHTML='<option value="BTCUSDT">Bitcoin — BTCUSDT</option>';
+    select.innerHTML='<option value="BTCUSDT">BTC — BTCUSDT</option>';
     console.error(e);
   }
 }
+
+document.getElementById("source").addEventListener("change", loadSymbols);
+
 
 async function analyze(){
   const s=document.getElementById("symbol").value.trim();
@@ -711,8 +729,11 @@ def health():
 
 
 @app.get("/symbols")
-def symbols():
-    return {"count": len(get_all_symbols()), "symbols": get_all_symbols()}
+def symbols(source: str = Query("auto")):
+    rows = get_all_symbols()
+    if source in {"Binance", "Wallex", "Nobitex"}:
+        rows = [x for x in rows if source in str(x.get("source", ""))]
+    return {"count": len(rows), "symbols": rows}
 
 
 @app.get("/analyze")

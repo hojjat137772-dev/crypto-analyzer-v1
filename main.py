@@ -415,7 +415,9 @@ pre{white-space:pre-wrap;direction:ltr;text-align:left}
 
 <div class="card">
 <div class="row">
-<input id="symbol" value="BTCUSDT" placeholder="مثلاً BTCUSDT یا ETHUSDT">
+<select id="symbol">
+<option value="BTCUSDT" selected>Bitcoin — BTCUSDT</option>
+</select>
 <select id="interval">
 <option value="15m">15 دقیقه</option>
 <option value="1h" selected>1 ساعت</option>
@@ -423,6 +425,7 @@ pre{white-space:pre-wrap;direction:ltr;text-align:left}
 <option value="1d">روزانه</option>
 </select>
 </div>
+<div class="small" style="margin-top:8px">فهرست ارزها به‌صورت خودکار از بازار اسپات Binance دریافت می‌شود؛ شامل آلت‌کوین‌ها، میم‌کوین‌ها و توکن‌های USDT قابل معامله است.</div>
 <button onclick="analyze()">🔎 تحلیل ارز</button>
 <button class="secondary" onclick="backtest()">🧪 بک‌تست</button>
 <button onclick="scan()">🔍 اسکن بازار</button>
@@ -437,6 +440,29 @@ function n(x,d=2){
   return Number(x).toLocaleString("en-US",{maximumFractionDigits:d});
 }
 function card(label,value){return `<div class="item"><div class="label">${label}</div><div class="value">${value}</div></div>`}
+async function loadSymbols(){
+  const select=document.getElementById("symbol");
+  select.innerHTML='<option>در حال دریافت فهرست ارزها...</option>';
+  try{
+    const r=await fetch('/symbols');
+    const j=await r.json();
+    if(!r.ok) throw new Error(j.detail||"خطا در دریافت فهرست ارزها");
+    const rows=Array.isArray(j.symbols)?j.symbols:[];
+    select.innerHTML="";
+    rows.forEach(x=>{
+      const o=document.createElement("option");
+      o.value=x.symbol;
+      o.textContent=`${x.base || x.symbol.replace(/USDT$/,"")} — ${x.symbol}`;
+      select.appendChild(o);
+    });
+    const btc=rows.find(x=>x.symbol==="BTCUSDT");
+    if(btc) select.value="BTCUSDT";
+  }catch(e){
+    select.innerHTML='<option value="BTCUSDT">Bitcoin — BTCUSDT</option>';
+    console.error(e);
+  }
+}
+
 async function analyze(){
   const s=document.getElementById("symbol").value.trim();
   const i=document.getElementById("interval").value;
@@ -512,6 +538,7 @@ async function scan(){
     out.innerHTML=`<div class="card"><h2>نتیجه اسکن بازار</h2><div class="grid">${rows}</div></div>`;
   }catch(e){out.innerHTML=`<div class="card"><b>خطا:</b> ${e.message}</div>`}
 }
+loadSymbols();
 </script>
 </body>
 </html>"""

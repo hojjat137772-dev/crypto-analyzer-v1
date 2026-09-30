@@ -327,6 +327,7 @@ def nobitex_price(symbol):
 
 # -------------------- Tabdeal --------------------
 
+
 def parse_tabdeal_trade_rows(data):
     rows = data
     if isinstance(data, dict):
@@ -336,26 +337,28 @@ def parse_tabdeal_trade_rows(data):
                 break
     if not isinstance(rows, list):
         raise RuntimeError("لیست معاملات تبدیل معتبر نیست.")
+
     out = []
     for x in rows:
         if not isinstance(x, dict):
             continue
         price = safe_float(x.get("price"))
         qty = safe_float(x.get("qty", x.get("quantity")))
-        ts = x.get("time", x.get("timestamp"))
-        ts = safe_float(ts)
+        ts = safe_float(x.get("time", x.get("timestamp")))
         if np.isfinite(price) and np.isfinite(qty) and np.isfinite(ts):
             if ts > 10_000_000_000:
                 ts /= 1000
             out.append((pd.to_datetime(ts, unit="s"), price, qty))
-    if len(out) < 80:
+
+    if len(out) < 20:
         raise RuntimeError("معاملات کافی از تبدیل دریافت نشد.")
     return out
 
+
 def tabdeal_pair_name(symbol):
-    """Convert compact symbol (BTCUSDT/BTCIRT) to Tabdeal's underscore form."""
+    """Convert BTCUSDT/BTCIRT to Tabdeal's documented BTC_USDT/BTC_IRT."""
     s = str(symbol).upper().replace("-", "").replace("_", "")
-    for quote in ["USDT", "IRT", "RLS", "USDC", "BTC", "ETH"]:
+    for quote in ["USDT", "IRT", "USDC", "BTC", "ETH"]:
         if s.endswith(quote) and len(s) > len(quote):
             return f"{s[:-len(quote)]}_{quote}"
     return s
@@ -363,31 +366,25 @@ def tabdeal_pair_name(symbol):
 
 @st.cache_data(ttl=30, show_spinner=False)
 def tabdeal_trades(symbol, limit=2000):
-    # Tabdeal supports both compact `symbol` and underscore `tabdealSymbol`.
-    # Some markets/endpoints reject the compact form, so try the documented
-    # underscore form first and then fall back to compact form.
+    """Public recent trades.
+
+    Tabdeal's official public collection documents `tabdealSymbol` for this
+    endpoint and shows the optional limit disabled. Do not send `limit=2000`
+    because that combination can return HTTP 400 on the live API.
+    """
     tab_symbol = tabdeal_pair_name(symbol)
-    attempts = [
-        {"tabdealSymbol": tab_symbol, "limit": min(limit, 2000)},
-        {"tabdealSymbol": tab_symbol},
-        {"symbol": symbol, "limit": min(limit, 2000)},
-        {"symbol": symbol},
-    ]
-    last = None
-    for params in attempts:
-        try:
-            data = http_get(
-                f"{TABDEAL_BASE}/r/api/v1/trades",
-                params,
-                15,
-            )
-            return parse_tabdeal_trade_rows(data)
-        except Exception as exc:
-            last = exc
-    raise RuntimeError(
-        f"داده معاملات تبدیل برای {symbol} دریافت نشد. "
-        f"نماد Tabdeal: {tab_symbol}"
-    ) from last
+    try:
+        data = http_get(
+            f"{TABDEAL_BASE}/r/api/v1/trades",
+            {"tabdealSymbol": tab_symbol},
+            15,
+        )
+        return parse_tabdeal_trade_rows(data)
+    except Exception as exc:
+        raise RuntimeError(
+            f"داده معاملات تبدیل برای {symbol} در دسترس نیست ({tab_symbol})."
+        ) from exc
+
 
 def trades_to_ohlcv(trades, interval):
     sec = resolution_seconds(interval)
@@ -407,36 +404,58 @@ def trades_to_ohlcv(trades, interval):
         "close": c.values,
         "volume": v.values,
     }).dropna()
-    if len(out) < 80:
+    if len(out) < 20:
         raise RuntimeError("تاریخچه معاملاتی تبدیل برای این تایم‌فریم کافی نیست.")
     return out.tail(300)
 
+
 @st.cache_data(ttl=45, show_spinner=False)
 def tabdeal_klines(symbol, interval):
-    try:
-        return trades_to_ohlcv(tabdeal_trades(symbol), interval)
-    except Exception:
-        # Tabdeal's public API does not expose a full historical kline feed
-        # in the current public documentation. Use Binance OHLC only as a
-        # technical-history fallback so the analyzer/scanner remains usable.
-        return binance_klines(symbol, interval)
+    """Get technical candles without letting a Tabdeal 400 break the app.
+
+    For USDT markets, Binance is used as the technical-history source because
+    it provides native OHLC candles. The live/reference price still comes
+    from Tabdeal. For non-USDT markets, recent Tabdeal trades are converted
+    to candles when available.
+    """
+    compact = str(symbol).upper().replace("-", "").replace("_", "")
+    if compact.endswith("USDT"):
+        return binance_klines(compact, interval)
+
+    return trades_to_ohlcv(tabdeal_trades(compact), interval)
+
 
 @st.cache_data(ttl=30, show_spinner=False)
 def tabdeal_price(symbol):
-    data = http_get(
-        f"{TABDEAL_BASE}/r/api/v1/depth",
-        {"symbol": symbol, "limit": 5},
-        15,
-    )
-    bids = data.get("bids", [])
-    asks = data.get("asks", [])
-    if bids and asks:
-        return (float(bids[0][0]) + float(asks[0][0])) / 2
-    if bids:
-        return float(bids[0][0])
-    if asks:
-        return float(asks[0][0])
-    raise RuntimeError("قیمت تبدیل دریافت نشد.")
+    """Read Tabdeal public order book using documented tabdealSymbol first."""
+    tab_symbol = tabdeal_pair_name(symbol)
+    attempts = [
+        {"tabdealSymbol": tab_symbol, "limit": 5},
+        {"tabdealSymbol": tab_symbol},
+        {"symbol": str(symbol).upper(), "limit": 5},
+    ]
+    last = None
+    for params in attempts:
+        try:
+            data = http_get(
+                f"{TABDEAL_BASE}/r/api/v1/depth",
+                params,
+                15,
+            )
+            bids = data.get("bids", [])
+            asks = data.get("asks", [])
+            if bids and asks:
+                return (float(bids[0][0]) + float(asks[0][0])) / 2
+            if bids:
+                return float(bids[0][0])
+            if asks:
+                return float(asks[0][0])
+        except Exception as exc:
+            last = exc
+
+    raise RuntimeError(
+        f"قیمت تبدیل برای {symbol} دریافت نشد ({tab_symbol})."
+    ) from last
 
 # -------------------- Exchange router --------------------
 
@@ -579,29 +598,28 @@ def base_asset(symbol):
 
 
 def scanner_candidates(exchange, markets, limit=20):
-    """Return a stable, reasonably sized universe for the scanner."""
+    """Build a clean scanner universe from the selected exchange."""
     cleaned = []
-    for m in markets:
-        m = str(m).upper().replace("-", "").replace("_", "")
+    for raw in markets:
+        m = str(raw).upper().replace("-", "").replace("_", "")
         base, quote = base_asset(m)
-        if not base or base in STABLE_BASES:
+        if not base or base in STABLE_BASES or not quote:
             continue
-        # For local exchanges prefer USDT/IRT markets; for Binance prefer USDT.
         if exchange == "Binance" and quote != "USDT":
             continue
         if exchange in {"والکس", "نوبیتکس", "تبدیل"} and quote not in {"USDT", "IRT", "RLS"}:
             continue
         cleaned.append(m)
 
-    # Keep common liquid symbols first, then fill from the exchange list.
     preferred = [
         "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "BNBUSDT",
         "DOGEUSDT", "ADAUSDT", "AVAXUSDT", "LINKUSDT", "TRXUSDT",
-        "DOTUSDT", "MATICUSDT", "LTCUSDT", "SHIBUSDT", "ATOMUSDT",
+        "DOTUSDT", "LTCUSDT", "SHIBUSDT", "ATOMUSDT", "NEARUSDT",
+        "ARBUSDT", "OPUSDT", "APTUSDT", "SUIUSDT", "PEPEUSDT",
     ]
     ordered = [x for x in preferred if x in cleaned]
     ordered += [x for x in cleaned if x not in ordered]
-    return ordered[:limit]
+    return ordered[:max(1, int(limit))]
 
 
 def scanner_action(score):
@@ -617,13 +635,16 @@ def scanner_action(score):
 
 
 def scan_one_market(exchange, symbol, scan_tfs):
-    """Analyze one market without changing the main analyzer state."""
+    """Analyze one market. Uses candle close as the live/reference price.
+    This deliberately avoids an extra ticker request per coin, making the
+    multi-coin scanner much faster and more reliable."""
     scores = []
     tf_scores = {}
     latest_price = np.nan
     atr_value = np.nan
     support = np.nan
     resistance = np.nan
+    last_ind = None
 
     for tf_name, weight in scan_tfs:
         try:
@@ -633,6 +654,7 @@ def scan_one_market(exchange, symbol, scan_tfs):
                 continue
             scores.append((score, weight))
             tf_scores[tf_name] = score
+            last_ind = ind
             last = ind.iloc[-1]
             latest_price = float(last["close"])
             atr_value = float(last["atr"])
@@ -640,17 +662,12 @@ def scan_one_market(exchange, symbol, scan_tfs):
         except Exception:
             tf_scores[tf_name] = None
 
-    if not scores:
-        raise RuntimeError("داده تکنیکال کافی نیست")
+    # Require at least two valid timeframes so one bad endpoint cannot create
+    # a misleading top result.
+    if len(scores) < 2 or not np.isfinite(latest_price) or latest_price <= 0:
+        raise RuntimeError("حداقل دو تایم‌فریم معتبر در دسترس نیست")
 
     score = round(sum(s * w for s, w in scores) / sum(w for _, w in scores))
-    try:
-        latest_price = float(get_price(exchange, symbol))
-    except Exception:
-        pass
-
-    if not np.isfinite(latest_price):
-        raise RuntimeError("قیمت در دسترس نیست")
 
     if not np.isfinite(atr_value) or atr_value <= 0:
         atr_value = latest_price * 0.02
@@ -683,6 +700,7 @@ def scan_one_market(exchange, symbol, scan_tfs):
         "1h": tf_scores.get("1h"),
         "4h": tf_scores.get("4h"),
         "1d": tf_scores.get("1d"),
+        "تایم‌فریم معتبر": len(scores),
     }
 
 
@@ -691,6 +709,8 @@ def run_scanner(exchange, markets, scan_tfs, limit):
     rows = []
     progress = st.progress(0, text="شروع اسکن بازار...")
     total = len(candidates)
+
+    # Keep requests sequential to respect public exchange API limits.
     for i, symbol in enumerate(candidates, 1):
         try:
             rows.append(scan_one_market(exchange, symbol, scan_tfs))
@@ -698,15 +718,23 @@ def run_scanner(exchange, markets, scan_tfs, limit):
             rows.append({
                 "بازار": symbol,
                 "امتیاز": None,
-                "وضعیت": f"خطا: {str(exc)[:45]}",
+                "وضعیت": f"داده ناکافی: {str(exc)[:35]}",
+                "تایم‌فریم معتبر": 0,
             })
         progress.progress(i / max(total, 1), text=f"اسکن {symbol} — {i}/{total}")
+
     progress.empty()
     df = pd.DataFrame(rows)
     if df.empty:
         return df
+
     df["امتیاز_sort"] = pd.to_numeric(df["امتیاز"], errors="coerce")
-    return df.sort_values("امتیاز_sort", ascending=False, na_position="last").drop(columns=["امتیاز_sort"])
+    df = df.sort_values(
+        ["امتیاز_sort", "تایم‌فریم معتبر"],
+        ascending=[False, False],
+        na_position="last",
+    ).drop(columns=["امتیاز_sort"])
+    return df.reset_index(drop=True)
 
 # -------------------- UI / Dropdowns --------------------
 

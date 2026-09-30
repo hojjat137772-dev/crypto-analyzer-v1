@@ -9,7 +9,7 @@ import requests
 from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 BINANCE_URLS = [
     "https://api.binance.com",
     "https://api.binance.us",
@@ -29,6 +29,9 @@ CACHE = {}
 CACHE_TTL = 60
 SYMBOLS_CACHE = {"time": 0, "rows": []}
 SYMBOLS_CACHE_TTL = 600
+
+WALLEX_BASE = "https://api.wallex.ir"
+NOBITEX_BASE = "https://api.nobitex.ir"
 
 
 def get_json(path, params=None, timeout=15):
@@ -57,64 +60,201 @@ def interval_to_text(interval: str) -> str:
     return allowed.get(interval, interval)
 
 
+def _normalize_market(base, quote, symbol, source):
+    base = str(base or "").upper()
+    quote = str(quote or "").upper()
+    symbol = clean_symbol(symbol)
+    return {"symbol": symbol, "base": base, "quote": quote, "source": source}
+
+
+def get_binance_symbols():
+    data = get_json("/api/v3/exchangeInfo")
+    rows = []
+    for s in data.get("symbols", []):
+        if s.get("status") == "TRADING" and s.get("quoteAsset") == "USDT" and s.get("isSpotTradingAllowed", True):
+            rows.append(_normalize_market(s.get("baseAsset"), "USDT", s.get("symbol"), "Binance"))
+    return rows
+
+
+def get_nobitex_symbols():
+    r = SESSION.get(NOBITEX_BASE + "/market/stats", timeout=15)
+    r.raise_for_status()
+    data = r.json()
+    rows = []
+    for key in data.get("stats", {}).keys():
+        k = clean_symbol(key)
+        if k.endswith("USDT") and len(k) > 4:
+            rows.append(_normalize_market(k[:-4], "USDT", k, "Nobitex"))
+    return rows
+
+
+def get_wallex_symbols():
+    # Wallex public market endpoints have changed between API versions.
+    # Try the current v1 market list first and tolerate an unavailable endpoint.
+    candidates = [
+        ("/v1/markets", {}),
+        ("/v1/markets", {"symbol": ""}),
+    ]
+    last = None
+    for path, params in candidates:
+        try:
+            r = SESSION.get(WALLEX_BASE + path, params=params, timeout=15)
+            r.raise_for_status()
+            data = r.json()
+            markets = data.get("result", {}).get("symbols") if isinstance(data.get("result"), dict) else None
+            if markets is None:
+                markets = data.get("result", {}).get("markets") if isinstance(data.get("result"), dict) else None
+            if markets is None:
+                markets = data.get("markets")
+            if isinstance(markets, dict):
+                markets = list(markets.values())
+            rows = []
+            for m in markets or []:
+                symbol = clean_symbol(m.get("symbol") or m.get("name") or m.get("pair"))
+                quote = clean_symbol(m.get("quoteAsset") or m.get("quoteCurrency") or m.get("quote"))
+                base = clean_symbol(m.get("baseAsset") or m.get("baseCurrency") or m.get("base"))
+                if not symbol and base and quote:
+                    symbol = base + quote
+                if symbol.endswith("USDT") and len(symbol) > 4:
+                    rows.append(_normalize_market(base or symbol[:-4], "USDT", symbol, "Wallex"))
+            if rows:
+                return rows
+        except Exception as exc:
+            last = exc
+    return []
+
+
 def get_all_symbols():
     now = time.time()
     if SYMBOLS_CACHE["rows"] and now - SYMBOLS_CACHE["time"] < SYMBOLS_CACHE_TTL:
         return SYMBOLS_CACHE["rows"]
 
-    data = get_json("/api/v3/exchangeInfo")
-    rows = []
-    for s in data.get("symbols", []):
-        if (
-            s.get("status") == "TRADING"
-            and s.get("quoteAsset") == "USDT"
-            and s.get("isSpotTradingAllowed", True)
-        ):
-            rows.append({
-                "symbol": s["symbol"],
-                "base": s.get("baseAsset", ""),
-                "quote": s.get("quoteAsset", "USDT"),
-            })
+    merged = {}
+    errors = []
+    for fn in (get_binance_symbols, get_wallex_symbols, get_nobitex_symbols):
+        try:
+            for row in fn():
+                key = row["symbol"]
+                if key not in merged:
+                    merged[key] = row
+                else:
+                    sources = set(str(merged[key].get("source", "")).split(" + "))
+                    sources.add(row["source"])
+                    merged[key]["source"] = " + ".join(sorted(x for x in sources if x))
+        except Exception as exc:
+            errors.append(type(exc).__name__)
 
-    rows.sort(key=lambda x: x["symbol"])
+    rows = sorted(merged.values(), key=lambda x: x["symbol"])
     SYMBOLS_CACHE["rows"] = rows
     SYMBOLS_CACHE["time"] = now
     return rows
 
 
-def get_history(symbol: str, interval: str = DEFAULT_INTERVAL, limit: int = 300):
+def resolution_for(interval):
+    return {"15m": "15", "1h": "60", "4h": "240", "1d": "D"}[interval]
+
+
+def get_nobitex_history(symbol, interval, limit):
     symbol = clean_symbol(symbol)
-    limit = max(100, min(int(limit), 1000))
-    key = f"{symbol}:{interval}:{limit}"
-    now = time.time()
-
-    if key in CACHE and now - CACHE[key]["time"] < CACHE_TTL:
-        return CACHE[key]["df"].copy()
-
-    raw = get_json(
-        "/api/v3/klines",
-        params={"symbol": symbol, "interval": interval, "limit": limit},
-        timeout=20,
-    )
-
-    if not raw:
-        raise ValueError("داده تاریخی برای این نماد پیدا نشد.")
-
-    cols = [
-        "open_time", "open", "high", "low", "close", "volume",
-        "close_time", "quote_volume", "trades",
-        "taker_base", "taker_quote", "ignore"
-    ]
-    df = pd.DataFrame(raw, columns=cols)
-    for c in ["open", "high", "low", "close", "volume"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-
-    df["time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
-    df = df[["time", "open", "high", "low", "close", "volume"]].dropna()
-    df = df.reset_index(drop=True)
-
-    CACHE[key] = {"time": now, "df": df.copy()}
+    now = int(time.time())
+    resolution = resolution_for(interval)
+    seconds = {"15m": 15*60, "1h": 3600, "4h": 4*3600, "1d": 86400}[interval]
+    frm = now - seconds * (limit + 10)
+    r = SESSION.get(NOBITEX_BASE + "/market/udf/history", params={
+        "symbol": symbol, "resolution": resolution, "from": frm, "to": now, "countback": limit
+    }, timeout=20)
+    r.raise_for_status()
+    data = r.json()
+    if data.get("s") != "ok" or not data.get("t"):
+        raise ValueError("نوبیتکس برای این نماد/تایم‌فریم داده کافی ندارد.")
+    df = pd.DataFrame({
+        "time": pd.to_datetime(data["t"], unit="s", utc=True),
+        "open": pd.to_numeric(data["o"], errors="coerce"),
+        "high": pd.to_numeric(data["h"], errors="coerce"),
+        "low": pd.to_numeric(data["l"], errors="coerce"),
+        "close": pd.to_numeric(data["c"], errors="coerce"),
+        "volume": pd.to_numeric(data.get("v", [0]*len(data["t"])), errors="coerce"),
+    }).dropna().reset_index(drop=True)
     return df
+
+
+def get_wallex_history(symbol, interval, limit):
+    # Best-effort adapter for public Wallex candle APIs; if unavailable, caller can fall back.
+    resolutions = {"15m": 15, "1h": 60, "4h": 240, "1d": 1440}
+    symbol = clean_symbol(symbol)
+    now = int(time.time())
+    frm = now - resolutions[interval] * 60 * (limit + 10)
+    endpoints = [
+        "/v1/market/candle",
+        "/v1/market/candles",
+        "/v1/market/candles/history",
+    ]
+    last = None
+    for ep in endpoints:
+        try:
+            r = SESSION.get(WALLEX_BASE + ep, params={
+                "symbol": symbol, "resolution": resolutions[interval], "from": frm, "to": now, "limit": limit
+            }, timeout=20)
+            r.raise_for_status()
+            data = r.json()
+            raw = data.get("result") or data.get("candles") or data.get("data")
+            if isinstance(raw, dict):
+                raw = raw.get("candles") or raw.get("items") or raw.get("data")
+            if not isinstance(raw, list) or not raw:
+                continue
+            rows=[]
+            for x in raw:
+                if isinstance(x, dict):
+                    t=x.get("time") or x.get("timestamp") or x.get("openTime")
+                    rows.append([t,x.get("open"),x.get("high"),x.get("low"),x.get("close"),x.get("volume",0)])
+                elif isinstance(x, (list,tuple)) and len(x)>=6:
+                    rows.append(x[:6])
+            if not rows: continue
+            df=pd.DataFrame(rows, columns=["time","open","high","low","close","volume"])
+            for c in ["open","high","low","close","volume"]: df[c]=pd.to_numeric(df[c], errors="coerce")
+            t=pd.to_numeric(df["time"], errors="coerce")
+            unit="ms" if t.dropna().max()>10_000_000_000 else "s"
+            df["time"]=pd.to_datetime(t, unit=unit, utc=True, errors="coerce")
+            return df.dropna().sort_values("time").tail(limit).reset_index(drop=True)
+        except Exception as exc:
+            last=exc
+    raise ValueError("والکس برای این نماد/تایم‌فریم داده کندلی قابل دریافت نداد.")
+
+
+def get_binance_history(symbol: str, interval: str, limit: int):
+    raw = get_json("/api/v3/klines", params={"symbol": clean_symbol(symbol), "interval": interval, "limit": limit}, timeout=20)
+    if not raw: raise ValueError("Binance داده تاریخی برای این نماد ندارد.")
+    cols=["open_time","open","high","low","close","volume","close_time","quote_volume","trades","taker_base","taker_quote","ignore"]
+    df=pd.DataFrame(raw, columns=cols)
+    for c in ["open","high","low","close","volume"]: df[c]=pd.to_numeric(df[c], errors="coerce")
+    df["time"]=pd.to_datetime(df["open_time"], unit="ms", utc=True)
+    return df[["time","open","high","low","close","volume"]].dropna().reset_index(drop=True)
+
+
+def get_history(symbol: str, interval: str = DEFAULT_INTERVAL, limit: int = 300, source: str = "auto"):
+    symbol=clean_symbol(symbol)
+    limit=max(100,min(int(limit),1000))
+    key=f"{source}:{symbol}:{interval}:{limit}"
+    now=time.time()
+    if key in CACHE and now-CACHE[key]["time"]<CACHE_TTL: return CACHE[key]["df"].copy()
+
+    order=[]
+    if source=="Binance": order=[("Binance",get_binance_history)]
+    elif source=="Wallex": order=[("Wallex",get_wallex_history), ("Binance",get_binance_history)]
+    elif source=="Nobitex": order=[("Nobitex",get_nobitex_history), ("Binance",get_binance_history)]
+    else:
+        order=[("Binance",get_binance_history), ("Wallex",get_wallex_history), ("Nobitex",get_nobitex_history)]
+
+    errors=[]
+    for name,fn in order:
+        try:
+            df=fn(symbol,interval,limit)
+            if len(df)>=50:
+                CACHE[key]={"time":now,"df":df.copy()}
+                return df
+        except Exception as exc:
+            errors.append(f"{name}: {exc}")
+    raise ValueError("داده کندلی از منابع انتخاب‌شده دریافت نشد. " + " | ".join(errors[-3:]))
 
 
 def ema(s, n):
@@ -253,8 +393,8 @@ def build_signal(df):
     }
 
 
-def analyze_symbol(symbol: str, interval: str):
-    df = get_history(symbol, interval, 300)
+def analyze_symbol(symbol: str, interval: str, source: str = "auto"):
+    df = get_history(symbol, interval, 300, source)
 
     df["ema20"] = ema(df["close"], 20)
     df["ema50"] = ema(df["close"], 50)
@@ -272,14 +412,15 @@ def analyze_symbol(symbol: str, interval: str):
 
     result = build_signal(df)
     result["symbol"] = clean_symbol(symbol)
+    result["source"] = source
     result["interval"] = interval
     result["interval_text"] = interval_to_text(interval)
     result["updated_at"] = datetime.now(timezone.utc).isoformat()
     return result
 
 
-def run_backtest(symbol: str, interval: str, limit: int = 300):
-    df = get_history(symbol, interval, limit)
+def run_backtest(symbol: str, interval: str, limit: int = 300, source: str = "auto"):
+    df = get_history(symbol, interval, limit, source)
     df["ema10"] = ema(df["close"], 10)
     df["ema20"] = ema(df["close"], 20)
     df["rsi"] = rsi(df["close"], 14)
@@ -344,6 +485,7 @@ def run_backtest(symbol: str, interval: str, limit: int = 300):
         return {
             "symbol": clean_symbol(symbol),
             "interval": interval,
+            "source": source,
             "trades": 0,
             "win_rate": 0,
             "avg_return": 0,
@@ -366,6 +508,7 @@ def run_backtest(symbol: str, interval: str, limit: int = 300):
     return {
         "symbol": clean_symbol(symbol),
         "interval": interval,
+        "source": source,
         "trades": len(trades),
         "win_rate": win_rate,
         "avg_return": avg_return,
@@ -410,13 +553,19 @@ pre{white-space:pre-wrap;direction:ltr;text-align:left}
 <div class="wrap">
 <div class="card">
 <h1>تحلیل‌گر بازار کریپتو 🪙</h1>
-<div class="sub">نسخه 1.0.0 — تحلیل تکنیکال، سیگنال مشروط، مدیریت ریسک و بک‌تست</div>
+<div class="sub">نسخه 1.1.0 — تحلیل تکنیکال، سیگنال مشروط، مدیریت ریسک و بک‌تست</div>
 </div>
 
 <div class="card">
 <div class="row">
 <select id="symbol">
 <option value="BTCUSDT" selected>Bitcoin — BTCUSDT</option>
+</select>
+<select id="source">
+<option value="auto" selected>خودکار (هر سه منبع)</option>
+<option value="Binance">Binance</option>
+<option value="Wallex">والکس</option>
+<option value="Nobitex">نوبیتکس</option>
 </select>
 <select id="interval">
 <option value="15m">15 دقیقه</option>
@@ -425,7 +574,7 @@ pre{white-space:pre-wrap;direction:ltr;text-align:left}
 <option value="1d">روزانه</option>
 </select>
 </div>
-<div class="small" style="margin-top:8px">فهرست ارزها به‌صورت خودکار از بازار اسپات Binance دریافت می‌شود؛ شامل آلت‌کوین‌ها، میم‌کوین‌ها و توکن‌های USDT قابل معامله است.</div>
+<div class="small" style="margin-top:8px">فهرست بازارها از Binance، والکس و نوبیتکس جمع می‌شود. تحلیل فقط از داده کندلی قابل‌دریافت استفاده می‌کند.</div>
 <button onclick="analyze()">🔎 تحلیل ارز</button>
 <button class="secondary" onclick="backtest()">🧪 بک‌تست</button>
 <button onclick="scan()">🔍 اسکن بازار</button>
@@ -466,9 +615,10 @@ async function loadSymbols(){
 async function analyze(){
   const s=document.getElementById("symbol").value.trim();
   const i=document.getElementById("interval").value;
+  const src=document.getElementById("source").value;
   out.innerHTML='<div class="card">در حال دریافت اطلاعات بازار...</div>';
   try{
-    const r=await fetch(`/analyze?symbol=${encodeURIComponent(s)}&interval=${i}`);
+    const r=await fetch(`/analyze?symbol=${encodeURIComponent(s)}&interval=${i}&source=${encodeURIComponent(src)}`);
     const j=await r.json();
     if(!r.ok) throw new Error(j.detail||"خطا");
     const cls=j.status==="صعودی"?"good":j.status==="نزولی"?"bad":"neutral";
@@ -508,9 +658,10 @@ async function analyze(){
 async function backtest(){
   const s=document.getElementById("symbol").value.trim();
   const i=document.getElementById("interval").value;
+  const src=document.getElementById("source").value;
   out.innerHTML='<div class="card">در حال اجرای بک‌تست...</div>';
   try{
-    const r=await fetch(`/backtest?symbol=${encodeURIComponent(s)}&interval=${i}`);
+    const r=await fetch(`/backtest?symbol=${encodeURIComponent(s)}&interval=${i}&source=${encodeURIComponent(src)}`);
     const j=await r.json();
     if(!r.ok) throw new Error(j.detail||"خطا");
     out.innerHTML=`
@@ -554,7 +705,7 @@ def health():
     return {
         "status": "ok",
         "version": APP_VERSION,
-        "data_source": "Binance public market data",
+        "data_sources": ["Binance", "Wallex", "Nobitex"],
         "trading_enabled": False,
     }
 
@@ -568,13 +719,14 @@ def symbols():
 def analyze(
     symbol: str = Query(DEFAULT_SYMBOL),
     interval: str = Query(DEFAULT_INTERVAL),
+    source: str = Query("auto"),
 ):
     allowed = {"15m", "1h", "4h", "1d"}
     if interval not in allowed:
         return JSONResponse({"detail": "تایم‌فریم نامعتبر است."}, status_code=400)
 
     try:
-        return analyze_symbol(symbol, interval)
+        return analyze_symbol(symbol, interval, source)
     except Exception as exc:
         return JSONResponse({"detail": str(exc)}, status_code=502)
 
@@ -583,13 +735,14 @@ def analyze(
 def backtest(
     symbol: str = Query(DEFAULT_SYMBOL),
     interval: str = Query(DEFAULT_INTERVAL),
+    source: str = Query("auto"),
 ):
     allowed = {"15m", "1h", "4h", "1d"}
     if interval not in allowed:
         return JSONResponse({"detail": "تایم‌فریم نامعتبر است."}, status_code=400)
 
     try:
-        return run_backtest(symbol, interval)
+        return run_backtest(symbol, interval, source=source)
     except Exception as exc:
         return JSONResponse({"detail": str(exc)}, status_code=502)
 
@@ -616,7 +769,7 @@ def scan(
         results = []
         for s in selected:
             try:
-                r = analyze_symbol(s, interval)
+                r = analyze_symbol(s, interval, "auto")
                 results.append({
                     "symbol": s,
                     "score": r["score"],

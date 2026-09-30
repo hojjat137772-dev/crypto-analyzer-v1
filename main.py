@@ -9,7 +9,7 @@ import requests
 from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.2.1"
 BINANCE_URLS = [
     "https://api.binance.com",
     "https://api.binance.us",
@@ -264,9 +264,16 @@ def get_history(symbol: str, interval: str = DEFAULT_INTERVAL, limit: int = 300,
     if source in funcs:
         order = [source]
     else:
+        # Automatic mode: try every exchange that lists this symbol.
+        # A missing candle series on one exchange must not block the others.
         rows = [x for x in get_all_symbols("auto") if x["symbol"] == symbol]
-        # Use the first listed exchange for this exact symbol.
-        order = [rows[0]["source"]] if rows else list(funcs.keys())
+        order = []
+        for row in rows:
+            name = row.get("source")
+            if name in funcs and name not in order:
+                order.append(name)
+        if not order:
+            order = list(funcs.keys())
 
     errors = []
     for name in order:
@@ -581,7 +588,7 @@ pre{white-space:pre-wrap;direction:ltr;text-align:left}
 <div class="wrap">
 <div class="card">
 <h1>تحلیل‌گر بازار کریپتو 🪙</h1>
-<div class="sub">نسخه 1.2.0 — تحلیل تکنیکال، سیگنال مشروط، مدیریت ریسک و بک‌تست</div>
+<div class="sub">نسخه 1.2.1 — تحلیل تکنیکال، سه منبع داده، مدیریت ریسک و بک‌تست</div>
 </div>
 
 <div class="card">
@@ -647,8 +654,11 @@ document.getElementById("source").addEventListener("change", loadSymbols);
 function selectedMarket(){
   const raw=document.getElementById("symbol").value || "";
   const parts=raw.split("::");
-  if(parts.length===2) return {symbol:parts[1], source:parts[0]};
-  return {symbol:raw, source:document.getElementById("source").value};
+  const uiSource=document.getElementById("source").value;
+  // Auto mode must stay auto so the backend can fail over between exchanges.
+  if(uiSource==="auto") return {symbol:(parts.length===2?parts[1]:raw), source:"auto"};
+  if(parts.length===2) return {symbol:parts[1], source:uiSource};
+  return {symbol:raw, source:uiSource};
 }
 
 async function analyze(){

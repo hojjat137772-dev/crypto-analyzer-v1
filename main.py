@@ -9,7 +9,7 @@ import requests
 from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 BINANCE_URLS = [
     "https://api.binance.com",
     "https://api.binance.us",
@@ -82,73 +82,82 @@ def get_nobitex_symbols():
     data = r.json()
     rows = []
     for key in data.get("stats", {}).keys():
-        k = clean_symbol(key)
-        if k.endswith("USDT") and len(k) > 4:
-            rows.append(_normalize_market(k[:-4], "USDT", k, "Nobitex"))
+        raw = str(key or "").upper().strip()
+        # Nobitex commonly exposes pairs such as BTC-USDT / BTC_USDT.
+        compact = raw.replace("/", "").replace("-", "").replace("_", "")
+        if compact.endswith("USDT") and len(compact) > 4:
+            base = compact[:-4]
+            rows.append(_normalize_market(base, "USDT", compact, "Nobitex"))
+            rows[-1]["market_symbol"] = raw
     return rows
 
-
 def get_wallex_symbols():
-    # Wallex public market endpoints have changed between API versions.
-    # Try the current v1 market list first and tolerate an unavailable endpoint.
     candidates = [
+        ("/hector/web/v1/markets", {}),
         ("/v1/markets", {}),
-        ("/v1/markets", {"symbol": ""}),
     ]
-    last = None
     for path, params in candidates:
         try:
             r = SESSION.get(WALLEX_BASE + path, params=params, timeout=15)
             r.raise_for_status()
             data = r.json()
-            markets = data.get("result", {}).get("symbols") if isinstance(data.get("result"), dict) else None
-            if markets is None:
-                markets = data.get("result", {}).get("markets") if isinstance(data.get("result"), dict) else None
-            if markets is None:
-                markets = data.get("markets")
+            result = data.get("result") if isinstance(data, dict) else None
+            markets = None
+            if isinstance(result, dict):
+                markets = result.get("markets") or result.get("symbols")
             if isinstance(markets, dict):
                 markets = list(markets.values())
             rows = []
             for m in markets or []:
-                symbol = clean_symbol(m.get("symbol") or m.get("name") or m.get("pair"))
-                quote = clean_symbol(m.get("quoteAsset") or m.get("quoteCurrency") or m.get("quote"))
-                base = clean_symbol(m.get("baseAsset") or m.get("baseCurrency") or m.get("base"))
-                if not symbol and base and quote:
-                    symbol = base + quote
-                if symbol.endswith("USDT") and len(symbol) > 4:
-                    rows.append(_normalize_market(base or symbol[:-4], "USDT", symbol, "Wallex"))
+                if not isinstance(m, dict):
+                    continue
+                raw_symbol = str(m.get("symbol") or m.get("name") or m.get("pair") or "").upper()
+                base = str(m.get("baseAsset") or m.get("base_asset") or m.get("baseCurrency") or m.get("base") or "").upper()
+                quote = str(m.get("quoteAsset") or m.get("quote_asset") or m.get("quoteCurrency") or m.get("quote") or "").upper()
+                compact = raw_symbol.replace("/", "").replace("-", "").replace("_", "")
+                if not base and compact.endswith("USDT"):
+                    base = compact[:-4]
+                if not quote and compact.endswith("USDT"):
+                    quote = "USDT"
+                is_spot = m.get("is_spot", m.get("isSpot", True))
+                if quote == "USDT" and base and is_spot is not False:
+                    symbol = base + "USDT"
+                    row = _normalize_market(base, "USDT", symbol, "Wallex")
+                    row["market_symbol"] = raw_symbol or symbol
+                    rows.append(row)
             if rows:
                 return rows
-        except Exception as exc:
-            last = exc
+        except Exception:
+            continue
     return []
 
-
-def get_all_symbols():
+def get_all_symbols(source="auto"):
     now = time.time()
-    if SYMBOLS_CACHE["rows"] and now - SYMBOLS_CACHE["time"] < SYMBOLS_CACHE_TTL:
-        return SYMBOLS_CACHE["rows"]
+    cache_key = f"symbols:{source}"
+    cached = CACHE.get(cache_key)
+    if cached and now - cached["time"] < SYMBOLS_CACHE_TTL:
+        return cached["rows"]
 
-    merged = {}
-    errors = []
-    for fn in (get_binance_symbols, get_wallex_symbols, get_nobitex_symbols):
+    funcs = {"Binance": get_binance_symbols, "Wallex": get_wallex_symbols, "Nobitex": get_nobitex_symbols}
+    names = [source] if source in funcs else list(funcs.keys())
+    rows = []
+    seen = set()
+    for name in names:
         try:
-            for row in fn():
-                key = row["symbol"]
-                if key not in merged:
-                    merged[key] = row
-                else:
-                    sources = set(str(merged[key].get("source", "")).split(" + "))
-                    sources.add(row["source"])
-                    merged[key]["source"] = " + ".join(sorted(x for x in sources if x))
-        except Exception as exc:
-            errors.append(type(exc).__name__)
-
-    rows = sorted(merged.values(), key=lambda x: x["symbol"])
-    SYMBOLS_CACHE["rows"] = rows
-    SYMBOLS_CACHE["time"] = now
+            for row in funcs[name]():
+                key = (name, row["symbol"], row.get("market_symbol", row["symbol"]))
+                if key in seen:
+                    continue
+                seen.add(key)
+                row = dict(row)
+                row["source"] = name
+                row["market_symbol"] = row.get("market_symbol", row["symbol"])
+                rows.append(row)
+        except Exception:
+            continue
+    rows.sort(key=lambda x: (x["symbol"], x["source"]))
+    CACHE[cache_key] = {"time": now, "rows": rows}
     return rows
-
 
 def resolution_for(interval):
     return {"15m": "15", "1h": "60", "4h": "240", "1d": "D"}[interval]
@@ -244,30 +253,37 @@ def get_binance_history(symbol: str, interval: str, limit: int):
 
 
 def get_history(symbol: str, interval: str = DEFAULT_INTERVAL, limit: int = 300, source: str = "auto"):
-    symbol=clean_symbol(symbol)
-    limit=max(100,min(int(limit),1000))
-    key=f"{source}:{symbol}:{interval}:{limit}"
-    now=time.time()
-    if key in CACHE and now-CACHE[key]["time"]<CACHE_TTL: return CACHE[key]["df"].copy()
+    symbol = clean_symbol(symbol)
+    limit = max(100, min(int(limit), 1000))
+    key = f"{source}:{symbol}:{interval}:{limit}"
+    now = time.time()
+    if key in CACHE and now - CACHE[key]["time"] < CACHE_TTL:
+        return CACHE[key]["df"].copy()
 
-    order=[]
-    if source=="Binance": order=[("Binance",get_binance_history)]
-    elif source=="Wallex": order=[("Wallex",get_wallex_history), ("Binance",get_binance_history)]
-    elif source=="Nobitex": order=[("Nobitex",get_nobitex_history), ("Binance",get_binance_history)]
+    funcs = {"Binance": get_binance_history, "Wallex": get_wallex_history, "Nobitex": get_nobitex_history}
+    if source in funcs:
+        order = [source]
     else:
-        order=[("Binance",get_binance_history), ("Wallex",get_wallex_history), ("Nobitex",get_nobitex_history)]
+        rows = [x for x in get_all_symbols("auto") if x["symbol"] == symbol]
+        # Use the first listed exchange for this exact symbol.
+        order = [rows[0]["source"]] if rows else list(funcs.keys())
 
-    errors=[]
-    for name,fn in order:
+    errors = []
+    for name in order:
         try:
-            df=fn(symbol,interval,limit)
-            if len(df)>=50:
-                CACHE[key]={"time":now,"df":df.copy()}
+            market_symbol = symbol
+            matches = [x for x in get_all_symbols(name) if x["symbol"] == symbol]
+            if matches:
+                market_symbol = matches[0].get("market_symbol", symbol)
+            df = funcs[name](market_symbol, interval, limit)
+            if len(df) >= 50:
+                CACHE[key] = {"time": now, "df": df.copy()}
                 return df
         except Exception as exc:
             errors.append(f"{name}: {exc}")
-    raise ValueError("داده کندلی از منابع انتخاب‌شده دریافت نشد. " + " | ".join(errors[-3:]))
-
+            if source in funcs:
+                break
+    raise ValueError("داده کندلی از منبع انتخاب‌شده دریافت نشد. " + " | ".join(errors[-3:]))
 
 def ema(s, n):
     return s.ewm(span=n, adjust=False).mean()
@@ -565,7 +581,7 @@ pre{white-space:pre-wrap;direction:ltr;text-align:left}
 <div class="wrap">
 <div class="card">
 <h1>تحلیل‌گر بازار کریپتو 🪙</h1>
-<div class="sub">نسخه 1.1.0 — تحلیل تکنیکال، سیگنال مشروط، مدیریت ریسک و بک‌تست</div>
+<div class="sub">نسخه 1.2.0 — تحلیل تکنیکال، سیگنال مشروط، مدیریت ریسک و بک‌تست</div>
 </div>
 
 <div class="card">
@@ -613,13 +629,12 @@ async function loadSymbols(){
     select.innerHTML="";
     rows.forEach(x=>{
       const o=document.createElement("option");
-      o.value=x.symbol;
-      const srcText=x.source ? ` — ${x.source}` : "";
-      o.textContent=`${x.base || x.symbol.replace(/USDT$/,"\")} — ${x.symbol}${srcText}`;
+      o.value=`${x.source}::${x.symbol}`;
+      o.textContent=`${x.base || x.symbol.replace(/USDT$/,"")} — ${x.symbol} — ${x.source}`;
       select.appendChild(o);
     });
     const btc=rows.find(x=>x.symbol==="BTCUSDT");
-    if(btc) select.value="BTCUSDT";
+    if(btc) select.value=`${btc.source}::BTCUSDT`;
     else if(rows.length) select.selectedIndex=0;
   }catch(e){
     select.innerHTML='<option value="BTCUSDT">BTC — BTCUSDT</option>';
@@ -629,11 +644,18 @@ async function loadSymbols(){
 
 document.getElementById("source").addEventListener("change", loadSymbols);
 
+function selectedMarket(){
+  const raw=document.getElementById("symbol").value || "";
+  const parts=raw.split("::");
+  if(parts.length===2) return {symbol:parts[1], source:parts[0]};
+  return {symbol:raw, source:document.getElementById("source").value};
+}
 
 async function analyze(){
-  const s=document.getElementById("symbol").value.trim();
+  const market=selectedMarket();
+  const s=market.symbol;
   const i=document.getElementById("interval").value;
-  const src=document.getElementById("source").value;
+  const src=market.source;
   out.innerHTML='<div class="card">در حال دریافت اطلاعات بازار...</div>';
   try{
     const r=await fetch(`/analyze?symbol=${encodeURIComponent(s)}&interval=${i}&source=${encodeURIComponent(src)}`);
@@ -674,9 +696,10 @@ async function analyze(){
   }catch(e){out.innerHTML=`<div class="card"><b>خطا:</b> ${e.message}</div>`}
 }
 async function backtest(){
-  const s=document.getElementById("symbol").value.trim();
+  const market=selectedMarket();
+  const s=market.symbol;
   const i=document.getElementById("interval").value;
-  const src=document.getElementById("source").value;
+  const src=market.source;
   out.innerHTML='<div class="card">در حال اجرای بک‌تست...</div>';
   try{
     const r=await fetch(`/backtest?symbol=${encodeURIComponent(s)}&interval=${i}&source=${encodeURIComponent(src)}`);
@@ -700,7 +723,8 @@ async function scan(){
   out.innerHTML='<div class="card">در حال اسکن ارزهای USDT...</div>';
   try{
     const i=document.getElementById("interval").value;
-    const r=await fetch(`/scan?interval=${i}&limit=20`);
+    const src=document.getElementById("source").value;
+    const r=await fetch(`/scan?interval=${i}&limit=20&source=${encodeURIComponent(src)}`);
     const j=await r.json();
     if(!r.ok) throw new Error(j.detail||"خطا");
     let rows=j.results.map(x=>`<div class="item"><b>${x.symbol}</b><br>امتیاز: ${x.score} — ${x.status}<br>قیمت: ${n(x.price)}</div>`).join("");
@@ -730,9 +754,7 @@ def health():
 
 @app.get("/symbols")
 def symbols(source: str = Query("auto")):
-    rows = get_all_symbols()
-    if source in {"Binance", "Wallex", "Nobitex"}:
-        rows = [x for x in rows if source in str(x.get("source", ""))]
+    rows = get_all_symbols(source)
     return {"count": len(rows), "symbols": rows}
 
 

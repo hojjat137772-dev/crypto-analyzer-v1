@@ -2,490 +2,366 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import requests
-import time
-from datetime import datetime
-
-# ============================================================
-# Crypto Analyzer Pro
-# BUY / SELL / WAIT + multi-market scanner
-# Public market data only - no order execution
-# Dependencies: streamlit, pandas, numpy, requests
-# ============================================================
+from datetime import datetime, timezone
 
 st.set_page_config(page_title="ربات تحلیل حرفه‌ای کریپتو", page_icon="📈", layout="wide")
 
-BINANCE = "https://data-api.binance.vision"
-WALLEX = "https://api.wallex.ir"
-NOBITEX = "https://api.nobitex.ir"
-TABDEAL = "https://api1.tabdeal.org"
-EXCHANGES = ["Binance", "والکس", "نوبیتکس", "تبدیل"]
-TFS = ["15m", "1h", "4h", "1d"]
+BINANCE = "https://api.binance.com"
+SESSION = requests.Session()
+SESSION.headers.update({"User-Agent": "CryptoAnalyzer/1.0"})
 
-st.markdown("""
-<style>
-.block-container{padding-top:1rem;max-width:1450px}
-.signal{padding:18px;border-radius:16px;text-align:center;font-size:25px;font-weight:800;margin:10px 0}
-</style>
-""", unsafe_allow_html=True)
+TIMEFRAMES = {
+    "15 دقیقه": "15m",
+    "1 ساعت": "1h",
+    "4 ساعت": "4h",
+    "روزانه": "1d",
+}
 
-st.title("📈 ربات تحلیل حرفه‌ای کریپتو")
-st.caption("تحلیل تکنیکال چندتایم‌فریمی | BUY / SELL / WAIT | بدون ثبت سفارش")
+COINS = [
+    "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT",
+    "ADAUSDT", "DOGEUSDT", "AVAXUSDT", "LINKUSDT", "DOTUSDT",
+    "TRXUSDT", "LTCUSDT", "BCHUSDT", "ATOMUSDT", "NEARUSDT",
+    "APTUSDT", "ARBUSDT", "OPUSDT", "SUIUSDT", "ETCUSDT"
+]
 
-
-def get_json(url, params=None, timeout=15):
-    r = requests.get(url, params=params, timeout=timeout,
-                     headers={"User-Agent": "CryptoAnalyzer/3.0"})
+def api_get(url, params=None, timeout=12):
+    r = SESSION.get(url, params=params, timeout=timeout)
     r.raise_for_status()
     return r.json()
 
+@st.cache_data(ttl=20)
+def get_price(symbol):
+    data = api_get(f"{BINANCE}/api/v3/ticker/price", {"symbol": symbol})
+    return float(data["price"])
 
-def fnum(x, default=np.nan):
-    try:
-        return float(x)
-    except Exception:
-        return default
+@st.cache_data(ttl=30)
+def get_klines(symbol, interval, limit=250):
+    data = api_get(
+        f"{BINANCE}/api/v3/klines",
+        {"symbol": symbol, "interval": interval, "limit": limit},
+    )
+    if not data:
+        raise ValueError("داده کندلی دریافت نشد.")
 
+    cols = [
+        "open_time", "open", "high", "low", "close", "volume",
+        "close_time", "quote_volume", "trades", "taker_buy_base",
+        "taker_buy_quote", "ignore"
+    ]
+    df = pd.DataFrame(data, columns=cols)
 
-def clean_symbol(s):
-    return str(s).upper().replace("-", "").replace("_", "").replace("/", "")
-
-
-def quote_of(s):
-    s = clean_symbol(s)
-    for q in ("USDT", "USDC", "FDUSD", "BUSD", "IRT", "RLS", "BTC", "ETH"):
-        if s.endswith(q) and len(s) > len(q):
-            return q
-    return ""
-
-
-def base_of(s):
-    q = quote_of(s)
-    return clean_symbol(s)[:-len(q)] if q else clean_symbol(s)
-
-
-# ---------------- Binance ----------------
-@st.cache_data(ttl=180, show_spinner=False)
-def binance_markets():
-    d = get_json(f"{BINANCE}/api/v3/exchangeInfo")
-    return sorted({str(x["symbol"]).upper() for x in d.get("symbols", [])
-                   if x.get("status") == "TRADING" and str(x.get("symbol", "")).upper().endswith("USDT")})
-
-
-@st.cache_data(ttl=30, show_spinner=False)
-def binance_price(symbol):
-    d = get_json(f"{BINANCE}/api/v3/ticker/price", {"symbol": clean_symbol(symbol)})
-    return fnum(d.get("price"))
-
-
-@st.cache_data(ttl=30, show_spinner=False)
-def binance_candles(symbol, interval, limit=300):
-    d = get_json(f"{BINANCE}/api/v3/klines", {
-        "symbol": clean_symbol(symbol), "interval": interval, "limit": min(limit, 1000)
-    })
-    if not isinstance(d, list) or len(d) < 80:
-        raise RuntimeError("کندل Binance کافی نیست")
-    df = pd.DataFrame(d, columns=["t","o","h","l","c","v","ct","qv","n","tb","tq","x"])
-    for c in ["o","h","l","c","v","qv"]:
+    numeric_cols = ["open", "high", "low", "close", "volume", "quote_volume"]
+    for c in numeric_cols:
         df[c] = pd.to_numeric(df[c], errors="coerce")
-    df["t"] = pd.to_datetime(df["t"], unit="ms")
-    return df.rename(columns={"t":"open_time","o":"open","h":"high","l":"low","c":"close","v":"volume","qv":"quote_volume"})[["open_time","open","high","low","close","volume","quote_volume"]].dropna()
 
+    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
+    df = df.dropna(subset=["open", "high", "low", "close"]).reset_index(drop=True)
 
-# ---------------- Wallex ----------------
-@st.cache_data(ttl=180, show_spinner=False)
-def wallex_markets():
-    d = get_json(f"{WALLEX}/v1/markets")
-    syms = d.get("result", {}).get("symbols", {})
-    if isinstance(syms, dict):
-        return sorted({clean_symbol(k) for k in syms.keys() if clean_symbol(k)})
-    raise RuntimeError("لیست بازار والکس دریافت نشد")
+    if len(df) < 60:
+        raise ValueError("تعداد کندل کافی نیست.")
 
+    return df
 
-@st.cache_data(ttl=30, show_spinner=False)
-def wallex_price(symbol):
-    d = get_json(f"{WALLEX}/v1/markets")
-    item = d.get("result", {}).get("symbols", {}).get(str(symbol).upper())
-    if not item:
-        # try exact key from returned dictionary
-        for k, v in d.get("result", {}).get("symbols", {}).items():
-            if clean_symbol(k) == clean_symbol(symbol):
-                item = v
-                break
-    p = (item or {}).get("stats", {}).get("lastPrice")
-    if p is None:
-        raise RuntimeError("قیمت والکس پیدا نشد")
-    return fnum(p)
+def ema(s, n):
+    return s.ewm(span=n, adjust=False).mean()
 
+def rsi(s, n=14):
+    delta = s.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1/n, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1/n, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    out = 100 - (100 / (1 + rs))
+    return out.fillna(50)
 
-def udf_df(d):
-    if not isinstance(d, dict) or d.get("s") not in ("ok", "no_data"):
-        raise RuntimeError("پاسخ کندل معتبر نیست")
-    n = min(*(len(d.get(k, [])) for k in ["t","o","h","l","c","v"]))
-    if n < 80:
-        raise RuntimeError("کندل کافی نیست")
-    return pd.DataFrame({
-        "open_time": pd.to_datetime(pd.to_numeric(d["t"][:n]), unit="s"),
-        "open": pd.to_numeric(d["o"][:n], errors="coerce"),
-        "high": pd.to_numeric(d["h"][:n], errors="coerce"),
-        "low": pd.to_numeric(d["l"][:n], errors="coerce"),
-        "close": pd.to_numeric(d["c"][:n], errors="coerce"),
-        "volume": pd.to_numeric(d["v"][:n], errors="coerce"),
-    }).dropna()
+def atr(df, n=14):
+    prev = df["close"].shift(1)
+    tr = pd.concat(
+        [
+            df["high"] - df["low"],
+            (df["high"] - prev).abs(),
+            (df["low"] - prev).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    return tr.ewm(alpha=1/n, adjust=False).mean()
 
+def macd(s):
+    fast = ema(s, 12)
+    slow = ema(s, 26)
+    line = fast - slow
+    signal = ema(line, 9)
+    hist = line - signal
+    return line, signal, hist
 
-@st.cache_data(ttl=45, show_spinner=False)
-def wallex_candles(symbol, interval, limit=300):
-    res = {"15m":15, "1h":60, "4h":240, "1d":"D"}[interval]
-    sec = {"15m":900, "1h":3600, "4h":14400, "1d":86400}[interval]
-    now = int(time.time())
-    d = get_json(f"{WALLEX}/v1/udf/history", {
-        "symbol": str(symbol).upper(), "resolution":res,
-        "from":now-sec*(limit+50), "to":now
-    })
-    return udf_df(d).tail(limit)
+def analyze_frame(df):
+    close = df["close"]
+    e20 = ema(close, 20)
+    e50 = ema(close, 50)
+    e200 = ema(close, 200)
+    rv = rsi(close)
+    ml, ms, mh = macd(close)
+    av = atr(df)
 
+    i = len(df) - 1
+    price = float(close.iloc[i])
 
-# ---------------- Nobitex ----------------
-@st.cache_data(ttl=180, show_spinner=False)
-def nobitex_markets():
-    d = get_json(f"{NOBITEX}/market/stats")
-    return sorted({clean_symbol(k) for k in d.get("stats", {}).keys() if "-" in str(k)})
+    score = 50.0
+    reasons = []
 
+    if price > e20.iloc[i]:
+        score += 8
+        reasons.append("قیمت بالای EMA20")
+    else:
+        score -= 8
+        reasons.append("قیمت زیر EMA20")
 
-def nobitex_parts(symbol):
-    s = clean_symbol(symbol)
-    if s.endswith("USDT"):
-        return s[:-4].lower(), "usdt"
-    if s.endswith("IRT"):
-        return s[:-3].lower(), "rls"
-    if s.endswith("RLS"):
-        return s[:-3].lower(), "rls"
-    return base_of(s).lower(), "usdt"
+    if e20.iloc[i] > e50.iloc[i]:
+        score += 10
+        reasons.append("EMA20 بالای EMA50")
+    else:
+        score -= 10
+        reasons.append("EMA20 زیر EMA50")
 
+    if price > e200.iloc[i]:
+        score += 8
+        reasons.append("قیمت بالای EMA200")
+    else:
+        score -= 8
+        reasons.append("قیمت زیر EMA200")
 
-@st.cache_data(ttl=30, show_spinner=False)
-def nobitex_price(symbol):
-    src, dst = nobitex_parts(symbol)
-    d = get_json(f"{NOBITEX}/market/stats", {"srcCurrency":src, "dstCurrency":dst})
-    item = d.get("stats", {}).get(f"{src}-{dst}")
-    if not item:
-        raise RuntimeError("قیمت نوبیتکس پیدا نشد")
-    return fnum(item.get("latest"))
+    r = float(rv.iloc[i])
+    if 50 <= r <= 68:
+        score += 8
+        reasons.append("RSI صعودی و متعادل")
+    elif r >= 75:
+        score -= 5
+        reasons.append("RSI بیش‌خرید")
+    elif r < 35:
+        score -= 4
+        reasons.append("RSI ضعیف")
 
+    if ml.iloc[i] > ms.iloc[i]:
+        score += 8
+        reasons.append("MACD مثبت")
+    else:
+        score -= 8
+        reasons.append("MACD منفی")
 
-@st.cache_data(ttl=45, show_spinner=False)
-def nobitex_candles(symbol, interval, limit=300):
-    src, dst = nobitex_parts(symbol)
-    res = {"15m":15, "1h":60, "4h":240, "1d":"D"}[interval]
-    sec = {"15m":900, "1h":3600, "4h":14400, "1d":86400}[interval]
-    now = int(time.time())
-    d = get_json(f"{NOBITEX}/market/udf/history", {
-        "symbol":f"{src.upper()}{dst.upper()}", "resolution":res,
-        "from":now-sec*(limit+50), "to":now
-    })
-    return udf_df(d).tail(limit)
+    if mh.iloc[i] > mh.iloc[i - 1]:
+        score += 5
+    else:
+        score -= 3
 
+    score = float(np.clip(score, 0, 100))
 
-# ---------------- Tabdeal ----------------
-def tabdeal_name(symbol):
-    s = clean_symbol(symbol)
-    q = quote_of(s)
-    return f"{s[:-len(q)]}_{q}" if q else s
+    recent = df.tail(60)
+    support = float(recent["low"].min())
+    resistance = float(recent["high"].max())
+    atr_value = float(av.iloc[i])
 
+    return {
+        "price": price,
+        "score": score,
+        "rsi": r,
+        "macd_hist": float(mh.iloc[i]),
+        "atr": atr_value,
+        "ema20": float(e20.iloc[i]),
+        "ema50": float(e50.iloc[i]),
+        "ema200": float(e200.iloc[i]),
+        "support": support,
+        "resistance": resistance,
+        "reasons": reasons,
+    }
 
-def extract_symbols(obj):
-    out=[]
-    if isinstance(obj, dict):
-        for k,v in obj.items():
-            if str(k).lower() in ("symbol","tabdealsymbol") and isinstance(v,str):
-                out.append(clean_symbol(v))
-            else:
-                out.extend(extract_symbols(v))
-    elif isinstance(obj,list):
-        for v in obj:
-            out.extend(extract_symbols(v))
-    return out
+def combine_signals(frames):
+    scores = [x["score"] for x in frames]
+    avg_score = float(np.mean(scores))
+    bullish = sum(x["score"] >= 55 for x in frames)
+    bearish = sum(x["score"] <= 45 for x in frames)
 
+    latest = frames[0]
+    price = latest["price"]
+    atr_value = max(latest["atr"], price * 0.003)
 
-@st.cache_data(ttl=180, show_spinner=False)
-def tabdeal_markets():
-    d = get_json(f"{TABDEAL}/r/api/v1/exchangeInfo")
-    out = [s for s in extract_symbols(d) if 5 <= len(s) <= 25 and s.isalnum()]
-    if not out:
-        raise RuntimeError("لیست بازارهای تبدیل دریافت نشد")
-    return sorted(set(out))
+    # فقط در صورت هم‌جهتی حداقل دو تایم‌فریم سیگنال صادر می‌شود.
+    if bullish >= 2 and avg_score >= 62:
+        action = "BUY"
+        entry = price
+        sl = entry - 1.5 * atr_value
+        risk = entry - sl
+        tp1 = entry + 1.0 * risk
+        tp2 = entry + 2.0 * risk
+        tp3 = entry + 3.0 * risk
+    elif bearish >= 2 and avg_score <= 38:
+        action = "SELL"
+        entry = price
+        sl = entry + 1.5 * atr_value
+        risk = sl - entry
+        tp1 = entry - 1.0 * risk
+        tp2 = entry - 2.0 * risk
+        tp3 = entry - 3.0 * risk
+    else:
+        action = "WAIT"
+        entry = price
+        sl = np.nan
+        tp1 = np.nan
+        tp2 = np.nan
+        tp3 = np.nan
 
+    return {
+        "action": action,
+        "score": round(avg_score, 1),
+        "entry": entry,
+        "sl": sl,
+        "tp1": tp1,
+        "tp2": tp2,
+        "tp3": tp3,
+        "bullish_frames": bullish,
+        "bearish_frames": bearish,
+    }
 
-@st.cache_data(ttl=30, show_spinner=False)
-def tabdeal_price(symbol):
-    ts = tabdeal_name(symbol)
-    last = None
-    for params in ({"tabdealSymbol":ts}, {"symbol":clean_symbol(symbol)}):
+def full_analysis(symbol):
+    # 1D برای ساختن سیگنال بلندمدت، 4H و 1H برای تأیید.
+    intervals = ["1h", "4h", "1d"]
+    frames = []
+    for interval in intervals:
+        df = get_klines(symbol, interval, 250)
+        frames.append(analyze_frame(df))
+    result = combine_signals(frames)
+    result["frames"] = frames
+    return result
+
+@st.cache_data(ttl=60)
+def scan_market(symbols):
+    rows = []
+    for symbol in symbols:
         try:
-            d = get_json(f"{TABDEAL}/r/api/v1/depth", params)
-            bids, asks = d.get("bids", []), d.get("asks", [])
-            if bids and asks:
-                return (fnum(bids[0][0]) + fnum(asks[0][0]))/2
-            if bids: return fnum(bids[0][0])
-            if asks: return fnum(asks[0][0])
+            result = full_analysis(symbol)
+            rows.append({
+                "ارز": symbol,
+                "سیگنال": result["action"],
+                "امتیاز": result["score"],
+                "قیمت": result["entry"],
+                "ورود": result["entry"],
+                "حدضرر": result["sl"],
+                "TP1": result["tp1"],
+                "TP2": result["tp2"],
+                "تایم‌فریم صعودی": result["bullish_frames"],
+                "تایم‌فریم نزولی": result["bearish_frames"],
+            })
         except Exception as e:
-            last=e
-    raise RuntimeError(f"قیمت تبدیل پیدا نشد: {ts}") from last
+            rows.append({
+                "ارز": symbol,
+                "سیگنال": "ERROR",
+                "امتیاز": 0,
+                "قیمت": np.nan,
+                "ورود": np.nan,
+                "حدضرر": np.nan,
+                "TP1": np.nan,
+                "TP2": np.nan,
+                "تایم‌فریم صعودی": 0,
+                "تایم‌فریم نزولی": 0,
+            })
 
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    return df.sort_values("امتیاز", ascending=False).reset_index(drop=True)
 
-# IMPORTANT: For Tabdeal USDT markets use Binance OHLC as technical-history fallback.
-# This prevents the known /trades?symbol=...&limit=2000 400 error from breaking analysis.
-@st.cache_data(ttl=45, show_spinner=False)
-def tabdeal_candles(symbol, interval):
-    s = clean_symbol(symbol)
-    if quote_of(s) == "USDT":
-        return binance_candles(s, interval)
-    raise RuntimeError("برای این بازار تبدیل تاریخچه کندلی عمومی کافی نیست")
+st.title("📈 ربات تحلیل حرفه‌ای کریپتو")
+st.caption("تحلیل تکنیکال | BUY / SELL / WAIT | بدون ثبت سفارش")
 
-
-# ---------------- Router ----------------
-def markets(exchange):
-    if exchange == "Binance": return binance_markets()
-    if exchange == "والکس": return wallex_markets()
-    if exchange == "نوبیتکس": return nobitex_markets()
-    return tabdeal_markets()
-
-
-def price(exchange, symbol):
-    if exchange == "Binance": return binance_price(symbol)
-    if exchange == "والکس": return wallex_price(symbol)
-    if exchange == "نوبیتکس": return nobitex_price(symbol)
-    return tabdeal_price(symbol)
-
-
-def candles(exchange, symbol, tf):
-    if exchange == "Binance": return binance_candles(symbol, tf)
-    if exchange == "والکس": return wallex_candles(symbol, tf)
-    if exchange == "نوبیتکس": return nobitex_candles(symbol, tf)
-    return tabdeal_candles(symbol, tf)
-
-
-# ---------------- Indicators ----------------
-def add_indicators(df):
-    x=df.copy()
-    x["ema20"]=x.close.ewm(span=20,adjust=False).mean()
-    x["ema50"]=x.close.ewm(span=50,adjust=False).mean()
-    x["ema200"]=x.close.ewm(span=200,adjust=False).mean()
-    d=x.close.diff()
-    gain=d.clip(lower=0).ewm(alpha=1/14,adjust=False,min_periods=14).mean()
-    loss=(-d.clip(upper=0)).ewm(alpha=1/14,adjust=False,min_periods=14).mean()
-    rs=gain/loss.replace(0,np.nan)
-    x["rsi"]=(100-100/(1+rs)).fillna(50)
-    x["macd"]=x.close.ewm(span=12,adjust=False).mean()-x.close.ewm(span=26,adjust=False).mean()
-    x["macd_signal"]=x.macd.ewm(span=9,adjust=False).mean()
-    prev=x.close.shift(1)
-    tr=pd.concat([x.high-x.low,(x.high-prev).abs(),(x.low-prev).abs()],axis=1).max(axis=1)
-    x["atr"]=tr.ewm(alpha=1/14,adjust=False,min_periods=14).mean()
-    x["vol_ratio"]=x.volume/x.volume.rolling(20).mean().replace(0,np.nan)
-    return x.dropna().reset_index(drop=True)
-
-
-def score_tf(df):
-    x=add_indicators(df)
-    if len(x)<20: raise RuntimeError("اندیکاتور کافی نیست")
-    a=x.iloc[-1]; p=x.iloc[-2]
-    score=50
-    if a.ema20>a.ema50: score+=10
-    else: score-=10
-    if a.close>a.ema200: score+=10
-    else: score-=10
-    if a.macd>a.macd_signal: score+=8
-    else: score-=8
-    if a.macd>a.macd_signal and a.macd-p.macd>0: score+=4
-    if a.macd<a.macd_signal and a.macd-p.macd<0: score-=4
-    if 50<=a.rsi<=68: score+=8
-    elif a.rsi>72: score-=7
-    elif a.rsi<30: score+=2
-    else: score-=1
-    vr=fnum(a.vol_ratio,1)
-    if vr>=1.5: score+=7
-    elif vr>=1.1: score+=3
-    return int(np.clip(score,0,100)),x
-
-
-def support_resistance(x):
-    r=x.tail(60)
-    return float(r.low.min()),float(r.high.max())
-
-
-def signal(scores, main):
-    """BUY/SELL only with multi-timeframe confirmation; otherwise WAIT."""
-    s1,s4=scores.get("1h"),scores.get("4h")
-    a=main.iloc[-1]
-    bull=(a.ema20>a.ema50 and a.close>a.ema200 and a.macd>a.macd_signal and 50<=a.rsi<=70)
-    bear=(a.ema20<a.ema50 and a.close<a.ema200 and a.macd<a.macd_signal and 30<=a.rsi<=50)
-    if s1 is not None and s4 is not None:
-        bull = bull and s1>=60 and s4>=60
-        bear = bear and s1<=40 and s4<=40
-    vals=[v for v in scores.values() if v is not None]
-    total=round(float(np.mean(vals))) if vals else 50
-    if total>=68 and bull: return "BUY",total
-    if total<=32 and bear: return "SELL",total
-    return "WAIT",total
-
-
-def levels(side, entry, atrv, sup, res):
-    atrv=max(float(atrv) if np.isfinite(atrv) and atrv>0 else entry*.02, entry*.005)
-    if side=="BUY":
-        sl=min(entry-1.5*atrv, sup*.995 if sup<entry else entry-1.5*atrv)
-        risk=max(entry-sl,entry*.005)
-        return sl,entry+1.5*risk,entry+2.5*risk,entry+4*risk
-    if side=="SELL":
-        sl=max(entry+1.5*atrv,res*1.005 if res>entry else entry+1.5*atrv)
-        risk=max(sl-entry,entry*.005)
-        return sl,entry-1.5*risk,entry-2.5*risk,entry-4*risk
-    return np.nan,np.nan,np.nan,np.nan
-
-
-def fmt(v):
-    if v is None or not np.isfinite(v): return "-"
-    if abs(v)>=1000:return f"{v:,.2f}"
-    if abs(v)>=1:return f"{v:.4f}"
-    return f"{v:.8f}"
-
-
-# ---------------- Scanner ----------------
-def scanner_universe(ms, n):
-    preferred=["BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT","BNBUSDT","DOGEUSDT","ADAUSDT","AVAXUSDT","LINKUSDT","TRXUSDT","SHIBUSDT","DOTUSDT","LTCUSDT","SUIUSDT","PEPEUSDT","ARBUSDT","OPUSDT","APTUSDT","NEARUSDT"]
-    clean=[]
-    for m in ms:
-        s=clean_symbol(m)
-        if quote_of(s) in ("USDT","IRT","RLS") and base_of(s) not in ("USDT","USDC","IRT","RLS"):
-            clean.append(s)
-    out=[x for x in preferred if x in clean]
-    out += [x for x in clean if x not in out]
-    return out[:n]
-
-
-def scan_market(exchange,symbol,tfs):
-    scores={}; main=None; last=None
-    for tf in tfs:
-        try:
-            sc,x=score_tf(candles(exchange,symbol,tf))
-            scores[tf]=sc
-            if tf=="4h" or main is None:
-                main=x; last=x.iloc[-1]
-        except Exception:
-            scores[tf]=None
-    valid=[v for v in scores.values() if v is not None]
-    if len(valid)<2 or main is None:
-        raise RuntimeError("داده حداقل دو تایم‌فریم موجود نیست")
-    side,total=signal(scores,main)
-    entry=price(exchange,symbol)
-    sup,res=support_resistance(main)
-    sl,tp1,tp2,tp3=levels(side,entry,last.atr,sup,res)
-    return {"بازار":symbol,"امتیاز":total,"سیگنال":side,"قیمت":entry,"ورود":entry,"حدضرر":sl,"TP1":tp1,"TP2":tp2,"TP3":tp3,"حمایت":sup,"مقاومت":res,"1h":scores.get("1h"),"4h":scores.get("4h")}
-
-
-def run_scan(exchange,ms,n,tfs):
-    rows=[]
-    bar=st.progress(0)
-    syms=scanner_universe(ms,n)
-    for i,s in enumerate(syms,1):
-        try: rows.append(scan_market(exchange,s,tfs))
-        except Exception as e: rows.append({"بازار":s,"امتیاز":np.nan,"سیگنال":"WAIT","خطا":str(e)[:45]})
-        bar.progress(i/len(syms),text=f"اسکن {s} | {i}/{len(syms)}")
-    bar.empty()
-    return pd.DataFrame(rows).sort_values("امتیاز",ascending=False,na_position="last").reset_index(drop=True)
-
-
-# ---------------- UI ----------------
 with st.sidebar:
-    st.header("🏦 صرافی")
-    exchange=st.selectbox("انتخاب صرافی",EXCHANGES)
-    try:
-        ms=markets(exchange)
-        st.success(f"{len(ms)} بازار دریافت شد")
-    except Exception as e:
-        ms=[]
-        st.error("لیست بازارها دریافت نشد")
-        st.caption(str(e))
-    symbol=st.selectbox("🪙 ارز / بازار",ms if ms else ["BTCUSDT"])
-    tf=st.selectbox("⏱ تایم‌فریم",TFS,index=2)
-    analyze=st.button("🚀 تحلیل",use_container_width=True)
-    st.divider()
-    st.header("🔎 اسکن چند ارز")
-    n=st.slider("تعداد ارز",5,30,15,5)
-    mode=st.selectbox("نوع اسکن",["سریع: 1h + 4h","کامل: 15m + 1h + 4h + 1d"])
-    scan=st.button("🔎 شروع اسکن",use_container_width=True)
+    st.header("⚙️ تنظیمات")
+    symbol = st.selectbox("ارز برای تحلیل", COINS, index=0)
+    scan_count = st.slider("تعداد ارز برای اسکن", 5, len(COINS), 10)
+    st.info("داده تکنیکال این نسخه از بازار عمومی Binance دریافت می‌شود.")
 
-if scan:
-    tfs=["1h","4h"] if mode.startswith("سریع") else ["15m","1h","4h","1d"]
-    st.subheader("🔎 نتیجه اسکن بازار")
-    if not ms:
-        st.error("لیست بازار صرافی موجود نیست")
-    else:
-        with st.spinner("در حال اسکن..."):
-            result=run_scan(exchange,ms,n,tfs)
-        valid=result[pd.to_numeric(result["امتیاز"],errors="coerce").notna()].head(3)
-        if valid.empty:
-            st.warning("هیچ بازار دارای داده کافی پیدا نشد")
-        else:
-            st.markdown("### 🏆 ۳ بازار با بالاترین امتیاز محاسباتی")
-            cols=st.columns(len(valid))
-            for col,(_,r) in zip(cols,valid.iterrows()):
-                with col:
-                    st.metric(r["بازار"],f"{int(r['امتیاز'])}/100")
-                    if r["سیگنال"]=="BUY": st.success("🟢 BUY")
-                    elif r["سیگنال"]=="SELL": st.error("🔴 SELL")
-                    else: st.warning("🟡 WAIT")
-                    st.write(f"ورود: **{fmt(r['ورود'])}**")
-                    st.write(f"SL: **{fmt(r['حدضرر'])}**")
-                    st.write(f"TP1: **{fmt(r['TP1'])}**")
-                    st.write(f"TP2: **{fmt(r['TP2'])}**")
-            show=result[[c for c in ["بازار","امتیاز","سیگنال","ورود","حدضرر","TP1","TP2","TP3","حمایت","مقاومت","1h","4h"] if c in result.columns]].copy()
-            for c in ["ورود","حدضرر","TP1","TP2","TP3","حمایت","مقاومت"]:
-                if c in show: show[c]=show[c].apply(lambda x:fmt(fnum(x)))
-            st.dataframe(show,use_container_width=True,hide_index=True)
+tab1, tab2 = st.tabs(["📊 تحلیل ارز", "🔎 اسکن بازار"])
 
-# ---------------- Single analysis ----------------
-try:
-    p=price(exchange,symbol)
-    all_scores={}; data={}
-    for x_tf in TFS:
+with tab1:
+    if st.button("تحلیل الآن", type="primary", use_container_width=True):
         try:
-            sc,x=score_tf(candles(exchange,symbol,x_tf))
-            all_scores[x_tf]=sc; data[x_tf]=x
-        except Exception:
-            all_scores[x_tf]=None
-    main=data.get(tf) or data.get("4h") or data.get("1h")
-    if main is None: raise RuntimeError("داده کافی برای تحلیل وجود ندارد")
-    side,total=signal(all_scores,main)
-    last=main.iloc[-1]
-    sup,res=support_resistance(main)
-    sl,tp1,tp2,tp3=levels(side,p,last.atr,sup,res)
+            result = full_analysis(symbol)
+            action = result["action"]
 
-    st.subheader(f"{exchange} | {symbol}")
-    if side=="BUY":
-        st.markdown('<div class="signal">🟢 BUY — شرایط خرید تأیید شده</div>',unsafe_allow_html=True)
-    elif side=="SELL":
-        st.markdown('<div class="signal">🔴 SELL — شرایط فروش/خروج تأیید شده</div>',unsafe_allow_html=True)
-    else:
-        st.markdown('<div class="signal">🟡 WAIT — فعلاً دست نگه دار</div>',unsafe_allow_html=True)
+            if action == "BUY":
+                st.success("🟢 BUY — شرایط محاسباتی خرید")
+            elif action == "SELL":
+                st.error("🔴 SELL — شرایط محاسباتی فروش/خروج")
+            else:
+                st.warning("🟡 WAIT — فعلاً دست نگه دار")
 
-    c1,c2,c3,c4=st.columns(4)
-    c1.metric("قیمت",fmt(p)); c2.metric("امتیاز",f"{total}/100"); c3.metric("RSI",f"{last.rsi:.1f}"); c4.metric("ATR",fmt(last.atr))
-    st.markdown("### 🎯 سطوح معامله")
-    a,b,c,d=st.columns(4)
-    a.metric("ورود",fmt(p)); b.metric("حدضرر",fmt(sl)); c.metric("TP1",fmt(tp1)); d.metric("TP2",fmt(tp2))
-    st.metric("TP3",fmt(tp3))
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("امتیاز", result["score"])
+            c2.metric("ورود", f'{result["entry"]:,.8g}')
+            c3.metric("TP1", "-" if np.isnan(result["tp1"]) else f'{result["tp1"]:,.8g}')
+            c4.metric("TP2", "-" if np.isnan(result["tp2"]) else f'{result["tp2"]:,.8g}')
 
-    st.markdown("### 🧭 تایم‌فریم‌ها")
-    rows=[]
-    for k in TFS:
-        s=all_scores.get(k)
-        rows.append({"تایم‌فریم":k,"امتیاز":"-" if s is None else s,"وضعیت":"داده ندارد" if s is None else ("صعودی" if s>=60 else "نزولی" if s<=40 else "خنثی")})
-    st.dataframe(pd.DataFrame(rows),use_container_width=True,hide_index=True)
+            c5, c6, c7 = st.columns(3)
+            c5.metric("حدضرر", "-" if np.isnan(result["sl"]) else f'{result["sl"]:,.8g}')
+            c6.metric("TP3", "-" if np.isnan(result["tp3"]) else f'{result["tp3"]:,.8g}')
+            c7.metric("هم‌جهتی", f'{result["bullish_frames"]} صعودی / {result["bearish_frames"]} نزولی')
 
-    st.markdown("### 📊 نمودار")
-    chart=main.tail(150).set_index("open_time")[["close","ema20","ema50"]]
-    st.line_chart(chart,use_container_width=True)
+            st.subheader("تایم‌فریم‌ها")
+            tf_names = ["1H", "4H", "1D"]
+            tf_rows = []
+            for name, frame in zip(tf_names, result["frames"]):
+                tf_rows.append({
+                    "تایم‌فریم": name,
+                    "امتیاز": round(frame["score"], 1),
+                    "RSI": round(frame["rsi"], 1),
+                    "حمایت": frame["support"],
+                    "مقاومت": frame["resistance"],
+                })
+            st.dataframe(pd.DataFrame(tf_rows), use_container_width=True, hide_index=True)
 
-    st.caption(f"آخرین بروزرسانی: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | تحلیل عمومی، بدون ثبت سفارش")
-except Exception as e:
-    st.error(f"تحلیل انجام نشد: {e}")
+            st.subheader("دلایل تحلیل")
+            for reason in result["frames"][0]["reasons"]:
+                st.write("•", reason)
+
+        except Exception as e:
+            st.error(f"خطا در تحلیل: {e}")
+
+with tab2:
+    st.write("اسکنر چند ارز را بررسی می‌کند و سه امتیاز بالاتر را جداگانه نشان می‌دهد.")
+    if st.button("🔎 شروع اسکن", type="primary", use_container_width=True):
+        with st.spinner("در حال اسکن بازار..."):
+            result_df = scan_market(COINS[:scan_count])
+
+        valid = result_df[result_df["سیگنال"] != "ERROR"].copy()
+
+        if valid.empty:
+            st.error("هیچ داده‌ای برای اسکن دریافت نشد.")
+        else:
+            top3 = valid.head(3)
+
+            st.subheader("🏆 سه ارز با بالاترین امتیاز محاسباتی")
+            cols = st.columns(3)
+            for idx, (_, row) in enumerate(top3.iterrows()):
+                with cols[idx]:
+                    signal = row["سیگنال"]
+                    if signal == "BUY":
+                        st.success(f'🥇 {row["ارز"]} — BUY')
+                    elif signal == "SELL":
+                        st.error(f'🔴 {row["ارز"]} — SELL')
+                    else:
+                        st.warning(f'🟡 {row["ارز"]} — WAIT')
+                    st.metric("امتیاز", row["امتیاز"])
+                    st.write(f'ورود: {row["ورود"]:,.8g}')
+                    if pd.notna(row["حدضرر"]):
+                        st.write(f'SL: {row["حدضرر"]:,.8g}')
+                        st.write(f'TP1: {row["TP1"]:,.8g}')
+                        st.write(f'TP2: {row["TP2"]:,.8g}')
+
+            st.subheader("جدول کامل اسکن")
+            display = valid.copy()
+            for col in ["قیمت", "ورود", "حدضرر", "TP1", "TP2"]:
+                display[col] = display[col].map(
+                    lambda x: "-" if pd.isna(x) else f"{x:,.8g}"
+                )
+            st.dataframe(display, use_container_width=True, hide_index=True)
+
+st.caption(f"آخرین اجرای برنامه: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")

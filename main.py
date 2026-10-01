@@ -19,8 +19,13 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+# Multiple public Binance endpoints. The app tries them in order and
+# automatically falls back when one endpoint is unavailable.
 BINANCE_ENDPOINTS = [
     "https://api.binance.com",
+    "https://api1.binance.com",
+    "https://api2.binance.com",
+    "https://api3.binance.com",
     "https://data-api.binance.vision",
 ]
 WALLEX_BASE = "https://api.wallex.ir"
@@ -54,18 +59,44 @@ st.caption(
     "اتصال داده بازار: Binance، والکس، نوبیتکس و تبدیل | "
     "تحلیل چندتایم‌فریمی | BUY / SELL / HOLD | بدون ثبت سفارش"
 )
+st.caption(
+    "🛡️ پایداری اتصال: اگر API یک صرافی برای بازار USDT در دسترس نباشد، "
+    "برنامه به‌صورت خودکار از داده عمومی Binance برای ادامه تحلیل استفاده می‌کند."
+)
 
 # -------------------- Generic HTTP --------------------
 
-def http_get(url, params=None, timeout=15):
-    r = requests.get(
-        url,
-        params=params,
-        timeout=timeout,
-        headers={"User-Agent": "CryptoAnalyzerPro/2.0"},
-    )
-    r.raise_for_status()
-    return r.json()
+def http_get(url, params=None, timeout=15, retries=2):
+    """GET JSON with small retries.
+
+    This is intentionally conservative: retries help with transient network,
+    DNS, 429 and 5xx failures without making the public APIs suffer a large
+    request burst.
+    """
+    last = None
+    for attempt in range(max(1, int(retries) + 1)):
+        try:
+            r = requests.get(
+                url,
+                params=params,
+                timeout=timeout,
+                headers={
+                    "User-Agent": "CryptoAnalyzerPro/3.0",
+                    "Accept": "application/json",
+                },
+            )
+            if r.status_code == 429 or 500 <= r.status_code < 600:
+                last = RuntimeError(f"HTTP {r.status_code}")
+                if attempt < retries:
+                    time.sleep(0.8 * (attempt + 1))
+                    continue
+            r.raise_for_status()
+            return r.json()
+        except (requests.exceptions.RequestException, ValueError) as exc:
+            last = exc
+            if attempt < retries:
+                time.sleep(0.8 * (attempt + 1))
+    raise last if last is not None else RuntimeError("HTTP request failed")
 
 def unix_now():
     return int(time.time())
@@ -80,6 +111,25 @@ def safe_float(x, default=np.nan):
         return default
 
 # -------------------- Market lists --------------------
+
+def compact_symbol(symbol):
+    return str(symbol).upper().replace("-", "").replace("_", "").replace("/", "")
+
+def is_usdt_symbol(symbol):
+    return compact_symbol(symbol).endswith("USDT")
+
+@st.cache_data(ttl=180, show_spinner=False)
+def fallback_usdt_markets():
+    """Use Binance USDT markets as a read-only fallback universe."""
+    try:
+        return binance_markets()
+    except Exception:
+        return [
+            "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "BNBUSDT",
+            "DOGEUSDT", "ADAUSDT", "AVAXUSDT", "LINKUSDT", "TRXUSDT",
+            "DOTUSDT", "LTCUSDT", "SHIBUSDT", "ATOMUSDT", "NEARUSDT",
+            "ARBUSDT", "OPUSDT", "APTUSDT", "SUIUSDT", "PEPEUSDT",
+        ]
 
 @st.cache_data(ttl=180, show_spinner=False)
 def binance_markets():
@@ -130,18 +180,39 @@ def wallex_markets():
                     return sorted(set(out))
         except Exception as exc:
             last = exc
-    raise RuntimeError("لیست بازارهای والکس دریافت نشد.") from last
+    # Keep the app usable when the exchange API is temporarily unavailable.
+    # Only Binance-compatible USDT markets are returned as fallback.
+    return fallback_usdt_markets()
 
 @st.cache_data(ttl=180, show_spinner=False)
 def nobitex_markets():
-    data = http_get(f"{NOBITEX_BASE}/market/stats", timeout=15)
-    stats = data.get("stats", {})
-    out = []
-    for key in stats.keys():
-        k = str(key).upper().replace("-", "")
-        if k and k not in {"GLOBAL"}:
-            out.append(k)
-    return sorted(set(out))
+    try:
+        data = http_get(
+            f"{NOBITEX_BASE}/market/stats",
+            {"srcCurrency": "btc", "dstCurrency": "usdt"},
+            timeout=12,
+            retries=1,
+        )
+        # The endpoint can return one market when filters are supplied, so
+        # fetch the complete public stats response as the normal path.
+        if isinstance(data.get("stats"), dict) and data["stats"]:
+            stats = data["stats"]
+        else:
+            data = http_get(f"{NOBITEX_BASE}/market/stats", timeout=12, retries=1)
+            stats = data.get("stats", {})
+        out = []
+        for key in stats.keys():
+            k = str(key).upper().replace("-", "")
+            if k and k not in {"GLOBAL"}:
+                out.append(k)
+        if out:
+            return sorted(set(out))
+    except Exception:
+        pass
+
+    # If Render cannot resolve/reach api.nobitex.ir, keep the UI usable.
+    # USDT analysis can safely use Binance as the technical-data fallback.
+    return fallback_usdt_markets()
 
 def _collect_symbols(obj):
     found = []
@@ -170,7 +241,7 @@ def tabdeal_markets():
         if 5 <= len(s) <= 24 and s.isalnum()
     ]
     if not symbols:
-        raise RuntimeError("لیست بازارهای تبدیل دریافت نشد.")
+        return fallback_usdt_markets()
     return sorted(set(symbols))
 
 @st.cache_data(ttl=180, show_spinner=False)
@@ -460,25 +531,87 @@ def tabdeal_price(symbol):
 # -------------------- Exchange router --------------------
 
 def get_price(exchange, symbol):
+    """Read price from the selected exchange, then use Binance for USDT fallback."""
+    symbol = compact_symbol(symbol)
+
     if exchange == "Binance":
         return binance_price(symbol)
+
     if exchange == "والکس":
-        return wallex_price(symbol)
+        try:
+            return wallex_price(symbol)
+        except Exception as native_error:
+            if is_usdt_symbol(symbol):
+                try:
+                    return binance_price(symbol)
+                except Exception:
+                    raise native_error
+            raise
+
     if exchange == "نوبیتکس":
-        return nobitex_price(symbol)
+        try:
+            return nobitex_price(symbol)
+        except Exception as native_error:
+            if is_usdt_symbol(symbol):
+                try:
+                    return binance_price(symbol)
+                except Exception:
+                    raise native_error
+            raise
+
     if exchange == "تبدیل":
-        return tabdeal_price(symbol)
+        try:
+            return tabdeal_price(symbol)
+        except Exception as native_error:
+            if is_usdt_symbol(symbol):
+                try:
+                    return binance_price(symbol)
+                except Exception:
+                    raise native_error
+            raise
+
     raise RuntimeError("صرافی نامعتبر است.")
 
 def get_candles(exchange, symbol, interval):
+    """Read candles from the selected exchange, with Binance USDT fallback."""
+    symbol = compact_symbol(symbol)
+
     if exchange == "Binance":
         return binance_klines(symbol, interval)
+
     if exchange == "والکس":
-        return wallex_klines(symbol, interval)
+        try:
+            return wallex_klines(symbol, interval)
+        except Exception as native_error:
+            if is_usdt_symbol(symbol):
+                try:
+                    return binance_klines(symbol, interval)
+                except Exception:
+                    raise native_error
+            raise
+
     if exchange == "نوبیتکس":
-        return nobitex_klines(symbol, interval)
+        try:
+            return nobitex_klines(symbol, interval)
+        except Exception as native_error:
+            if is_usdt_symbol(symbol):
+                try:
+                    return binance_klines(symbol, interval)
+                except Exception:
+                    raise native_error
+            raise
+
     if exchange == "تبدیل":
-        return tabdeal_klines(symbol, interval)
+        try:
+            return tabdeal_klines(symbol, interval)
+        except Exception as native_error:
+            if is_usdt_symbol(symbol):
+                try:
+                    return binance_klines(symbol, interval)
+                except Exception:
+                    raise native_error
+            raise
+
     raise RuntimeError("صرافی نامعتبر است.")
 
 # -------------------- Indicators --------------------
@@ -1112,11 +1245,11 @@ try:
         j3.metric("نسبت حجم", f"{last['vol_ratio']:.2f}x")
 
     with st.expander("🏦 وضعیت اتصال صرافی‌ها"):
-        st.write(f"منبع فعال تحلیل: **{exchange}**")
-        st.write("Binance: متصل به داده عمومی")
-        st.write("والکس: متصل به داده عمومی")
-        st.write("نوبیتکس: متصل به داده عمومی")
-        st.write("تبدیل: متصل به داده عمومی")
+        st.write(f"منبع انتخاب‌شده: **{exchange}**")
+        st.write("Binance: منبع عمومی + چند مسیر جایگزین")
+        st.write("والکس: منبع عمومی؛ در USDT امکان fallback به Binance")
+        st.write("نوبیتکس: منبع عمومی؛ در USDT امکان fallback به Binance")
+        st.write("تبدیل: منبع عمومی؛ در USDT امکان fallback به Binance")
         st.caption(
             "در تبدیل، کندل‌های تکنیکال از معاملات عمومی اخیر ساخته می‌شوند؛ "
             "اگر تاریخچه کافی نباشد، همان بازار باید منبع داده جایگزین داشته باشد."
@@ -1145,8 +1278,11 @@ try:
     )
 
 except requests.exceptions.RequestException as exc:
-    st.error("ارتباط با API صرافی برقرار نشد.")
-    st.caption(str(exc))
+    st.error("ارتباط با منبع داده برقرار نشد.")
+    st.caption(
+        "اتصال اصلی و مسیرهای جایگزین برای این بازار موفق نشدند. "
+        f"جزئیات فنی: {exc}"
+    )
 except Exception as exc:
     st.error(f"تحلیل {symbol} در {exchange} انجام نشد.")
     st.caption(f"جزئیات فنی: {exc}")

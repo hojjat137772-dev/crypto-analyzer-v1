@@ -583,6 +583,146 @@ def money(v):
     return f"{v:.8f}"
 
 
+# -------------------- Probabilistic Forecast Engine --------------------
+
+def forecast_features(df):
+    """Build leakage-safe features available at candle close."""
+    x = add_indicators(df).copy()
+    close = x["close"].replace(0, np.nan)
+    x["ret1"] = close.pct_change(1)
+    x["ret3"] = close.pct_change(3)
+    x["ret6"] = close.pct_change(6)
+    x["ret12"] = close.pct_change(12)
+    x["ema20_gap"] = (close / x["ema20"]) - 1
+    x["ema50_gap"] = (close / x["ema50"]) - 1
+    x["ema200_gap"] = (close / x["ema200"]) - 1
+    x["macd_pct"] = x["macd_hist"] / close
+    x["atr_pct"] = x["atr"] / close
+    x["vol_ratio"] = x["vol_ratio"].replace([np.inf, -np.inf], np.nan)
+    x["rsi_norm"] = (x["rsi"] - 50) / 50
+    cols = [
+        "ret1", "ret3", "ret6", "ret12", "ema20_gap", "ema50_gap",
+        "ema200_gap", "macd_pct", "atr_pct", "vol_ratio", "rsi_norm"
+    ]
+    x = x.replace([np.inf, -np.inf], np.nan).dropna().reset_index(drop=True)
+    return x, cols
+
+
+def _fit_ridge(X, y, alpha=1e-3):
+    """Small numpy-only ridge regression; avoids adding sklearn dependency."""
+    X = np.asarray(X, dtype=float)
+    y = np.asarray(y, dtype=float)
+    mu = np.nanmean(X, axis=0)
+    sd = np.nanstd(X, axis=0)
+    sd[~np.isfinite(sd) | (sd < 1e-10)] = 1.0
+    Xz = (X - mu) / sd
+    A = np.column_stack([np.ones(len(Xz)), Xz])
+    reg = np.eye(A.shape[1]) * alpha
+    reg[0, 0] = 0.0
+    coef = np.linalg.solve(A.T @ A + reg, A.T @ y)
+    return coef, mu, sd
+
+
+def _predict_ridge(X, model):
+    coef, mu, sd = model
+    X = np.asarray(X, dtype=float)
+    Xz = (X - mu) / sd
+    A = np.column_stack([np.ones(len(Xz)), Xz])
+    return A @ coef
+
+
+def _forecast_one_horizon(feature_df, feature_cols, horizon, min_train=80):
+    """Walk-forward validation + final fit for one future horizon."""
+    n = len(feature_df)
+    if n <= horizon + min_train + 5:
+        return None
+
+    X_all = feature_df[feature_cols].to_numpy(dtype=float)
+    close = feature_df["close"].to_numpy(dtype=float)
+    future = np.full(n, np.nan)
+    future[:-horizon] = np.log(close[horizon:] / close[:-horizon])
+    valid = np.isfinite(future) & np.isfinite(X_all).all(axis=1)
+    idx = np.where(valid)[0]
+    if len(idx) < min_train + 20:
+        return None
+
+    # Hold out the latest observations for genuine out-of-sample validation.
+    val_count = min(40, max(20, len(idx) // 5))
+    train_idx = idx[:-val_count]
+    val_idx = idx[-val_count:]
+    if len(train_idx) < min_train:
+        return None
+
+    model = _fit_ridge(X_all[train_idx], future[train_idx], alpha=0.01)
+    val_pred = _predict_ridge(X_all[val_idx], model)
+    val_actual = future[val_idx]
+    residuals = val_actual - val_pred
+    direction_accuracy = float(np.mean(np.sign(val_pred) == np.sign(val_actual)) * 100)
+    mae = float(np.mean(np.abs(residuals)))
+    residual_std = float(np.std(residuals, ddof=1)) if len(residuals) > 1 else mae
+
+    # Refit on all historical examples before making the live forecast.
+    final_model = _fit_ridge(X_all[idx], future[idx], alpha=0.01)
+    latest_pred = float(_predict_ridge(X_all[[-1]], final_model)[0])
+    latest_price = float(close[-1])
+
+    # Convert residual uncertainty into a practical probability of a positive return.
+    sigma = max(residual_std, mae, 1e-5)
+    z = latest_pred / sigma
+    probability_up = float(np.clip(50 + 50 * np.tanh(z / 1.35), 1, 99))
+
+    # Forecast interval: model prediction +/- validation error, expressed as price.
+    low_ret = latest_pred - 1.28 * sigma
+    high_ret = latest_pred + 1.28 * sigma
+    low_price = latest_price * float(np.exp(low_ret))
+    high_price = latest_price * float(np.exp(high_ret))
+    target_price = latest_price * float(np.exp(latest_pred))
+
+    # Confidence combines historical directional accuracy and sample size.
+    sample_factor = min(1.0, len(train_idx) / 300.0)
+    confidence = float(np.clip(
+        0.55 * direction_accuracy + 45.0 * sample_factor,
+        0, 100
+    ))
+    direction = "صعودی" if latest_pred > max(0.002, sigma * 0.15) else (
+        "نزولی" if latest_pred < -max(0.002, sigma * 0.15) else "خنثی"
+    )
+
+    return {
+        "horizon": horizon,
+        "pred_return": latest_pred,
+        "target_price": target_price,
+        "low_price": min(low_price, high_price),
+        "high_price": max(low_price, high_price),
+        "probability_up": probability_up,
+        "direction_accuracy": direction_accuracy,
+        "mae": mae,
+        "confidence": confidence,
+        "direction": direction,
+        "samples": len(idx),
+    }
+
+
+def future_forecast(df_1h):
+    """Forecast 4h, 24h and 3d using 1h candles and walk-forward validation."""
+    feat, cols = forecast_features(df_1h)
+    if len(feat) < 140:
+        raise RuntimeError("برای پیش‌بینی، حداقل حدود 140 کندل 1h لازم است.")
+
+    horizons = [("4 ساعت", 4), ("24 ساعت", 24), ("3 روز", 72)]
+    rows = []
+    for label, bars in horizons:
+        result = _forecast_one_horizon(feat, cols, bars)
+        if result is None:
+            continue
+        result["label"] = label
+        rows.append(result)
+    if not rows:
+        raise RuntimeError("داده کافی برای ساخت پیش‌بینی احتمالی وجود ندارد.")
+
+    return pd.DataFrame(rows), feat
+
+
 # -------------------- Market Scanner --------------------
 
 STABLE_BASES = {
@@ -1105,6 +1245,7 @@ with st.sidebar:
     st.divider()
     st.header("🧪 بک‌تست")
     backtest_button = st.button("▶️ اجرای بک‌تست", use_container_width=True)
+    forecast_button = st.button("🔮 پیش‌بینی آینده ارز", use_container_width=True)
 
     st.divider()
     st.caption(
@@ -1192,6 +1333,62 @@ if backtest_button:
                 st.info("در این تاریخچه، سیگنال قابل بک‌تست پیدا نشد.")
         except Exception as exc:
             st.error(f"بک‌تست انجام نشد: {exc}")
+
+
+if forecast_button:
+    st.markdown("## 🔮 پیش‌بینی احتمالی آینده ارز")
+    st.caption(
+        "مدل از کندل‌های 1h، روند، EMA، RSI، MACD، ATR، حجم و بازده‌های گذشته استفاده می‌کند؛ "
+        "خروجی احتمال و بازه است، نه تضمین قیمت آینده."
+    )
+    with st.spinner("در حال آموزش مدل روی تاریخچه 1h و اعتبارسنجی خارج از نمونه..."):
+        try:
+            forecast_df = get_candles(exchange, symbol, "1h")
+            fc, _ = future_forecast(forecast_df)
+            current_fc_price = float(forecast_df["close"].iloc[-1])
+
+            st.metric("قیمت مبنا", money(current_fc_price))
+            cards = st.columns(len(fc))
+            for col, (_, row) in zip(cards, fc.iterrows()):
+                with col:
+                    arrow = "🟢" if row["direction"] == "صعودی" else "🔴" if row["direction"] == "نزولی" else "🟡"
+                    target_pct = (row["target_price"] / current_fc_price - 1) * 100
+                    col.metric(
+                        f"{arrow} {row['label']}",
+                        money(float(row["target_price"])),
+                        f"{target_pct:+.2f}%"
+                    )
+                    st.caption(f"احتمال صعود: {row['probability_up']:.1f}%")
+                    st.caption(f"اعتماد مدل: {row['confidence']:.1f}%")
+                    st.caption(f"دقت جهت در اعتبارسنجی: {row['direction_accuracy']:.1f}%")
+                    st.caption(
+                        f"بازه احتمالی: {money(float(row['low_price']))} تا {money(float(row['high_price']))}"
+                    )
+
+            view_fc = fc[["label", "direction", "target_price", "low_price", "high_price",
+                          "probability_up", "confidence", "direction_accuracy", "samples"]].copy()
+            view_fc.columns = [
+                "افق", "جهت احتمالی", "قیمت مدل", "کف بازه", "سقف بازه",
+                "احتمال صعود %", "اعتماد مدل %", "دقت جهت %", "تعداد نمونه"
+            ]
+            for c in ["قیمت مدل", "کف بازه", "سقف بازه"]:
+                view_fc[c] = view_fc[c].apply(lambda x: money(float(x)))
+            for c in ["احتمال صعود %", "اعتماد مدل %", "دقت جهت %"]:
+                view_fc[c] = view_fc[c].map(lambda x: f"{float(x):.1f}")
+            st.dataframe(view_fc, use_container_width=True, hide_index=True)
+
+            st.markdown("### 🧭 سناریوهای مدل")
+            mid = fc.iloc[-1]
+            s1, s2, s3 = st.columns(3)
+            s1.metric("سناریوی نزولی", money(float(mid["low_price"])))
+            s2.metric("سناریوی پایه", money(float(mid["target_price"])))
+            s3.metric("سناریوی صعودی", money(float(mid["high_price"])))
+            st.info(
+                "این بخش پیش‌بینی آماری است. برای تصمیم معاملاتی، آن را کنار سیگنال چندتایم‌فریمی، "
+                "حمایت/مقاومت و نتیجه بک‌تست همین استراتژی بررسی کن."
+            )
+        except Exception as exc:
+            st.error(f"پیش‌بینی انجام نشد: {exc}")
 
 if scan_button:
     if not markets:
@@ -1418,6 +1615,21 @@ try:
             "وضعیت": label,
         })
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    # Compact forecast preview is always shown after the main analysis.
+    try:
+        fc_df, _ = future_forecast(tf_data["1h"][0]) if "1h" in tf_data else future_forecast(main_df)
+        st.markdown("### 🔮 چشم‌انداز احتمالی آینده")
+        pf_cols = st.columns(len(fc_df))
+        for col, (_, row) in zip(pf_cols, fc_df.iterrows()):
+            with col:
+                pct = (float(row["target_price"]) / entry - 1) * 100
+                icon = "🟢" if row["direction"] == "صعودی" else "🔴" if row["direction"] == "نزولی" else "🟡"
+                st.metric(f"{icon} {row['label']}", money(float(row["target_price"])), f"{pct:+.2f}%")
+                st.caption(f"احتمال صعود {row['probability_up']:.1f}% | اعتماد {row['confidence']:.0f}%")
+        st.caption("پیش‌بینی بر پایه تاریخچه 1h و اعتبارسنجی خارج از نمونه است؛ قیمت آینده قطعی نیست.")
+    except Exception as forecast_exc:
+        st.caption(f"پیش‌بینی فعلاً در دسترس نیست: {forecast_exc}")
 
     st.markdown("### 📊 نمودار")
     chart_df = ind.tail(150).set_index("open_time")[["close", "ema20", "ema50"]]

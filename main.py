@@ -37,25 +37,8 @@ INTERVALS = {
     "1d": "1d",
 }
 
-st.markdown("""
-<style>
-.block-container {padding-top:.45rem;padding-bottom:.6rem;max-width:1500px;}
-h1{font-size:1.65rem!important;margin:.15rem 0 .25rem!important;}
-h2{font-size:1.25rem!important;margin:.35rem 0!important;}
-h3{font-size:1.05rem!important;margin:.3rem 0!important;}
-[data-testid="stMetric"]{padding:.35rem .5rem!important;}
-[data-testid="stMetricLabel"]{font-size:.75rem!important;}
-[data-testid="stMetricValue"]{font-size:1.12rem!important;}
-[data-testid="stVerticalBlock"]{gap:.35rem;}
-div[data-testid="stExpander"]{margin-top:.2rem;}
-.stButton>button{border-radius:9px;font-weight:600;padding:.35rem .5rem;}
-.market-card{padding:8px 10px;border-radius:10px;border:1px solid rgba(128,128,128,.22);margin-bottom:6px;}
-.small-note{font-size:.75rem;opacity:.75;}
-</style>
-""", unsafe_allow_html=True)
 
-st.title("📈 Crypto Analyzer Pro")
-st.caption("تحلیل بازار • سیگنال • نوسان‌گیری • پیش‌بینی • بک‌تست")
+
 
 # -------------------- Generic HTTP --------------------
 
@@ -509,6 +492,7 @@ def atr(df, n=14):
 
 def add_indicators(df):
     x = df.copy()
+    x["ema9"] = ema(x["close"], 9)
     x["ema20"] = ema(x["close"], 20)
     x["ema50"] = ema(x["close"], 50)
     x["ema200"] = ema(x["close"], 200)
@@ -521,58 +505,127 @@ def add_indicators(df):
     x["atr"] = atr(x, 14)
     x["vol_ma20"] = x["volume"].rolling(20).mean()
     x["vol_ratio"] = x["volume"] / x["vol_ma20"].replace(0, np.nan)
-    return x.dropna().reset_index(drop=True)
+    # ADX / directional movement
+    up = x["high"].diff()
+    down = -x["low"].diff()
+    tr = pd.concat([x["high"]-x["low"], (x["high"]-x["close"].shift()).abs(), (x["low"]-x["close"].shift()).abs()], axis=1).max(axis=1)
+    plus_dm = pd.Series(np.where((up > down) & (up > 0), up, 0.0), index=x.index)
+    minus_dm = pd.Series(np.where((down > up) & (down > 0), down, 0.0), index=x.index)
+    atr14 = tr.ewm(alpha=1/14, adjust=False).mean()
+    plus_di = 100 * plus_dm.ewm(alpha=1/14, adjust=False).mean() / atr14.replace(0, np.nan)
+    minus_di = 100 * minus_dm.ewm(alpha=1/14, adjust=False).mean() / atr14.replace(0, np.nan)
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+    x["adx"] = dx.ewm(alpha=1/14, adjust=False).mean()
+    x["plus_di"] = plus_di
+    x["minus_di"] = minus_di
+    # Ichimoku (non-forward display values)
+    tenkan = (x["high"].rolling(9).max() + x["low"].rolling(9).min()) / 2
+    kijun = (x["high"].rolling(26).max() + x["low"].rolling(26).min()) / 2
+    span_a = (tenkan + kijun) / 2
+    span_b = (x["high"].rolling(52).max() + x["low"].rolling(52).min()) / 2
+    x["ich_tenkan"], x["ich_kijun"] = tenkan, kijun
+    x["ich_span_a"], x["ich_span_b"] = span_a, span_b
+    # Rolling VWAP approximation for intraday confirmation
+    typical = (x["high"] + x["low"] + x["close"]) / 3
+    pv = typical * x["volume"]
+    x["vwap20"] = pv.rolling(20).sum() / x["volume"].rolling(20).sum().replace(0, np.nan)
+    # Candle/body and volatility regime
+    x["body_pct"] = (x["close"] - x["open"]) / x["open"].replace(0, np.nan) * 100
+    x["range_pct"] = (x["high"] - x["low"]) / x["close"].replace(0, np.nan) * 100
+    return x.replace([np.inf, -np.inf], np.nan).dropna().reset_index(drop=True)
 
 def support_resistance(df, window=60):
     recent = df.tail(window)
     return float(recent["low"].min()), float(recent["high"].max())
 
 def timeframe_score(df):
+    """Strict multi-factor score (0-100). More confirmations are required for extremes."""
     x = add_indicators(df)
-    if len(x) < 10:
+    if len(x) < 60:
         return 50, ["داده کافی نیست"], x
     a, p = x.iloc[-1], x.iloc[-2]
-    score = 50
+    score = 50.0
     reasons = []
 
-    if a["ema20"] > a["ema50"]:
-        score += 10; reasons.append("EMA20 بالاتر از EMA50 ✅")
-    else:
-        score -= 10; reasons.append("EMA20 پایین‌تر از EMA50 ⚠️")
+    # Trend structure
+    if a["ema9"] > a["ema20"] > a["ema50"]:
+        score += 10; reasons.append("ساختار EMA صعودی")
+    elif a["ema9"] < a["ema20"] < a["ema50"]:
+        score -= 10; reasons.append("ساختار EMA نزولی")
+    elif a["ema20"] > a["ema50"]:
+        score += 4; reasons.append("روند میان‌مدت صعودی")
+    elif a["ema20"] < a["ema50"]:
+        score -= 4; reasons.append("روند میان‌مدت نزولی")
 
     if a["close"] > a["ema200"]:
-        score += 8; reasons.append("قیمت بالای EMA200 ✅")
+        score += 7; reasons.append("قیمت بالای EMA200")
     else:
-        score -= 8; reasons.append("قیمت زیر EMA200 ⚠️")
+        score -= 7; reasons.append("قیمت زیر EMA200")
 
+    # MACD direction + histogram acceleration
     if a["macd"] > a["macd_signal"]:
-        score += 8; reasons.append("MACD صعودی ✅")
+        score += 7; reasons.append("MACD صعودی")
     else:
-        score -= 8; reasons.append("MACD نزولی ⚠️")
-
+        score -= 7; reasons.append("MACD نزولی")
     if a["macd_hist"] > p["macd_hist"]:
-        score += 4; reasons.append("مومنتوم MACD در حال تقویت ✅")
+        score += 4; reasons.append("شتاب MACD مثبت")
     else:
-        score -= 3; reasons.append("مومنتوم MACD در حال تضعیف ⚠️")
+        score -= 4; reasons.append("شتاب MACD منفی")
 
-    if 50 <= a["rsi"] <= 68:
-        score += 8; reasons.append(f"RSI مناسب ({a['rsi']:.1f}) ✅")
-    elif a["rsi"] > 72:
-        score -= 5; reasons.append(f"RSI بیش‌خرید ({a['rsi']:.1f}) ⚠️")
-    elif a["rsi"] < 30:
-        score += 2; reasons.append(f"RSI اشباع فروش ({a['rsi']:.1f})")
-    else:
-        score += 1; reasons.append(f"RSI خنثی ({a['rsi']:.1f})")
+    # RSI: reward healthy momentum, penalize exhaustion
+    rv=float(a["rsi"])
+    if 52 <= rv <= 68:
+        score += 7; reasons.append(f"RSI سالم {rv:.1f}")
+    elif 45 <= rv < 52:
+        score += 1
+    elif 32 <= rv < 45:
+        score -= 2
+    elif rv > 72:
+        score -= 7; reasons.append(f"RSI بیش‌خرید {rv:.1f}")
+    elif rv < 28:
+        score += 1; reasons.append(f"RSI اشباع فروش {rv:.1f}")
 
-    vr = float(a["vol_ratio"]) if np.isfinite(a["vol_ratio"]) else 1.0
+    # ADX + DI direction
+    adx_v=float(a["adx"]); plus=float(a["plus_di"]); minus=float(a["minus_di"])
+    if adx_v >= 25:
+        if plus > minus:
+            score += 7; reasons.append(f"روند قوی صعودی ADX {adx_v:.0f}")
+        else:
+            score -= 7; reasons.append(f"روند قوی نزولی ADX {adx_v:.0f}")
+    elif adx_v < 18:
+        score += 0; reasons.append("بازار کم‌روند / رنج")
+
+    # Ichimoku cloud
+    cloud_top=max(float(a["ich_span_a"]), float(a["ich_span_b"]))
+    cloud_bottom=min(float(a["ich_span_a"]), float(a["ich_span_b"]))
+    if a["close"] > cloud_top and a["ich_tenkan"] > a["ich_kijun"]:
+        score += 6; reasons.append("تأیید ایچیموکو صعودی")
+    elif a["close"] < cloud_bottom and a["ich_tenkan"] < a["ich_kijun"]:
+        score -= 6; reasons.append("تأیید ایچیموکو نزولی")
+
+    # VWAP
+    if np.isfinite(a["vwap20"]):
+        if a["close"] > a["vwap20"]:
+            score += 4; reasons.append("بالای VWAP")
+        else:
+            score -= 4; reasons.append("زیر VWAP")
+
+    # Volume confirmation
+    vr=float(a["vol_ratio"]) if np.isfinite(a["vol_ratio"]) else 1.0
     if vr >= 1.5:
-        score += 7; reasons.append(f"حجم قوی ({vr:.1f}x) ✅")
-    elif vr >= 1.1:
-        score += 3; reasons.append(f"حجم مناسب ({vr:.1f}x)")
-    else:
-        reasons.append(f"حجم معمولی ({vr:.1f}x)")
+        score += 5 if a["close"] >= p["close"] else -5
+        reasons.append(f"حجم تأییدکننده {vr:.1f}x")
+    elif vr < 0.65:
+        reasons.append(f"حجم ضعیف {vr:.1f}x")
 
-    return int(np.clip(score, 0, 100)), reasons, x
+    # Recent momentum slope
+    ret5=float(a["close"]/x["close"].iloc[-6]-1) if len(x)>=6 else 0
+    if ret5 > 0.01:
+        score += 3; reasons.append("مومنتوم کوتاه‌مدت مثبت")
+    elif ret5 < -0.01:
+        score -= 3; reasons.append("مومنتوم کوتاه‌مدت منفی")
+
+    return int(np.clip(round(score), 0, 100)), reasons, x
 
 def money(v):
     if not np.isfinite(v):
@@ -765,37 +818,22 @@ def scanner_candidates(exchange, markets, limit=20):
     return ordered[:max(1, int(limit))]
 
 
-def signal_from_score(score, ema20, ema50, ema200, macd_hist, rsi_value):
-    """Return a neutral BUY/SELL/HOLD trading state.
-
-    The signal is deliberately confirmation-based:
-    - BUY requires bullish multi-timeframe score and trend structure.
-    - SELL requires bearish multi-timeframe score and trend structure.
-    - Everything else is HOLD.
-    """
+def signal_from_score(score, ema20, ema50, ema200, macd_hist, rsi_value, adx_value=None, ich_bull=None, ich_bear=None):
+    """Strict confirmation-based market state."""
     if score is None:
         return "HOLD", "⚪", "داده ناکافی"
-
-    bullish = (
-        score >= 68
-        and ema20 > ema50
-        and ema50 >= ema200
-        and macd_hist >= 0
-        and rsi_value < 72
-    )
-    bearish = (
-        score <= 35
-        and ema20 < ema50
-        and ema50 <= ema200
-        and macd_hist <= 0
-        and rsi_value > 28
-    )
-
+    adx_ok = True if adx_value is None else adx_value >= 20
+    bull_extra = True if ich_bull is None else ich_bull
+    bear_extra = True if ich_bear is None else ich_bear
+    bullish = (score >= 72 and ema20 > ema50 and ema50 >= ema200 and macd_hist >= 0
+               and rsi_value < 70 and adx_ok and bull_extra)
+    bearish = (score <= 28 and ema20 < ema50 and ema50 <= ema200 and macd_hist <= 0
+               and rsi_value > 30 and adx_ok and bear_extra)
     if bullish:
-        return "BUY", "🟢", "شرایط خرید تأییدشده"
+        return "BUY", "🟢", "تأیید چندعاملی صعود"
     if bearish:
-        return "SELL", "🔴", "شرایط فروش تأییدشده"
-    return "HOLD", "🟡", "فعلاً دست نگه دار"
+        return "SELL", "🔴", "تأیید چندعاملی نزول"
+    return "HOLD", "🟡", "تأیید کامل ورود وجود ندارد"
 
 
 def scanner_action(score):
@@ -870,7 +908,10 @@ def scan_one_market(exchange, symbol, scan_tfs):
         resistance = latest_price + 2.0 * atr_value
 
     signal, icon, signal_text = signal_from_score(
-        score, ema20, ema50, ema200, macd_hist, rsi_value
+        score, ema20, ema50, ema200, macd_hist, rsi_value,
+        float(last.get("adx", 0)),
+        bool(last.get("close", 0) > max(last.get("ich_span_a", 0), last.get("ich_span_b", 0)) and last.get("ich_tenkan", 0) > last.get("ich_kijun", 0)),
+        bool(last.get("close", 0) < min(last.get("ich_span_a", 0), last.get("ich_span_b", 0)) and last.get("ich_tenkan", 0) < last.get("ich_kijun", 0)),
     )
     risk = max(1.5 * atr_value, latest_price * 0.01)
 
@@ -1186,76 +1227,122 @@ def backtest_strategy(df, initial_capital=1000.0, risk_pct=0.01,
 
 # -------------------- Scalping Engine --------------------
 def scalping_signal(df5, df15=None):
-    """Fast 5m/15m setup. Uses price structure + EMA/RSI/MACD/volume/ATR."""
+    """High-selectivity scalping engine: trend + momentum + volume + ADX + Ichimoku + VWAP + MTF."""
     x = add_indicators(df5).copy()
-    if len(x) < 80:
-        raise RuntimeError("برای نوسان‌گیری حداقل ۸۰ کندل 5m لازم است.")
-    last = x.iloc[-1]
-    prev = x.iloc[-2]
-    price = float(last["close"])
-    atr_v = float(last["atr"])
-    rsi_v = float(last["rsi"])
-    vol_ratio = float(last["vol_ratio"])
-    macd_h = float(last["macd_hist"])
-    ema20 = float(last["ema20"])
-    ema50 = float(last["ema50"])
+    if len(x) < 100:
+        raise RuntimeError("برای نوسان‌گیری دقیق حداقل ۱۰۰ کندل 5m لازم است.")
+    a, p = x.iloc[-1], x.iloc[-2]
+    price = float(a["close"])
+    atr_v = float(a["atr"])
+    atr_pct = atr_v / max(price, 1e-12) * 100
+    rsi_v = float(a["rsi"])
+    vr = float(a["vol_ratio"])
+    adx_v = float(a["adx"])
+    macd_h = float(a["macd_hist"])
+    ema9, ema20, ema50 = map(float, [a["ema9"], a["ema20"], a["ema50"]])
+    vwap = float(a["vwap20"])
+    cloud_top = max(float(a["ich_span_a"]), float(a["ich_span_b"]))
+    cloud_bottom = min(float(a["ich_span_a"]), float(a["ich_span_b"]))
 
-    score_long = 0.0
-    score_short = 0.0
-    reasons_long, reasons_short = [], []
+    long_score = short_score = 0.0
+    rl, rs = [], []
 
-    if price > ema20: score_long += 15; reasons_long.append("قیمت بالای EMA20")
-    if ema20 > ema50: score_long += 15; reasons_long.append("EMA20 بالای EMA50")
-    if macd_h > 0: score_long += 15; reasons_long.append("MACD مثبت")
-    if 48 <= rsi_v <= 68: score_long += 15; reasons_long.append("RSI مناسب")
-    if vol_ratio >= 1.25: score_long += 15; reasons_long.append("افزایش حجم")
-    if price > float(prev["high"]): score_long += 15; reasons_long.append("شکست سقف کندل قبل")
-    if price > float(x["high"].tail(12).iloc[:-1].max()): score_long += 10; reasons_long.append("شکست سقف کوتاه‌مدت")
+    # Trend structure: 25 points
+    if price > ema9 > ema20 > ema50:
+        long_score += 20; rl.append("روند صعودی چندلایه")
+    elif price > ema20 and ema20 > ema50:
+        long_score += 12; rl.append("ساختار صعودی")
+    if price < ema9 < ema20 < ema50:
+        short_score += 20; rs.append("روند نزولی چندلایه")
+    elif price < ema20 and ema20 < ema50:
+        short_score += 12; rs.append("ساختار نزولی")
 
-    if price < ema20: score_short += 15; reasons_short.append("قیمت زیر EMA20")
-    if ema20 < ema50: score_short += 15; reasons_short.append("EMA20 زیر EMA50")
-    if macd_h < 0: score_short += 15; reasons_short.append("MACD منفی")
-    if 32 <= rsi_v <= 52: score_short += 15; reasons_short.append("RSI مناسب")
-    if vol_ratio >= 1.25: score_short += 15; reasons_short.append("افزایش حجم")
-    if price < float(prev["low"]): score_short += 15; reasons_short.append("شکست کف کندل قبل")
-    if price < float(x["low"].tail(12).iloc[:-1].min()): score_short += 10; reasons_short.append("شکست کف کوتاه‌مدت")
+    # VWAP: 10
+    if price > vwap: long_score += 8; rl.append("بالای VWAP")
+    elif price < vwap: short_score += 8; rs.append("زیر VWAP")
 
-    mtf = None
-    if df15 is not None and len(df15) >= 60:
-        y = add_indicators(df15)
-        z = y.iloc[-1]
-        mtf = "LONG" if z["close"] > z["ema20"] and z["ema20"] > z["ema50"] and z["macd_hist"] >= 0 else "SHORT" if z["close"] < z["ema20"] and z["ema20"] < z["ema50"] and z["macd_hist"] <= 0 else "NEUTRAL"
-        if mtf == "LONG": score_long += 10
-        elif mtf == "SHORT": score_short += 10
+    # MACD + slope: 15
+    if macd_h > 0 and macd_h >= float(p["macd_hist"]): long_score += 12; rl.append("مومنتوم صعودی MACD")
+    elif macd_h < 0 and macd_h <= float(p["macd_hist"]): short_score += 12; rs.append("مومنتوم نزولی MACD")
 
-    long_score = min(100, round(score_long))
-    short_score = min(100, round(score_short))
-    if long_score >= 65 and long_score >= short_score + 8:
-        signal = "LONG"
-        score = long_score
-        sl = min(price - 1.15 * atr_v, float(x["low"].tail(8).min()) * .998)
-        risk = max(price - sl, price * .0025)
-        tp1, tp2 = price + 1.25 * risk, price + 2.0 * risk
-        reasons = reasons_long
-    elif short_score >= 65 and short_score >= long_score + 8:
-        signal = "SHORT"
-        score = short_score
-        sl = max(price + 1.15 * atr_v, float(x["high"].tail(8).max()) * 1.002)
-        risk = max(sl - price, price * .0025)
-        tp1, tp2 = price - 1.25 * risk, price - 2.0 * risk
-        reasons = reasons_short
+    # RSI avoids buying/selling exhausted moves: 12
+    if 52 <= rsi_v <= 67: long_score += 10; rl.append(f"RSI سالم {rsi_v:.0f}")
+    elif 33 <= rsi_v <= 48: short_score += 10; rs.append(f"RSI سالم {rsi_v:.0f}")
+    elif rsi_v > 72: long_score -= 8; rl.append("RSI بیش‌خرید")
+    elif rsi_v < 28: short_score -= 8; rs.append("RSI اشباع فروش")
+
+    # ADX + directional movement: 15
+    if adx_v >= 22:
+        if float(a["plus_di"]) > float(a["minus_di"]): long_score += 12; rl.append(f"قدرت روند ADX {adx_v:.0f}")
+        elif float(a["minus_di"]) > float(a["plus_di"]): short_score += 12; rs.append(f"قدرت روند ADX {adx_v:.0f}")
     else:
-        signal = "WAIT"
-        score = max(long_score, short_score)
-        sl = tp1 = tp2 = np.nan
+        long_score -= 4; short_score -= 4
+
+    # Ichimoku: 12
+    if price > cloud_top and float(a["ich_tenkan"]) > float(a["ich_kijun"]): long_score += 10; rl.append("تأیید ایچیموکو")
+    if price < cloud_bottom and float(a["ich_tenkan"]) < float(a["ich_kijun"]): short_score += 10; rs.append("تأیید ایچیموکو")
+
+    # Volume confirmation: 10
+    if vr >= 1.5:
+        if price > float(p["close"]): long_score += 10; rl.append(f"حجم تأییدکننده {vr:.1f}x")
+        elif price < float(p["close"]): short_score += 10; rs.append(f"حجم تأییدکننده {vr:.1f}x")
+    elif vr < 0.75:
+        long_score -= 5; short_score -= 5
+
+    # Breakout / pullback trigger: 10
+    prev_high = float(x["high"].tail(12).iloc[:-1].max())
+    prev_low = float(x["low"].tail(12).iloc[:-1].min())
+    breakout_up = price > prev_high and price > float(p["high"])
+    breakout_down = price < prev_low and price < float(p["low"])
+    if breakout_up: long_score += 10; rl.append("شکست سقف کوتاه‌مدت")
+    if breakout_down: short_score += 10; rs.append("شکست کف کوتاه‌مدت")
+
+    # MTF confirmation. Conflicting higher timeframe blocks the trade.
+    mtf = "NEUTRAL"
+    if df15 is not None and len(df15) >= 100:
+        y = add_indicators(df15)
+        z, zp = y.iloc[-1], y.iloc[-2]
+        l15 = z["close"] > z["ema20"] > z["ema50"] and z["macd_hist"] >= 0 and z["rsi"] < 72
+        s15 = z["close"] < z["ema20"] < z["ema50"] and z["macd_hist"] <= 0 and z["rsi"] > 28
+        if l15: mtf = "LONG"; long_score += 13; rl.append("تأیید 15m")
+        elif s15: mtf = "SHORT"; short_score += 13; rs.append("تأیید 15m")
+        else: mtf = "NEUTRAL"
+
+    # Volatility sanity filter: don't scalp dead or excessively expanded candles.
+    regime_ok = 0.03 <= atr_pct <= 1.8
+    if not regime_ok:
+        long_score -= 15; short_score -= 15
+
+    long_score = int(np.clip(round(long_score), 0, 100))
+    short_score = int(np.clip(round(short_score), 0, 100))
+
+    # High-selectivity entry: score + separation + trend confirmation + no exhaustion.
+    signal = "WAIT"
+    sl = tp1 = tp2 = np.nan
+    reasons = rl if long_score >= short_score else rs
+    chosen = max(long_score, short_score)
+    if (long_score >= 78 and long_score >= short_score + 10 and mtf == "LONG"
+            and adx_v >= 20 and regime_ok and rsi_v < 70):
+        signal = "LONG"
+        sl = min(price - 1.15 * atr_v, float(x["low"].tail(8).min()) * .998)
+        risk = max(price - sl, price * .002)
+        tp1, tp2 = price + 1.30 * risk, price + 2.10 * risk
+    elif (short_score >= 78 and short_score >= long_score + 10 and mtf == "SHORT"
+          and adx_v >= 20 and regime_ok and rsi_v > 30):
+        signal = "SHORT"
+        sl = max(price + 1.15 * atr_v, float(x["high"].tail(8).max()) * 1.002)
+        risk = max(sl - price, price * .002)
+        tp1, tp2 = price - 1.30 * risk, price - 2.10 * risk
+    else:
         risk = np.nan
-        reasons = reasons_long if long_score >= short_score else reasons_short
+        if chosen >= 65:
+            reasons = reasons + ["شرایط کامل ورود هنوز تأیید نشده؛ صبر"]
 
     return {
-        "signal": signal, "score": score, "price": price, "sl": sl,
-        "tp1": tp1, "tp2": tp2, "rsi": rsi_v, "volume": vol_ratio,
-        "atr_pct": atr_v / price * 100, "mtf": mtf or "-", "reasons": reasons[-5:],
-        "df": x,
+        "signal": signal, "score": chosen, "long_score": long_score, "short_score": short_score,
+        "price": price, "sl": sl, "tp1": tp1, "tp2": tp2, "rsi": rsi_v,
+        "volume": vr, "adx": adx_v, "atr_pct": atr_pct, "mtf": mtf,
+        "regime_ok": regime_ok, "reasons": reasons[-6:], "df": x,
     }
 
 
@@ -1295,558 +1382,205 @@ def scalping_backtest(df, risk_pct=0.01):
     return {"trades":trades,"win_rate":(wins/trades*100 if trades else 0),"return_pct":(equity/start-1)*100,"max_dd":max_dd,"equity":equity}
 
 
-# -------------------- UI / Dropdowns --------------------
+# -------------------- Compact mobile UI --------------------
+st.markdown("""
+<style>
+:root{--accent:#f4b928;--ink:#2b2925;--muted:#77736b;--card:#ffffff;}
+.block-container{padding:0.45rem .65rem 1.2rem;max-width:1180px;}
+[data-testid="stSidebar"]{display:none;}
+header[data-testid="stHeader"]{background:transparent;}
+.main-title{font-size:1.55rem;font-weight:800;text-align:center;margin:.1rem 0 .05rem;color:var(--ink)}
+.sub-title{text-align:center;color:var(--muted);font-size:.78rem;margin-bottom:.55rem}
+.card{background:var(--card);border:1px solid rgba(40,35,25,.10);border-radius:20px;padding:12px 13px;box-shadow:0 3px 16px rgba(40,35,25,.05);margin-bottom:8px}
+.signal-card{border-radius:24px;padding:14px;background:linear-gradient(135deg,#fff,#fffaf0);border:1px solid rgba(244,185,40,.35)}
+.tile{background:#fff;border:1px solid rgba(40,35,25,.09);border-radius:17px;padding:9px;text-align:center;min-height:78px;box-shadow:0 2px 12px rgba(0,0,0,.035)}
+.tile .big{font-size:1.05rem;font-weight:800}.tile .small{font-size:.72rem;color:#777}
+.stButton>button{border-radius:15px!important;border:1px solid rgba(40,35,25,.09)!important;font-weight:700!important;min-height:42px!important;background:#fff!important;color:#2b2925!important}
+.stButton>button:hover{border-color:var(--accent)!important}
+[data-testid="stMetric"]{background:#fff;border-radius:15px;padding:7px 8px!important;border:1px solid rgba(40,35,25,.07)}
+[data-testid="stMetricLabel"]{font-size:.68rem!important;color:#777}
+[data-testid="stMetricValue"]{font-size:1rem!important}
+[data-testid="stExpander"]{border-radius:15px!important}
+[data-testid="stDataFrame"]{border-radius:15px;overflow:hidden}
+hr{margin:.45rem 0!important}
+.small-note{font-size:.72rem;color:#777}
+@media(max-width:700px){.block-container{padding:.3rem .45rem 1rem}.main-title{font-size:1.35rem}.stSelectbox label{font-size:.72rem}}
+</style>
+""", unsafe_allow_html=True)
 
-with st.sidebar:
-    st.header("🏦 صرافی")
-    exchange = st.selectbox(
-        "منبع بازار",
-        EXCHANGES,
-        index=0,
-    )
+st.markdown('<div class="main-title">Crypto Analyzer</div><div class="sub-title">تحلیل چندلایه بازار • سیگنال • نوسان‌گیری</div>', unsafe_allow_html=True)
 
+# Compact controls instead of a large sidebar.
+with st.container(border=True):
+    c1,c2,c3 = st.columns([1.05,1.45,1.0])
+    with c1:
+        exchange = st.selectbox("صرافی", EXCHANGES, index=0, label_visibility="collapsed")
     try:
         markets = get_markets(exchange)
     except Exception as exc:
-        markets = []
-        st.error(f"دریافت بازارهای {exchange} ناموفق بود.")
-        st.caption(str(exc))
-
-    if markets:
-        default_index = 0
-        preferred = [
-            "BTCUSDT", "ETHUSDT", "XRPUSDT", "SOLUSDT",
-            "BTCIRT", "ETHIRT", "XRPIRT", "SOLIRT"
-        ]
-        for p in preferred:
-            if p in markets:
-                default_index = markets.index(p)
-                break
-
-        symbol = st.selectbox(
-            "🪙 انتخاب ارز / بازار",
-            markets,
-            index=default_index,
-            help="لیست به‌صورت زنده از صرافی انتخاب‌شده دریافت می‌شود."
-        )
-    else:
-        symbol = st.text_input(
-            "نماد بازار",
-            value="BTCUSDT",
-            placeholder="مثلاً BTCUSDT",
-        ).strip().upper()
-
-    tf = st.selectbox(
-        "⏱ تایم‌فریم اصلی",
-        list(INTERVALS.keys()),
-        index=2,
-    )
-
-    analyze = st.button("🚀 تحلیل", use_container_width=True)
-    scalp_button = st.button("⚡ نوسان‌گیری سریع", use_container_width=True)
-
-    st.divider()
-    st.header("🔎 اسکن")
-    scan_count = st.slider("تعداد بازارها", min_value=5, max_value=30, value=15, step=5)
-    scan_mode = st.selectbox(
-        "نوع اسکن",
-        ["سریع (1h + 4h)", "چندتایم‌فریمی کامل (15m + 1h + 4h + 1d)"],
-        index=0,
-    )
-    scan_button = st.button("🔎 شروع اسکن", use_container_width=True)
-    full_scan_button = st.button("🌐 اسکن کل بازار", use_container_width=True)
-
-    st.divider()
-    st.header("🧪 تست")
-    backtest_button = st.button("▶️ اجرای بک‌تست", use_container_width=True)
-    forecast_button = st.button("🔮 پیش‌بینی آینده ارز", use_container_width=True)
-
-    st.divider()
-    st.caption(
-        "🔒 فقط داده عمومی بازار استفاده می‌شود. "
-        "این نسخه سفارش خرید/فروش ثبت نمی‌کند."
-    )
-
-
-if scalp_button:
-    st.markdown("## ⚡ نوسان‌گیری سریع")
-    st.caption(f"{exchange} | {symbol} | 5m + 15m")
-    with st.spinner("در حال بررسی شرایط کوتاه‌مدت..."):
-        try:
-            df5 = get_candles(exchange, symbol, "5m")
-            try:
-                df15 = get_candles(exchange, symbol, "15m")
-            except Exception:
-                df15 = None
-            sc = scalping_signal(df5, df15)
-            icon = "🟢" if sc["signal"] == "LONG" else "🔴" if sc["signal"] == "SHORT" else "🟡"
-            c1,c2,c3,c4 = st.columns(4)
-            c1.metric("سیگنال", f"{icon} {sc['signal']}")
-            c2.metric("امتیاز", f"{sc['score']}/100")
-            c3.metric("قیمت", money(sc["price"]))
-            c4.metric("RSI", f"{sc['rsi']:.1f}")
-            if sc["signal"] != "WAIT":
-                q1,q2,q3,q4 = st.columns(4)
-                q1.metric("ورود", money(sc["price"]))
-                q2.metric("حدضرر", money(sc["sl"]))
-                q3.metric("TP1", money(sc["tp1"]))
-                q4.metric("TP2", money(sc["tp2"]))
-                rr = abs(sc["tp1"]-sc["price"])/max(abs(sc["price"]-sc["sl"]),1e-12)
-                st.caption(f"نسبت ریسک/بازده TP1: 1:{rr:.2f} | حجم: {sc['volume']:.2f}x | ATR: {sc['atr_pct']:.2f}% | تأیید 15m: {sc['mtf']}")
-            else:
-                st.caption(f"فعلاً ورود تأیید نشده | حجم: {sc['volume']:.2f}x | ATR: {sc['atr_pct']:.2f}% | 15m: {sc['mtf']}")
-            if sc["reasons"]:
-                st.caption(" • ".join(sc["reasons"]))
-            st.line_chart(sc["df"].tail(100).set_index("open_time")[['close','ema20','ema50']], use_container_width=True)
-            with st.expander("🧪 بک‌تست نوسان‌گیری", expanded=False):
-                bt = scalping_backtest(df5)
-                a,b,c,d = st.columns(4)
-                a.metric("معاملات", bt["trades"])
-                b.metric("موفقیت", f"{bt['win_rate']:.1f}%")
-                c.metric("بازده", f"{bt['return_pct']:+.2f}%")
-                d.metric("افت سرمایه", f"{bt['max_dd']:.2f}%")
-        except Exception as exc:
-            st.error(f"نوسان‌گیری اجرا نشد: {exc}")
-
-if full_scan_button:
-    if not markets:
-        st.error("لیست بازارهای این صرافی در دسترس نیست؛ اسکن کل بازار انجام نشد.")
-    else:
-        st.markdown("## 🌐 اسکن کل بازار")
-        st.caption(f"{exchange} | 1h + 4h")
-        with st.spinner("در حال اسکن تمام بازارهای قابل دریافت..."):
-            full_df = run_full_market_scanner(exchange, markets)
-
-        if full_df.empty:
-            st.warning("نتیجه‌ای از اسکن کل بازار به دست نیامد.")
+        markets=[]
+        st.error("دریافت بازارها ناموفق بود.")
+    with c2:
+        if markets:
+            preferred=["BTCUSDT","ETHUSDT","XRPUSDT","SOLUSDT","BTCIRT","ETHIRT","XRPIRT","SOLIRT"]
+            default_index=next((markets.index(p) for p in preferred if p in markets),0)
+            symbol=st.selectbox("ارز",markets,index=default_index,label_visibility="collapsed")
         else:
-            valid_full = full_df[
-                pd.to_numeric(full_df["امتیاز"], errors="coerce").notna()
-            ].copy()
-            st.success(
-                f"اسکن کل بازار تمام شد؛ {len(valid_full)} بازار دارای داده معتبر بررسی شد."
-            )
-
-            if not valid_full.empty:
-                st.markdown("### 🔥 کاندیداهای با امتیاز بالاتر")
-                top_full = valid_full.head(10)
-                cols = st.columns(min(5, len(top_full)))
-                for col, (_, row) in zip(cols, top_full.head(5).iterrows()):
-                    with col:
-                        st.markdown(f"**{row['بازار']}**")
-                        st.metric("امتیاز", f"{int(row['امتیاز'])}/100")
-                        st.write(row.get("سیگنال", "⚪ HOLD"))
-                        if pd.notna(row.get("قیمت")):
-                            st.caption(f"قیمت: {money(float(row['قیمت']))}")
-
-            full_cols = [
-                "بازار", "امتیاز", "سیگنال", "قیمت", "ورود",
-                "حدضرر", "حدسود 1", "حدسود 2", "حمایت", "مقاومت",
-                "1h", "4h", "تایم‌فریم معتبر"
-            ]
-            full_cols = [c for c in full_cols if c in full_df.columns]
-            full_view = full_df[full_cols].copy()
-            for c in ["قیمت", "ورود", "حدضرر", "حدسود 1", "حدسود 2", "حمایت", "مقاومت"]:
-                if c in full_view.columns:
-                    full_view[c] = full_view[c].apply(
-                        lambda x: money(float(x)) if pd.notna(x) else "-"
-                    )
-            st.dataframe(full_view, use_container_width=True, hide_index=True)
-
-if backtest_button:
-    st.markdown("## 🧪 بک‌تست واقعی استراتژی")
-    st.caption(
-        f"{exchange} | {symbol} | تایم‌فریم {tf} | "
-        "ورود روی کندل بعد از تأیید سیگنال و خروج با SL/TP"
-    )
-    with st.spinner("در حال دریافت تاریخچه و اجرای بک‌تست..."):
-        try:
-            bt_df = get_candles(exchange, symbol, tf)
-            summary, trades_df = backtest_strategy(bt_df)
-
-            b1, b2, b3, b4 = st.columns(4)
-            b1.metric("تعداد معاملات", summary["تعداد معاملات"])
-            b2.metric("درصد موفقیت", f"{summary['درصد معاملات موفق']:.1f}%")
-            b3.metric("بازده خالص", f"{summary['بازده خالص حساب']:.2f}%")
-            b4.metric("حداکثر افت سرمایه", f"{summary['حداکثر افت سرمایه']:.2f}%")
-
-            b5, b6 = st.columns(2)
-            b5.metric("سرمایه اولیه", f"${summary['سرمایه اولیه']:.2f}")
-            b6.metric("سرمایه نهایی", f"${summary['سرمایه نهایی']:.2f}")
-
-            if not trades_df.empty:
-                show_bt = trades_df[
-                    ["جهت", "ورود", "خروج", "نتیجه",
-                     "بازده معامله %", "اثر حساب %", "سرمایه"]
-                ].copy()
-                for c in ["ورود", "خروج", "سرمایه"]:
-                    show_bt[c] = show_bt[c].apply(lambda x: money(float(x)))
-                st.dataframe(show_bt, use_container_width=True, hide_index=True)
-            else:
-                st.info("در این تاریخچه، سیگنال قابل بک‌تست پیدا نشد.")
-        except Exception as exc:
-            st.error(f"بک‌تست انجام نشد: {exc}")
-
-
-if forecast_button:
-    st.markdown("## 🔮 پیش‌بینی احتمالی آینده ارز")
-    st.caption(
-        "مدل از کندل‌های 1h، روند، EMA، RSI، MACD، ATR، حجم و بازده‌های گذشته استفاده می‌کند؛ "
-        "خروجی احتمال و بازه است، نه تضمین قیمت آینده."
-    )
-    with st.spinner("در حال آموزش مدل روی تاریخچه 1h و اعتبارسنجی خارج از نمونه..."):
-        try:
-            forecast_df = get_candles(exchange, symbol, "1h")
-            fc, _ = future_forecast(forecast_df)
-            current_fc_price = float(forecast_df["close"].iloc[-1])
-
-            st.metric("قیمت مبنا", money(current_fc_price))
-            cards = st.columns(len(fc))
-            for col, (_, row) in zip(cards, fc.iterrows()):
-                with col:
-                    arrow = "🟢" if row["direction"] == "صعودی" else "🔴" if row["direction"] == "نزولی" else "🟡"
-                    target_pct = (row["target_price"] / current_fc_price - 1) * 100
-                    col.metric(
-                        f"{arrow} {row['label']}",
-                        money(float(row["target_price"])),
-                        f"{target_pct:+.2f}%"
-                    )
-                    st.caption(f"احتمال صعود: {row['probability_up']:.1f}%")
-                    st.caption(f"اعتماد مدل: {row['confidence']:.1f}%")
-                    st.caption(f"دقت جهت در اعتبارسنجی: {row['direction_accuracy']:.1f}%")
-                    st.caption(
-                        f"بازه احتمالی: {money(float(row['low_price']))} تا {money(float(row['high_price']))}"
-                    )
-
-            view_fc = fc[["label", "direction", "target_price", "low_price", "high_price",
-                          "probability_up", "confidence", "direction_accuracy", "samples"]].copy()
-            view_fc.columns = [
-                "افق", "جهت احتمالی", "قیمت مدل", "کف بازه", "سقف بازه",
-                "احتمال صعود %", "اعتماد مدل %", "دقت جهت %", "تعداد نمونه"
-            ]
-            for c in ["قیمت مدل", "کف بازه", "سقف بازه"]:
-                view_fc[c] = view_fc[c].apply(lambda x: money(float(x)))
-            for c in ["احتمال صعود %", "اعتماد مدل %", "دقت جهت %"]:
-                view_fc[c] = view_fc[c].map(lambda x: f"{float(x):.1f}")
-            st.dataframe(view_fc, use_container_width=True, hide_index=True)
-
-            st.markdown("### 🧭 سناریوهای مدل")
-            mid = fc.iloc[-1]
-            s1, s2, s3 = st.columns(3)
-            s1.metric("سناریوی نزولی", money(float(mid["low_price"])))
-            s2.metric("سناریوی پایه", money(float(mid["target_price"])))
-            s3.metric("سناریوی صعودی", money(float(mid["high_price"])))
-            st.info(
-                "این بخش پیش‌بینی آماری است. برای تصمیم معاملاتی، آن را کنار سیگنال چندتایم‌فریمی، "
-                "حمایت/مقاومت و نتیجه بک‌تست همین استراتژی بررسی کن."
-            )
-        except Exception as exc:
-            st.error(f"پیش‌بینی انجام نشد: {exc}")
-
-if scan_button:
-    if not markets:
-        st.error("لیست بازارهای این صرافی در دسترس نیست؛ اسکن انجام نشد.")
-    else:
-        scan_tfs = [("1h", 0.45), ("4h", 0.55)]
-        if scan_mode.startswith("چندتایم‌فریمی"):
-            scan_tfs = [("15m", 0.15), ("1h", 0.25), ("4h", 0.35), ("1d", 0.25)]
-
-        st.markdown("## 🔎 اسکن بازار")
-        st.caption(f"{exchange} | {scan_count} بازار | {', '.join(tf for tf, _ in scan_tfs)}")
-        with st.spinner("در حال دریافت داده و محاسبه امتیاز بازارها..."):
-            scan_df = run_scanner(exchange, markets, scan_tfs, scan_count)
-
-        if scan_df.empty:
-            st.warning("نتیجه‌ای برای اسکن به دست نیامد.")
-        else:
-            valid_scan = scan_df[pd.to_numeric(scan_df["امتیاز"], errors="coerce").notna()].copy()
-            if not valid_scan.empty:
-                st.success(f"اسکن تمام شد؛ {len(valid_scan)} بازار با داده معتبر بررسی شد.")
-
-                # Highlight the three highest-scoring markets without claiming a trading recommendation.
-                top = valid_scan.head(3)
-                st.markdown("### 📌 ۳ بازار با بالاترین امتیاز محاسباتی")
-                cols = st.columns(min(3, len(top)))
-                for col, (_, row) in zip(cols, top.iterrows()):
-                    with col:
-                        st.markdown(f"**{row['بازار']}**")
-                        st.metric("امتیاز", f"{int(row['امتیاز'])}/100")
-                        st.write(row.get("سیگنال", "⚪ HOLD"))
-                        st.caption(row.get("توضیح سیگنال", ""))
-                        if pd.notna(row.get("قیمت")):
-                            st.caption(f"قیمت: {money(float(row['قیمت']))}")
-
-            display_cols = [
-                "بازار", "امتیاز", "سیگنال", "توضیح سیگنال", "قیمت",
-                "ورود", "حدضرر", "حدسود 1", "حدسود 2", "حمایت", "مقاومت",
-            ]
-            display_cols = [c for c in display_cols if c in scan_df.columns]
-            view = scan_df[display_cols].copy()
-            for c in ["قیمت", "ورود", "حدضرر", "حدسود 1", "حدسود 2", "حمایت", "مقاومت"]:
-                if c in view.columns:
-                    view[c] = view[c].apply(lambda x: money(float(x)) if pd.notna(x) else "-")
-            st.dataframe(view, use_container_width=True, hide_index=True)
-            st.caption(
-                "سیگنال اسکن بر پایه روند، EMA، MACD، RSI، حجم و تایم‌فریم‌های انتخاب‌شده است؛ "
-                "نتیجه اسکن به‌تنهایی تضمین‌کننده نتیجه معامله نیست."
-            )
+            symbol=st.text_input("نماد",value="BTCUSDT",label_visibility="collapsed").strip().upper()
+    with c3:
+        tf=st.selectbox("تایم‌فریم",list(INTERVALS.keys()),index=2,label_visibility="collapsed")
 
 if not symbol:
     st.warning("یک بازار انتخاب کن.")
     st.stop()
 
-# -------------------- Analysis --------------------
+# Quick action row
+q1,q2,q3,q4=st.columns(4)
+with q1: analyze_button=st.button("📊 تحلیل",use_container_width=True)
+with q2: scalp_button=st.button("⚡ نوسان",use_container_width=True)
+with q3: full_scan_button=st.button("🔎 اسکن بازار",use_container_width=True)
+with q4: backtest_button=st.button("🧪 بک‌تست",use_container_width=True)
 
+if scalp_button:
+    with st.spinner("در حال بررسی نوسان‌گیری..."):
+        try:
+            df5=get_candles(exchange,symbol,"5m")
+            try: df15=get_candles(exchange,symbol,"15m")
+            except Exception: df15=None
+            sc=scalping_signal(df5,df15)
+            icon="🟢" if sc["signal"]=="LONG" else "🔴" if sc["signal"]=="SHORT" else "🟡"
+            st.markdown('<div class="signal-card">',unsafe_allow_html=True)
+            a,b,c,d=st.columns(4)
+            a.metric("سیگنال",f"{icon} {sc['signal']}")
+            b.metric("قدرت",f"{sc['score']}/100")
+            c.metric("قیمت",money(sc["price"]))
+            d.metric("RSI",f"{sc['rsi']:.1f}")
+            if sc["signal"]!="WAIT":
+                e,f,g,h=st.columns(4)
+                e.metric("ورود",money(sc["price"])); f.metric("SL",money(sc["sl"])); g.metric("TP1",money(sc["tp1"])); h.metric("TP2",money(sc["tp2"]))
+            st.markdown('</div>',unsafe_allow_html=True)
+            st.caption(f"5m + 15m | حجم {sc['volume']:.2f}x | ADX {sc['adx']:.1f} | ATR {sc['atr_pct']:.2f}% | تأیید {sc['mtf']}")
+            if sc["reasons"]: st.caption(" • ".join(sc["reasons"]))
+            st.line_chart(sc["df"].tail(100).set_index("open_time")[["close","ema20","ema50"]],use_container_width=True)
+            with st.expander("بک‌تست نوسان‌گیری"):
+                bt=scalping_backtest(df5); aa,bb,cc,dd=st.columns(4)
+                aa.metric("معامله",bt["trades"]); bb.metric("موفقیت",f"{bt['win_rate']:.1f}%"); cc.metric("بازده",f"{bt['return_pct']:+.2f}%"); dd.metric("افت",f"{bt['max_dd']:.2f}%")
+        except Exception as exc: st.error(f"نوسان‌گیری اجرا نشد: {exc}")
+
+if full_scan_button:
+    if not markets: st.error("لیست بازارها در دسترس نیست.")
+    else:
+        with st.spinner("در حال اسکن کل بازار..."):
+            full_df=run_full_market_scanner(exchange,markets)
+        if full_df.empty: st.warning("نتیجه‌ای پیدا نشد.")
+        else:
+            valid_full=full_df[pd.to_numeric(full_df["امتیاز"],errors="coerce").notna()].copy()
+            st.markdown("### 🔎 اسکن کل بازار")
+            st.caption(f"{len(valid_full)} بازار دارای داده معتبر")
+            cols=["بازار","امتیاز","سیگنال","قیمت","ورود","حدضرر","حدسود 1","حدسود 2","حمایت","مقاومت","1h","4h"]
+            cols=[c for c in cols if c in valid_full.columns]
+            view=valid_full[cols].copy()
+            for c in ["قیمت","ورود","حدضرر","حدسود 1","حدسود 2","حمایت","مقاومت"]:
+                if c in view.columns: view[c]=view[c].apply(lambda x: money(float(x)) if pd.notna(x) else "-")
+            st.dataframe(view,use_container_width=True,hide_index=True)
+
+if backtest_button:
+    with st.spinner("در حال اجرای بک‌تست..."):
+        try:
+            bt_df=get_candles(exchange,symbol,tf); summary,trades_df=backtest_strategy(bt_df)
+            a,b,c,d=st.columns(4); a.metric("معاملات",summary["تعداد معاملات"]); b.metric("موفقیت",f"{summary['درصد معاملات موفق']:.1f}%"); c.metric("بازده",f"{summary['بازده خالص حساب']:.2f}%"); d.metric("افت",f"{summary['حداکثر افت سرمایه']:.2f}%")
+            if not trades_df.empty: st.dataframe(trades_df,use_container_width=True,hide_index=True)
+        except Exception as exc: st.error(f"بک‌تست انجام نشد: {exc}")
+
+# -------------------- Main precise analysis --------------------
 try:
-    # Fetch the live price and all four timeframes concurrently.
-    tf_names = ["15m", "1h", "4h", "1d"]
+    tf_names=["15m","1h","4h","1d"]
     with ThreadPoolExecutor(max_workers=5) as pool:
-        price_future = pool.submit(get_price, exchange, symbol)
-        candle_futures = {name: pool.submit(get_candles, exchange, symbol, name) for name in tf_names}
-        price = price_future.result()
-        tf_data = {}
-        scores = {}
-        for name, future in candle_futures.items():
+        price_future=pool.submit(get_price,exchange,symbol)
+        futures={n:pool.submit(get_candles,exchange,symbol,n) for n in tf_names}
+        price=price_future.result(); tf_data={}; scores={}
+        for n,fut in futures.items():
             try:
-                d = future.result()
-                sc, rs, ind_tf = timeframe_score(d)
-                scores[name] = sc
-                tf_data[name] = (d, ind_tf, rs)
-            except Exception:
-                scores[name] = None
+                d=fut.result(); sc,rs,ind_tf=timeframe_score(d); scores[n]=sc; tf_data[n]=(d,ind_tf,rs)
+            except Exception: scores[n]=None
+    valid_tf=next((n for n in tf_names if n in tf_data),None)
+    if valid_tf is None: raise RuntimeError("هیچ تایم‌فریم معتبری دریافت نشد.")
+    main_df,ind,reasons=tf_data.get(tf,tf_data[valid_tf])
+    main_score=scores.get(tf) or scores.get(valid_tf) or 50
+    weights={"15m":.15,"1h":.25,"4h":.35,"1d":.25}
+    valid=[(scores[k],weights[k]) for k in weights if scores.get(k) is not None]
+    mtf_score=round(sum(s*w for s,w in valid)/sum(w for _,w in valid))
+    support,resistance=support_resistance(ind,60); last=ind.iloc[-1]; entry=float(price)
+    atr_value=float(last["atr"]) if np.isfinite(last["atr"]) and last["atr"]>0 else entry*.02
+    ema20,ema50,ema200=map(float,[last["ema20"],last["ema50"],last["ema200"]]); rsi_v=float(last["rsi"]); macd_hist=float(last["macd_hist"]); adx_v=float(last["adx"])
+    ich_bull=bool(last["close"]>max(last["ich_span_a"],last["ich_span_b"]) and last["ich_tenkan"]>last["ich_kijun"])
+    ich_bear=bool(last["close"]<min(last["ich_span_a"],last["ich_span_b"]) and last["ich_tenkan"]<last["ich_kijun"])
+    signal,signal_icon,signal_text=signal_from_score(mtf_score,ema20,ema50,ema200,macd_hist,rsi_v,adx_v,ich_bull,ich_bear)
+    risk=max(1.5*atr_value,entry*.01)
+    if signal=="BUY":
+        sl=min(entry-risk,support*.995); sl=sl if 0<sl<entry else entry-risk; rrisk=max(entry-sl,entry*.01); tp1=entry+1.5*rrisk; tp2=entry+2.5*rrisk; tp3=entry+4*rrisk
+    elif signal=="SELL":
+        sl=max(entry+risk,resistance*1.005); rrisk=max(sl-entry,entry*.01); tp1=entry-1.5*rrisk; tp2=entry-2.5*rrisk; tp3=entry-4*rrisk
+    else: sl=tp1=tp2=tp3=np.nan
 
-    # Reuse the already-fetched selected timeframe; never request it twice.
-    if tf in tf_data:
-        main_df, ind, reasons = tf_data[tf]
-    else:
-        valid_tf = next((name for name in tf_names if name in tf_data), None)
-        if valid_tf is None:
-            raise RuntimeError("هیچ تایم‌فریم معتبری برای تحلیل دریافت نشد.")
-        main_df, ind, reasons = tf_data[valid_tf]
+    # Confidence = agreement + trend strength + data quality, not a profit probability.
+    vals=[scores[k] for k in tf_names if scores.get(k) is not None]
+    agreement=100-(np.std(vals)*2.2 if len(vals)>1 else 35); agreement=float(np.clip(agreement,0,100))
+    trend=min(adx_v/35*100,100); data_quality=min(len(ind)/250*100,100)
+    confidence=round(.5*agreement+.3*trend+.2*data_quality)
+    status="صعودی" if mtf_score>=60 else "نزولی" if mtf_score<=40 else "رنج"
+    status_icon="🟢" if status=="صعودی" else "🔴" if status=="نزولی" else "🟡"
 
-    main_score = scores.get(tf) if scores.get(tf) is not None else timeframe_score(main_df)[0]
-    if len(ind) < 10:
-        raise RuntimeError("داده کافی برای تحلیل تکنیکال وجود ندارد.")
+    st.markdown(f'<div class="card"><b>{exchange} · {symbol}</b><br><span class="small-note">تحلیل دقیق {tf} + تأیید 15m / 1h / 4h / 1d</span></div>',unsafe_allow_html=True)
+    a,b,c,d=st.columns(4)
+    a.metric("قیمت",money(price)); b.metric("امتیاز",f"{mtf_score}/100"); c.metric("وضعیت",f"{status_icon} {status}"); d.metric("اعتماد تحلیل",f"{confidence}%")
+    st.markdown('<div class="signal-card">',unsafe_allow_html=True)
+    a,b,c,d=st.columns(4); a.metric("تصمیم",f"{signal_icon} {signal}"); b.metric("RSI",f"{rsi_v:.1f}"); c.metric("ADX",f"{adx_v:.1f}"); d.metric("حجم",f"{float(last['vol_ratio']):.2f}x")
+    if signal!="HOLD":
+        e,f,g,h=st.columns(4); e.metric("ورود",money(entry)); f.metric("SL",money(sl)); g.metric("TP1",money(tp1)); h.metric("TP2",money(tp2))
+    st.caption(signal_text)
+    st.markdown('</div>',unsafe_allow_html=True)
 
-    last = ind.iloc[-1]
-    weights = {"15m": 0.15, "1h": 0.25, "4h": 0.35, "1d": 0.25}
-    valid = [(scores[k], weights[k]) for k in weights if scores.get(k) is not None]
-    mtf_score = round(sum(s * w for s, w in valid) / sum(w for _, w in valid)) if valid else main_score
-
-    support, resistance = support_resistance(ind, 60)
-    atr_value = float(last["atr"])
-
-    entry = float(price)
-
-    weights = {"15m": 0.15, "1h": 0.25, "4h": 0.35, "1d": 0.25}
-    valid = [(scores[k], weights[k]) for k in weights if scores.get(k) is not None]
-    mtf_score = (
-        round(sum(s * w for s, w in valid) / sum(w for s, w in valid))
-        if valid else main_score
-    )
-
-    support, resistance = support_resistance(ind, 60)
-    atr_value = float(last["atr"])
-    if not np.isfinite(atr_value) or atr_value <= 0:
-        atr_value = entry * 0.02
-
-    ema20 = float(last["ema20"])
-    ema50 = float(last["ema50"])
-    ema200 = float(last["ema200"])
-    rsi_v = float(last["rsi"])
-    macd_hist = float(last["macd_hist"])
-
-    signal, signal_icon, signal_text = signal_from_score(
-        mtf_score, ema20, ema50, ema200, macd_hist, rsi_v
-    )
-
-    risk = max(1.5 * atr_value, entry * 0.01)
-
-    if signal == "BUY":
-        sl = min(entry - risk, support * 0.995)
-        if sl <= 0 or sl >= entry:
-            sl = entry - risk
-        risk_amount = max(entry - sl, entry * 0.01)
-        tp1 = entry + 1.5 * risk_amount
-        tp2 = entry + 2.5 * risk_amount
-        tp3 = entry + 4.0 * risk_amount
-
-        if resistance > entry and resistance < tp1:
-            tp1 = max(entry + risk_amount, resistance * 0.995)
-
-    elif signal == "SELL":
-        sl = max(entry + risk, resistance * 1.005)
-        risk_amount = max(sl - entry, entry * 0.01)
-        tp1 = entry - 1.5 * risk_amount
-        tp2 = entry - 2.5 * risk_amount
-        tp3 = entry - 4.0 * risk_amount
-
-        if support < entry and support > tp1:
-            tp1 = min(entry - risk_amount, support * 1.005)
-
-    else:
-        sl = np.nan
-        tp1 = np.nan
-        tp2 = np.nan
-        tp3 = np.nan
-
-    status = (
-        "صعودی" if mtf_score >= 60
-        else "نزولی" if mtf_score <= 45
-        else "رنج / خنثی"
-    )
-    status_icon = "🟢" if mtf_score >= 60 else "🔴" if mtf_score <= 45 else "🟡"
-    action = signal
-    action_icon = signal_icon
-
-    st.subheader(f"{exchange} | {symbol} — تحلیل چندتایم‌فریمی")
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("قیمت فعلی", money(price))
-    c2.metric("امتیاز ربات", f"{mtf_score}/100")
-    c3.metric("وضعیت", f"{status_icon} {status}")
-    c4.metric("تصمیم", f"{action_icon} {action}")
-
-    st.markdown("---")
-
-    a1, a2, a3 = st.columns(3)
-    a1.metric("قیمت / ورود", money(entry))
-    a2.metric(
-        "حد ضرر",
-        money(sl),
-        (
-            f"{((sl/entry)-1)*100:.2f}%"
-            if signal == "SELL" and np.isfinite(sl)
-            else f"-{(1-sl/entry)*100:.2f}%"
-            if signal == "BUY" and np.isfinite(sl)
-            else "-"
-        ),
-    )
-    a3.metric("حمایت", money(support))
-
-    b1, b2, b3 = st.columns(3)
-    if signal == "BUY":
-        b1.metric("حد سود 1", money(tp1), f"+{(tp1/entry-1)*100:.2f}%")
-        b2.metric("حد سود 2", money(tp2), f"+{(tp2/entry-1)*100:.2f}%")
-        b3.metric("حد سود 3", money(tp3), f"+{(tp3/entry-1)*100:.2f}%")
-    elif signal == "SELL":
-        b1.metric("حد سود 1", money(tp1), f"{(tp1/entry-1)*100:.2f}%")
-        b2.metric("حد سود 2", money(tp2), f"{(tp2/entry-1)*100:.2f}%")
-        b3.metric("حد سود 3", money(tp3), f"{(tp3/entry-1)*100:.2f}%")
-    else:
-        b1.metric("حد سود 1", "-")
-        b2.metric("حد سود 2", "-")
-        b3.metric("حد سود 3", "-")
-
-    st.metric("مقاومت", money(resistance))
-
-    if signal in {"BUY", "SELL"}:
-        rr1 = abs(tp1 - entry) / max(abs(entry - sl), 1e-12)
-        rr2 = abs(tp2 - entry) / max(abs(entry - sl), 1e-12)
-        rr3 = abs(tp3 - entry) / max(abs(entry - sl), 1e-12)
-        st.caption(
-            f"ریسک/بازده تقریبی: TP1 = 1:{rr1:.1f} | "
-            f"TP2 = 1:{rr2:.1f} | TP3 = 1:{rr3:.1f}"
-        )
-    else:
-        st.caption("برای HOLD حدضرر و حدسود فعال نمایش داده نمی‌شود؛ منتظر تأیید روند بمان.")
-
-
-    st.markdown("### 🧭 هم‌جهتی تایم‌فریم‌ها")
-    rows = []
-    for k in ["15m", "1h", "4h", "1d"]:
-        sc = scores.get(k)
-        label = "داده ندارد" if sc is None else (
-            "صعودی" if sc >= 60 else "نزولی" if sc <= 45 else "خنثی"
-        )
-        rows.append({
-            "تایم‌فریم": k,
-            "امتیاز": sc if sc is not None else "-",
-            "وضعیت": label,
-        })
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-
-    # Compact forecast preview is always shown after the main analysis.
+    # Forecast is integrated here; no separate prediction button.
     try:
-        fc_df, _ = future_forecast(tf_data["1h"][0]) if "1h" in tf_data else future_forecast(main_df)
-        st.markdown("### 🔮 چشم‌انداز احتمالی آینده")
-        pf_cols = st.columns(len(fc_df))
-        for col, (_, row) in zip(pf_cols, fc_df.iterrows()):
+        fc_df,_=future_forecast(tf_data["1h"][0] if "1h" in tf_data else main_df)
+        st.markdown("### 🔮 چشم‌انداز احتمالی")
+        cards=st.columns(len(fc_df))
+        for col,(_,row) in zip(cards,fc_df.iterrows()):
             with col:
-                pct = (float(row["target_price"]) / entry - 1) * 100
-                icon = "🟢" if row["direction"] == "صعودی" else "🔴" if row["direction"] == "نزولی" else "🟡"
-                st.metric(f"{icon} {row['label']}", money(float(row["target_price"])), f"{pct:+.2f}%")
-                st.caption(f"احتمال صعود {row['probability_up']:.1f}% | اعتماد {row['confidence']:.0f}%")
-        st.caption("پیش‌بینی بر پایه تاریخچه 1h و اعتبارسنجی خارج از نمونه است؛ قیمت آینده قطعی نیست.")
-    except Exception as forecast_exc:
-        st.caption(f"پیش‌بینی فعلاً در دسترس نیست: {forecast_exc}")
+                pct=(float(row["target_price"])/entry-1)*100
+                icon="🟢" if row["direction"]=="صعودی" else "🔴" if row["direction"]=="نزولی" else "🟡"
+                st.metric(f"{icon} {row['label']}",money(float(row["target_price"])),f"{pct:+.2f}%")
+                st.caption(f"احتمال صعود {row['probability_up']:.0f}% · اعتماد مدل {row['confidence']:.0f}%")
+    except Exception: pass
 
-    st.markdown("### 📊 نمودار")
-    chart_df = ind.tail(150).set_index("open_time")[["close", "ema20", "ema50"]]
-    st.line_chart(chart_df, use_container_width=True)
+    st.markdown("### 📊 هم‌جهتی بازار")
+    rows=[]
+    for k in tf_names:
+        sc=scores.get(k); label="—" if sc is None else "صعودی" if sc>=60 else "نزولی" if sc<=40 else "خنثی"
+        rows.append({"تایم‌فریم":k,"امتیاز":sc if sc is not None else "—","وضعیت":label})
+    st.dataframe(pd.DataFrame(rows),use_container_width=True,hide_index=True)
 
-    if signal in {"BUY", "SELL"}:
-        level_df = pd.DataFrame(index=chart_df.index)
-        level_df["قیمت"] = chart_df["close"]
-        level_df["ورود"] = entry
-        level_df["حدضرر"] = sl
-        level_df["حدسود1"] = tp1
-        level_df["حدسود2"] = tp2
-        st.markdown("### 🎯 سطوح معامله")
-        st.line_chart(level_df, use_container_width=True)
+    st.markdown("### 🎯 سطوح مهم")
+    a,b,c,d=st.columns(4); a.metric("حمایت",money(support)); b.metric("مقاومت",money(resistance)); c.metric("EMA20",money(ema20)); d.metric("EMA200",money(ema200))
 
-    with st.expander("🧠 دلایل امتیاز ربات", expanded=True):
-        for item in reasons:
-            st.write("•", item)
+    st.markdown("### 📈 نمودار")
+    chart_df=ind.tail(140).set_index("open_time")[["close","ema20","ema50","ema200"]]
+    st.line_chart(chart_df,use_container_width=True)
 
-    with st.expander("📐 اندیکاتورها"):
-        i1, i2, i3, i4 = st.columns(4)
-        i1.metric("RSI", f"{rsi_v:.1f}")
-        i2.metric("EMA20", money(ema20))
-        i3.metric("EMA50", money(ema50))
-        i4.metric("EMA200", money(ema200))
+    with st.expander("🧠 چرا این نتیجه صادر شد",expanded=True):
+        for item in reasons[-10:]: st.write("•",item)
+        st.caption(f"اعتماد {confidence}% از هم‌جهتی تایم‌فریم‌ها، قدرت روند و کیفیت داده محاسبه شده و احتمال سود نیست.")
 
-        j1, j2, j3 = st.columns(3)
-        j1.metric("MACD", f"{last['macd']:.6f}")
-        j2.metric("ATR", money(atr_value))
-        j3.metric("نسبت حجم", f"{last['vol_ratio']:.2f}x")
+    with st.expander("📐 جزئیات اندیکاتورها"):
+        a,b,c,d=st.columns(4); a.metric("RSI",f"{rsi_v:.1f}"); b.metric("MACD",f"{macd_hist:.6f}"); c.metric("ATR",money(atr_value)); d.metric("VWAP",money(float(last["vwap20"])))
+        a,b,c,d=st.columns(4); a.metric("ADX",f"{adx_v:.1f}"); b.metric("DI+",f"{float(last['plus_di']):.1f}"); c.metric("DI-",f"{float(last['minus_di']):.1f}"); d.metric("حجم",f"{float(last['vol_ratio']):.2f}x")
 
-    with st.expander("🏦 وضعیت اتصال صرافی‌ها"):
-        st.write(f"منبع فعال تحلیل: **{exchange}**")
-        st.write("Binance: متصل به داده عمومی")
-        st.write("والکس: متصل به داده عمومی")
-        st.write("نوبیتکس: متصل به داده عمومی")
-        st.write("تبدیل: متصل به داده عمومی")
-        st.caption(
-            "در تبدیل، کندل‌های تکنیکال از معاملات عمومی اخیر ساخته می‌شوند؛ "
-            "اگر تاریخچه کافی نباشد، همان بازار باید منبع داده جایگزین داشته باشد."
-        )
-
-    if action == "BUY":
-        st.success(
-            f"🟢 BUY — ورود مرجع {money(entry)} | "
-            f"حدضرر {money(sl)} | TP1 {money(tp1)}"
-        )
-    elif action == "SELL":
-        st.error(
-            f"🔴 SELL — ورود مرجع {money(entry)} | "
-            f"حدضرر {money(sl)} | TP1 {money(tp1)}"
-        )
-    else:
-        st.info(
-            "🟡 HOLD — فعلاً دست نگه دار؛ ساختار چندتایم‌فریمی برای ورود "
-            "خرید یا فروش به اندازه کافی تأیید نشده است."
-        )
-
-
-    st.caption(
-        f"آخرین بروزرسانی: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | "
-        "داده‌ها عمومی و صرفاً برای تحلیل هستند."
-    )
-
+    st.caption(f"آخرین بروزرسانی {datetime.now().strftime('%H:%M:%S')} · داده عمومی · تحلیل بدون اجرای سفارش")
 except requests.exceptions.RequestException as exc:
     st.error("ارتباط با API صرافی برقرار نشد.")
     st.caption(str(exc))
 except Exception as exc:
-    st.error(f"تحلیل {symbol} در {exchange} انجام نشد.")
-    st.caption(f"جزئیات فنی: {exc}")
+    st.error(f"تحلیل {symbol} انجام نشد.")
+    st.caption(str(exc))
+

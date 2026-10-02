@@ -39,22 +39,23 @@ INTERVALS = {
 
 st.markdown("""
 <style>
-.block-container {padding-top: 1rem; max-width: 1450px;}
-h1,h2,h3 {text-align:right;}
-div[data-testid="stMetric"] {direction:rtl;}
-.market-card {
-    padding: 12px 16px; border-radius: 14px;
-    border: 1px solid rgba(128,128,128,.25);
-    margin-bottom: 10px;
-}
+.block-container {padding-top:.45rem;padding-bottom:.6rem;max-width:1500px;}
+h1{font-size:1.65rem!important;margin:.15rem 0 .25rem!important;}
+h2{font-size:1.25rem!important;margin:.35rem 0!important;}
+h3{font-size:1.05rem!important;margin:.3rem 0!important;}
+[data-testid="stMetric"]{padding:.35rem .5rem!important;}
+[data-testid="stMetricLabel"]{font-size:.75rem!important;}
+[data-testid="stMetricValue"]{font-size:1.12rem!important;}
+[data-testid="stVerticalBlock"]{gap:.35rem;}
+div[data-testid="stExpander"]{margin-top:.2rem;}
+.stButton>button{border-radius:9px;font-weight:600;padding:.35rem .5rem;}
+.market-card{padding:8px 10px;border-radius:10px;border:1px solid rgba(128,128,128,.22);margin-bottom:6px;}
+.small-note{font-size:.75rem;opacity:.75;}
 </style>
 """, unsafe_allow_html=True)
 
-st.title("📈 ربات تحلیل حرفه‌ای کریپتو")
-st.caption(
-    "اتصال داده بازار: Binance، والکس، نوبیتکس و تبدیل | "
-    "تحلیل چندتایم‌فریمی | BUY / SELL / HOLD | بدون ثبت سفارش"
-)
+st.title("📈 Crypto Analyzer Pro")
+st.caption("تحلیل بازار • سیگنال • نوسان‌گیری • پیش‌بینی • بک‌تست")
 
 # -------------------- Generic HTTP --------------------
 
@@ -73,7 +74,7 @@ def unix_now():
     return int(time.time())
 
 def resolution_seconds(tf):
-    return {"15m": 900, "1h": 3600, "4h": 14400, "1d": 86400}[tf]
+    return {"5m": 300, "15m": 900, "1h": 3600, "4h": 14400, "1d": 86400}[tf]
 
 def safe_float(x, default=np.nan):
     try:
@@ -259,7 +260,7 @@ def wallex_klines(symbol, interval, limit=300):
     seconds = resolution_seconds(interval)
     end = unix_now()
     start = end - seconds * (limit + 50)
-    resolution = {"15m": 15, "1h": 60, "4h": 240, "1d": "D"}[interval]
+    resolution = {"5m": 5, "15m": 15, "1h": 60, "4h": 240, "1d": "D"}[interval]
     data = http_get(
         f"{WALLEX_BASE}/v1/udf/history",
         {
@@ -289,7 +290,7 @@ def nobitex_klines(symbol, interval, limit=300):
     seconds = resolution_seconds(interval)
     end = unix_now()
     start = end - seconds * (limit + 50)
-    resolution = {"15m": 15, "1h": 60, "4h": 240, "1d": "D"}[interval]
+    resolution = {"5m": 5, "15m": 15, "1h": 60, "4h": 240, "1d": "D"}[interval]
     data = http_get(
         f"{NOBITEX_BASE}/market/udf/history",
         {
@@ -1182,6 +1183,118 @@ def backtest_strategy(df, initial_capital=1000.0, risk_pct=0.01,
     return summary, result_df
 
 
+
+# -------------------- Scalping Engine --------------------
+def scalping_signal(df5, df15=None):
+    """Fast 5m/15m setup. Uses price structure + EMA/RSI/MACD/volume/ATR."""
+    x = add_indicators(df5).copy()
+    if len(x) < 80:
+        raise RuntimeError("برای نوسان‌گیری حداقل ۸۰ کندل 5m لازم است.")
+    last = x.iloc[-1]
+    prev = x.iloc[-2]
+    price = float(last["close"])
+    atr_v = float(last["atr"])
+    rsi_v = float(last["rsi"])
+    vol_ratio = float(last["vol_ratio"])
+    macd_h = float(last["macd_hist"])
+    ema20 = float(last["ema20"])
+    ema50 = float(last["ema50"])
+
+    score_long = 0.0
+    score_short = 0.0
+    reasons_long, reasons_short = [], []
+
+    if price > ema20: score_long += 15; reasons_long.append("قیمت بالای EMA20")
+    if ema20 > ema50: score_long += 15; reasons_long.append("EMA20 بالای EMA50")
+    if macd_h > 0: score_long += 15; reasons_long.append("MACD مثبت")
+    if 48 <= rsi_v <= 68: score_long += 15; reasons_long.append("RSI مناسب")
+    if vol_ratio >= 1.25: score_long += 15; reasons_long.append("افزایش حجم")
+    if price > float(prev["high"]): score_long += 15; reasons_long.append("شکست سقف کندل قبل")
+    if price > float(x["high"].tail(12).iloc[:-1].max()): score_long += 10; reasons_long.append("شکست سقف کوتاه‌مدت")
+
+    if price < ema20: score_short += 15; reasons_short.append("قیمت زیر EMA20")
+    if ema20 < ema50: score_short += 15; reasons_short.append("EMA20 زیر EMA50")
+    if macd_h < 0: score_short += 15; reasons_short.append("MACD منفی")
+    if 32 <= rsi_v <= 52: score_short += 15; reasons_short.append("RSI مناسب")
+    if vol_ratio >= 1.25: score_short += 15; reasons_short.append("افزایش حجم")
+    if price < float(prev["low"]): score_short += 15; reasons_short.append("شکست کف کندل قبل")
+    if price < float(x["low"].tail(12).iloc[:-1].min()): score_short += 10; reasons_short.append("شکست کف کوتاه‌مدت")
+
+    mtf = None
+    if df15 is not None and len(df15) >= 60:
+        y = add_indicators(df15)
+        z = y.iloc[-1]
+        mtf = "LONG" if z["close"] > z["ema20"] and z["ema20"] > z["ema50"] and z["macd_hist"] >= 0 else "SHORT" if z["close"] < z["ema20"] and z["ema20"] < z["ema50"] and z["macd_hist"] <= 0 else "NEUTRAL"
+        if mtf == "LONG": score_long += 10
+        elif mtf == "SHORT": score_short += 10
+
+    long_score = min(100, round(score_long))
+    short_score = min(100, round(score_short))
+    if long_score >= 65 and long_score >= short_score + 8:
+        signal = "LONG"
+        score = long_score
+        sl = min(price - 1.15 * atr_v, float(x["low"].tail(8).min()) * .998)
+        risk = max(price - sl, price * .0025)
+        tp1, tp2 = price + 1.25 * risk, price + 2.0 * risk
+        reasons = reasons_long
+    elif short_score >= 65 and short_score >= long_score + 8:
+        signal = "SHORT"
+        score = short_score
+        sl = max(price + 1.15 * atr_v, float(x["high"].tail(8).max()) * 1.002)
+        risk = max(sl - price, price * .0025)
+        tp1, tp2 = price - 1.25 * risk, price - 2.0 * risk
+        reasons = reasons_short
+    else:
+        signal = "WAIT"
+        score = max(long_score, short_score)
+        sl = tp1 = tp2 = np.nan
+        risk = np.nan
+        reasons = reasons_long if long_score >= short_score else reasons_short
+
+    return {
+        "signal": signal, "score": score, "price": price, "sl": sl,
+        "tp1": tp1, "tp2": tp2, "rsi": rsi_v, "volume": vol_ratio,
+        "atr_pct": atr_v / price * 100, "mtf": mtf or "-", "reasons": reasons[-5:],
+        "df": x,
+    }
+
+
+def scalping_backtest(df, risk_pct=0.01):
+    """Simple non-overlapping 5m walk-forward backtest for the scalping rules."""
+    x = add_indicators(df).copy()
+    if len(x) < 120:
+        raise RuntimeError("داده کافی برای بک‌تست نوسان‌گیری وجود ندارد.")
+    equity = 1000.0
+    start = equity
+    wins = losses = trades = 0
+    peak = equity
+    max_dd = 0.0
+    for i in range(80, len(x)-3):
+        w = x.iloc[:i+1]
+        sig = scalping_signal(w)
+        if sig["signal"] == "WAIT":
+            continue
+        entry = float(x.iloc[i+1]["open"])
+        sl, tp = float(sig["sl"]), float(sig["tp1"])
+        hit = None
+        for j in range(i+1, min(i+4, len(x))):
+            hi, lo = float(x.iloc[j]["high"]), float(x.iloc[j]["low"])
+            if sig["signal"] == "LONG":
+                if lo <= sl: hit = -1; break
+                if hi >= tp: hit = 1; break
+            else:
+                if hi >= sl: hit = -1; break
+                if lo <= tp: hit = 1; break
+        if hit is None: continue
+        trades += 1
+        if hit > 0: wins += 1
+        else: losses += 1
+        equity *= (1 + (risk_pct * (1.25 if hit > 0 else -1)))
+        peak = max(peak, equity)
+        max_dd = max(max_dd, (peak-equity)/peak*100)
+    return {"trades":trades,"win_rate":(wins/trades*100 if trades else 0),"return_pct":(equity/start-1)*100,"max_dd":max_dd,"equity":equity}
+
+
 # -------------------- UI / Dropdowns --------------------
 
 with st.sidebar:
@@ -1229,10 +1342,11 @@ with st.sidebar:
         index=2,
     )
 
-    analyze = st.button("🚀 تحلیل حرفه‌ای", use_container_width=True)
+    analyze = st.button("🚀 تحلیل", use_container_width=True)
+    scalp_button = st.button("⚡ نوسان‌گیری سریع", use_container_width=True)
 
     st.divider()
-    st.header("🔎 اسکن بازار")
+    st.header("🔎 اسکن")
     scan_count = st.slider("تعداد بازارها", min_value=5, max_value=30, value=15, step=5)
     scan_mode = st.selectbox(
         "نوع اسکن",
@@ -1243,7 +1357,7 @@ with st.sidebar:
     full_scan_button = st.button("🌐 اسکن کل بازار", use_container_width=True)
 
     st.divider()
-    st.header("🧪 بک‌تست")
+    st.header("🧪 تست")
     backtest_button = st.button("▶️ اجرای بک‌تست", use_container_width=True)
     forecast_button = st.button("🔮 پیش‌بینی آینده ارز", use_container_width=True)
 
@@ -1253,14 +1367,53 @@ with st.sidebar:
         "این نسخه سفارش خرید/فروش ثبت نمی‌کند."
     )
 
+
+if scalp_button:
+    st.markdown("## ⚡ نوسان‌گیری سریع")
+    st.caption(f"{exchange} | {symbol} | 5m + 15m")
+    with st.spinner("در حال بررسی شرایط کوتاه‌مدت..."):
+        try:
+            df5 = get_candles(exchange, symbol, "5m")
+            try:
+                df15 = get_candles(exchange, symbol, "15m")
+            except Exception:
+                df15 = None
+            sc = scalping_signal(df5, df15)
+            icon = "🟢" if sc["signal"] == "LONG" else "🔴" if sc["signal"] == "SHORT" else "🟡"
+            c1,c2,c3,c4 = st.columns(4)
+            c1.metric("سیگنال", f"{icon} {sc['signal']}")
+            c2.metric("امتیاز", f"{sc['score']}/100")
+            c3.metric("قیمت", money(sc["price"]))
+            c4.metric("RSI", f"{sc['rsi']:.1f}")
+            if sc["signal"] != "WAIT":
+                q1,q2,q3,q4 = st.columns(4)
+                q1.metric("ورود", money(sc["price"]))
+                q2.metric("حدضرر", money(sc["sl"]))
+                q3.metric("TP1", money(sc["tp1"]))
+                q4.metric("TP2", money(sc["tp2"]))
+                rr = abs(sc["tp1"]-sc["price"])/max(abs(sc["price"]-sc["sl"]),1e-12)
+                st.caption(f"نسبت ریسک/بازده TP1: 1:{rr:.2f} | حجم: {sc['volume']:.2f}x | ATR: {sc['atr_pct']:.2f}% | تأیید 15m: {sc['mtf']}")
+            else:
+                st.caption(f"فعلاً ورود تأیید نشده | حجم: {sc['volume']:.2f}x | ATR: {sc['atr_pct']:.2f}% | 15m: {sc['mtf']}")
+            if sc["reasons"]:
+                st.caption(" • ".join(sc["reasons"]))
+            st.line_chart(sc["df"].tail(100).set_index("open_time")[['close','ema20','ema50']], use_container_width=True)
+            with st.expander("🧪 بک‌تست نوسان‌گیری", expanded=False):
+                bt = scalping_backtest(df5)
+                a,b,c,d = st.columns(4)
+                a.metric("معاملات", bt["trades"])
+                b.metric("موفقیت", f"{bt['win_rate']:.1f}%")
+                c.metric("بازده", f"{bt['return_pct']:+.2f}%")
+                d.metric("افت سرمایه", f"{bt['max_dd']:.2f}%")
+        except Exception as exc:
+            st.error(f"نوسان‌گیری اجرا نشد: {exc}")
+
 if full_scan_button:
     if not markets:
         st.error("لیست بازارهای این صرافی در دسترس نیست؛ اسکن کل بازار انجام نشد.")
     else:
         st.markdown("## 🌐 اسکن کل بازار")
-        st.caption(
-            f"صرافی: {exchange} | تمام بازارهای قابل دریافت | تایم‌فریم اسکن: 1h + 4h"
-        )
+        st.caption(f"{exchange} | 1h + 4h")
         with st.spinner("در حال اسکن تمام بازارهای قابل دریافت..."):
             full_df = run_full_market_scanner(exchange, markets)
 
@@ -1399,10 +1552,7 @@ if scan_button:
             scan_tfs = [("15m", 0.15), ("1h", 0.25), ("4h", 0.35), ("1d", 0.25)]
 
         st.markdown("## 🔎 اسکن بازار")
-        st.caption(
-            f"صرافی: {exchange} | تعداد بازار: {scan_count} | "
-            f"تایم‌فریم: {', '.join(tf for tf, _ in scan_tfs)}"
-        )
+        st.caption(f"{exchange} | {scan_count} بازار | {', '.join(tf for tf, _ in scan_tfs)}")
         with st.spinner("در حال دریافت داده و محاسبه امتیاز بازارها..."):
             scan_df = run_scanner(exchange, markets, scan_tfs, scan_count)
 

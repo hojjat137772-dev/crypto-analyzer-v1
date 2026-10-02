@@ -4,6 +4,7 @@ import pandas as pd
 import numpy as np
 import requests
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 
 # ============================================================
@@ -19,13 +20,8 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# Multiple public Binance endpoints. The app tries them in order and
-# automatically falls back when one endpoint is unavailable.
 BINANCE_ENDPOINTS = [
     "https://api.binance.com",
-    "https://api1.binance.com",
-    "https://api2.binance.com",
-    "https://api3.binance.com",
     "https://data-api.binance.vision",
 ]
 WALLEX_BASE = "https://api.wallex.ir"
@@ -59,44 +55,19 @@ st.caption(
     "اتصال داده بازار: Binance، والکس، نوبیتکس و تبدیل | "
     "تحلیل چندتایم‌فریمی | BUY / SELL / HOLD | بدون ثبت سفارش"
 )
-st.caption(
-    "🛡️ پایداری اتصال: اگر API یک صرافی برای بازار USDT در دسترس نباشد، "
-    "برنامه به‌صورت خودکار از داده عمومی Binance برای ادامه تحلیل استفاده می‌کند."
-)
 
 # -------------------- Generic HTTP --------------------
 
-def http_get(url, params=None, timeout=15, retries=2):
-    """GET JSON with small retries.
+_HTTP = requests.Session()
+_HTTP.headers.update({"User-Agent": "CryptoAnalyzerPro/2.1"})
 
-    This is intentionally conservative: retries help with transient network,
-    DNS, 429 and 5xx failures without making the public APIs suffer a large
-    request burst.
-    """
-    last = None
-    for attempt in range(max(1, int(retries) + 1)):
-        try:
-            r = requests.get(
-                url,
-                params=params,
-                timeout=timeout,
-                headers={
-                    "User-Agent": "CryptoAnalyzerPro/3.0",
-                    "Accept": "application/json",
-                },
-            )
-            if r.status_code == 429 or 500 <= r.status_code < 600:
-                last = RuntimeError(f"HTTP {r.status_code}")
-                if attempt < retries:
-                    time.sleep(0.8 * (attempt + 1))
-                    continue
-            r.raise_for_status()
-            return r.json()
-        except (requests.exceptions.RequestException, ValueError) as exc:
-            last = exc
-            if attempt < retries:
-                time.sleep(0.8 * (attempt + 1))
-    raise last if last is not None else RuntimeError("HTTP request failed")
+def http_get(url, params=None, timeout=7):
+    # Short, fail-fast public API calls. A failed endpoint should not block the
+    # whole analysis for 15-30 seconds.
+    timeout = min(float(timeout), 7.0)
+    r = _HTTP.get(url, params=params, timeout=timeout)
+    r.raise_for_status()
+    return r.json()
 
 def unix_now():
     return int(time.time())
@@ -111,25 +82,6 @@ def safe_float(x, default=np.nan):
         return default
 
 # -------------------- Market lists --------------------
-
-def compact_symbol(symbol):
-    return str(symbol).upper().replace("-", "").replace("_", "").replace("/", "")
-
-def is_usdt_symbol(symbol):
-    return compact_symbol(symbol).endswith("USDT")
-
-@st.cache_data(ttl=180, show_spinner=False)
-def fallback_usdt_markets():
-    """Use Binance USDT markets as a read-only fallback universe."""
-    try:
-        return binance_markets()
-    except Exception:
-        return [
-            "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "BNBUSDT",
-            "DOGEUSDT", "ADAUSDT", "AVAXUSDT", "LINKUSDT", "TRXUSDT",
-            "DOTUSDT", "LTCUSDT", "SHIBUSDT", "ATOMUSDT", "NEARUSDT",
-            "ARBUSDT", "OPUSDT", "APTUSDT", "SUIUSDT", "PEPEUSDT",
-        ]
 
 @st.cache_data(ttl=180, show_spinner=False)
 def binance_markets():
@@ -180,39 +132,18 @@ def wallex_markets():
                     return sorted(set(out))
         except Exception as exc:
             last = exc
-    # Keep the app usable when the exchange API is temporarily unavailable.
-    # Only Binance-compatible USDT markets are returned as fallback.
-    return fallback_usdt_markets()
+    raise RuntimeError("لیست بازارهای والکس دریافت نشد.") from last
 
 @st.cache_data(ttl=180, show_spinner=False)
 def nobitex_markets():
-    try:
-        data = http_get(
-            f"{NOBITEX_BASE}/market/stats",
-            {"srcCurrency": "btc", "dstCurrency": "usdt"},
-            timeout=12,
-            retries=1,
-        )
-        # The endpoint can return one market when filters are supplied, so
-        # fetch the complete public stats response as the normal path.
-        if isinstance(data.get("stats"), dict) and data["stats"]:
-            stats = data["stats"]
-        else:
-            data = http_get(f"{NOBITEX_BASE}/market/stats", timeout=12, retries=1)
-            stats = data.get("stats", {})
-        out = []
-        for key in stats.keys():
-            k = str(key).upper().replace("-", "")
-            if k and k not in {"GLOBAL"}:
-                out.append(k)
-        if out:
-            return sorted(set(out))
-    except Exception:
-        pass
-
-    # If Render cannot resolve/reach api.nobitex.ir, keep the UI usable.
-    # USDT analysis can safely use Binance as the technical-data fallback.
-    return fallback_usdt_markets()
+    data = http_get(f"{NOBITEX_BASE}/market/stats", timeout=15)
+    stats = data.get("stats", {})
+    out = []
+    for key in stats.keys():
+        k = str(key).upper().replace("-", "")
+        if k and k not in {"GLOBAL"}:
+            out.append(k)
+    return sorted(set(out))
 
 def _collect_symbols(obj):
     found = []
@@ -241,7 +172,7 @@ def tabdeal_markets():
         if 5 <= len(s) <= 24 and s.isalnum()
     ]
     if not symbols:
-        return fallback_usdt_markets()
+        raise RuntimeError("لیست بازارهای تبدیل دریافت نشد.")
     return sorted(set(symbols))
 
 @st.cache_data(ttl=180, show_spinner=False)
@@ -258,7 +189,7 @@ def get_markets(exchange):
 
 # -------------------- Binance candles --------------------
 
-@st.cache_data(ttl=45, show_spinner=False)
+@st.cache_data(ttl=30, show_spinner=False)
 def binance_klines(symbol, interval, limit=300):
     params = {"symbol": symbol, "interval": interval, "limit": min(limit, 1000)}
     last = None
@@ -285,7 +216,7 @@ def binance_klines(symbol, interval, limit=300):
     df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
     return df[["open_time","open","high","low","close","volume","quote_volume"]].dropna()
 
-@st.cache_data(ttl=30, show_spinner=False)
+@st.cache_data(ttl=20, show_spinner=False)
 def binance_price(symbol):
     last = None
     for base in BINANCE_ENDPOINTS:
@@ -323,7 +254,7 @@ def udf_to_df(data):
         "volume": pd.to_numeric(v[:n], errors="coerce"),
     }).dropna()
 
-@st.cache_data(ttl=45, show_spinner=False)
+@st.cache_data(ttl=30, show_spinner=False)
 def wallex_klines(symbol, interval, limit=300):
     seconds = resolution_seconds(interval)
     end = unix_now()
@@ -341,7 +272,7 @@ def wallex_klines(symbol, interval, limit=300):
     )
     return udf_to_df(data).tail(limit)
 
-@st.cache_data(ttl=30, show_spinner=False)
+@st.cache_data(ttl=20, show_spinner=False)
 def wallex_price(symbol):
     data = http_get(f"{WALLEX_BASE}/v1/markets", timeout=15)
     symbols = data.get("result", {}).get("symbols", {})
@@ -353,7 +284,7 @@ def wallex_price(symbol):
         raise RuntimeError("قیمت والکس دریافت نشد.")
     return float(p)
 
-@st.cache_data(ttl=45, show_spinner=False)
+@st.cache_data(ttl=30, show_spinner=False)
 def nobitex_klines(symbol, interval, limit=300):
     seconds = resolution_seconds(interval)
     end = unix_now()
@@ -371,7 +302,7 @@ def nobitex_klines(symbol, interval, limit=300):
     )
     return udf_to_df(data).tail(limit)
 
-@st.cache_data(ttl=30, show_spinner=False)
+@st.cache_data(ttl=20, show_spinner=False)
 def nobitex_price(symbol):
     compact = symbol.upper().replace("-", "")
     # Try common destination pairs first.
@@ -480,7 +411,7 @@ def trades_to_ohlcv(trades, interval):
     return out.tail(300)
 
 
-@st.cache_data(ttl=45, show_spinner=False)
+@st.cache_data(ttl=30, show_spinner=False)
 def tabdeal_klines(symbol, interval):
     """Get technical candles without letting a Tabdeal 400 break the app.
 
@@ -496,7 +427,7 @@ def tabdeal_klines(symbol, interval):
     return trades_to_ohlcv(tabdeal_trades(compact), interval)
 
 
-@st.cache_data(ttl=30, show_spinner=False)
+@st.cache_data(ttl=20, show_spinner=False)
 def tabdeal_price(symbol):
     """Read Tabdeal public order book using documented tabdealSymbol first."""
     tab_symbol = tabdeal_pair_name(symbol)
@@ -531,87 +462,25 @@ def tabdeal_price(symbol):
 # -------------------- Exchange router --------------------
 
 def get_price(exchange, symbol):
-    """Read price from the selected exchange, then use Binance for USDT fallback."""
-    symbol = compact_symbol(symbol)
-
     if exchange == "Binance":
         return binance_price(symbol)
-
     if exchange == "والکس":
-        try:
-            return wallex_price(symbol)
-        except Exception as native_error:
-            if is_usdt_symbol(symbol):
-                try:
-                    return binance_price(symbol)
-                except Exception:
-                    raise native_error
-            raise
-
+        return wallex_price(symbol)
     if exchange == "نوبیتکس":
-        try:
-            return nobitex_price(symbol)
-        except Exception as native_error:
-            if is_usdt_symbol(symbol):
-                try:
-                    return binance_price(symbol)
-                except Exception:
-                    raise native_error
-            raise
-
+        return nobitex_price(symbol)
     if exchange == "تبدیل":
-        try:
-            return tabdeal_price(symbol)
-        except Exception as native_error:
-            if is_usdt_symbol(symbol):
-                try:
-                    return binance_price(symbol)
-                except Exception:
-                    raise native_error
-            raise
-
+        return tabdeal_price(symbol)
     raise RuntimeError("صرافی نامعتبر است.")
 
 def get_candles(exchange, symbol, interval):
-    """Read candles from the selected exchange, with Binance USDT fallback."""
-    symbol = compact_symbol(symbol)
-
     if exchange == "Binance":
         return binance_klines(symbol, interval)
-
     if exchange == "والکس":
-        try:
-            return wallex_klines(symbol, interval)
-        except Exception as native_error:
-            if is_usdt_symbol(symbol):
-                try:
-                    return binance_klines(symbol, interval)
-                except Exception:
-                    raise native_error
-            raise
-
+        return wallex_klines(symbol, interval)
     if exchange == "نوبیتکس":
-        try:
-            return nobitex_klines(symbol, interval)
-        except Exception as native_error:
-            if is_usdt_symbol(symbol):
-                try:
-                    return binance_klines(symbol, interval)
-                except Exception:
-                    raise native_error
-            raise
-
+        return nobitex_klines(symbol, interval)
     if exchange == "تبدیل":
-        try:
-            return tabdeal_klines(symbol, interval)
-        except Exception as native_error:
-            if is_usdt_symbol(symbol):
-                try:
-                    return binance_klines(symbol, interval)
-                except Exception:
-                    raise native_error
-            raise
-
+        return tabdeal_klines(symbol, interval)
     raise RuntimeError("صرافی نامعتبر است.")
 
 # -------------------- Indicators --------------------
@@ -798,8 +667,9 @@ def scanner_action(score):
     return "HOLD"
 
 
+@st.cache_data(ttl=30, show_spinner=False)
 def scan_one_market(exchange, symbol, scan_tfs):
-    """Analyze one market and create BUY/SELL/HOLD levels."""
+    """Analyze one market. Timeframes are fetched in parallel."""
     scores = []
     tf_scores = {}
     latest_price = np.nan
@@ -808,29 +678,42 @@ def scan_one_market(exchange, symbol, scan_tfs):
     resistance = np.nan
     last_ind = None
 
-    for tf_name, weight in scan_tfs:
+    def fetch_tf(item):
+        tf_name, weight = item
         try:
             df = get_candles(exchange, symbol, tf_name)
             score, _, ind = timeframe_score(df)
             if len(ind) < 10:
-                continue
-
-            scores.append((score, weight))
-            tf_scores[tf_name] = score
-            last_ind = ind
-
-            last = ind.iloc[-1]
-            latest_price = float(last["close"])
-            atr_value = float(last["atr"])
-            support, resistance = support_resistance(ind, 60)
+                return tf_name, weight, None, None
+            return tf_name, weight, score, ind
         except Exception:
-            tf_scores[tf_name] = None
+            return tf_name, weight, None, None
+
+    workers = min(4, max(1, len(scan_tfs)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        results = list(pool.map(fetch_tf, scan_tfs))
+
+    # Keep the most important timeframe as the reference for levels.
+    ref_tf = max(scan_tfs, key=lambda x: x[1])[0] if scan_tfs else None
+    ref_ind = None
+    for tf_name, weight, score, ind in results:
+        tf_scores[tf_name] = score
+        if score is not None:
+            scores.append((score, weight))
+            if tf_name == ref_tf or ref_ind is None:
+                ref_ind = ind
+
+    if ref_ind is not None and len(ref_ind):
+        last = ref_ind.iloc[-1]
+        latest_price = float(last["close"])
+        atr_value = float(last["atr"])
+        support, resistance = support_resistance(ref_ind, 60)
+        last_ind = ref_ind
 
     if len(scores) < 2 or not np.isfinite(latest_price) or latest_price <= 0:
         raise RuntimeError("حداقل دو تایم‌فریم معتبر در دسترس نیست")
 
     score = round(sum(s * w for s, w in scores) / sum(w for _, w in scores))
-
     last = last_ind.iloc[-1]
     ema20 = float(last["ema20"])
     ema50 = float(last["ema50"])
@@ -840,7 +723,6 @@ def scan_one_market(exchange, symbol, scan_tfs):
 
     if not np.isfinite(atr_value) or atr_value <= 0:
         atr_value = latest_price * 0.02
-
     if not np.isfinite(support) or support <= 0:
         support = latest_price - 1.5 * atr_value
     if not np.isfinite(resistance) or resistance <= 0:
@@ -849,7 +731,6 @@ def scan_one_market(exchange, symbol, scan_tfs):
     signal, icon, signal_text = signal_from_score(
         score, ema20, ema50, ema200, macd_hist, rsi_value
     )
-
     risk = max(1.5 * atr_value, latest_price * 0.01)
 
     if signal == "BUY":
@@ -858,47 +739,29 @@ def scan_one_market(exchange, symbol, scan_tfs):
         if sl <= 0 or sl >= entry:
             sl = entry - risk
         risk_amount = max(entry - sl, entry * 0.01)
-        tp1 = entry + 1.5 * risk_amount
-        tp2 = entry + 2.5 * risk_amount
-
+        tp1, tp2 = entry + 1.5 * risk_amount, entry + 2.5 * risk_amount
         if resistance > entry and resistance < tp1:
             tp1 = max(entry + risk_amount, resistance * 0.995)
-
     elif signal == "SELL":
         entry = latest_price
         sl = max(entry + risk, resistance * 1.005)
         risk_amount = max(sl - entry, entry * 0.01)
-        tp1 = entry - 1.5 * risk_amount
-        tp2 = entry - 2.5 * risk_amount
-
+        tp1, tp2 = entry - 1.5 * risk_amount, entry - 2.5 * risk_amount
         if support < entry and support > tp1:
             tp1 = min(entry - risk_amount, support * 1.005)
-
     else:
         entry = latest_price
-        sl = np.nan
-        tp1 = np.nan
-        tp2 = np.nan
+        sl = tp1 = tp2 = np.nan
 
     return {
-        "بازار": symbol,
-        "امتیاز": score,
-        "سیگنال": f"{icon} {signal}",
-        "توضیح سیگنال": signal_text,
-        "قیمت": latest_price,
-        "ورود": entry if signal != "HOLD" else np.nan,
-        "حدضرر": sl,
-        "حدسود 1": tp1,
-        "حدسود 2": tp2,
-        "حمایت": support,
-        "مقاومت": resistance,
-        "15m": tf_scores.get("15m"),
-        "1h": tf_scores.get("1h"),
-        "4h": tf_scores.get("4h"),
-        "1d": tf_scores.get("1d"),
+        "بازار": symbol, "امتیاز": score, "سیگنال": f"{icon} {signal}",
+        "توضیح سیگنال": signal_text, "قیمت": latest_price,
+        "ورود": entry if signal != "HOLD" else np.nan, "حدضرر": sl,
+        "حدسود 1": tp1, "حدسود 2": tp2, "حمایت": support, "مقاومت": resistance,
+        "15m": tf_scores.get("15m"), "1h": tf_scores.get("1h"),
+        "4h": tf_scores.get("4h"), "1d": tf_scores.get("1d"),
         "تایم‌فریم معتبر": len(scores),
     }
-
 
 def run_scanner(exchange, markets, scan_tfs, limit):
     candidates = scanner_candidates(exchange, markets, limit)
@@ -906,32 +769,36 @@ def run_scanner(exchange, markets, scan_tfs, limit):
     progress = st.progress(0, text="شروع اسکن بازار...")
     total = len(candidates)
 
-    # Keep requests sequential to respect public exchange API limits.
-    for i, symbol in enumerate(candidates, 1):
+    def scan_symbol(symbol):
         try:
-            rows.append(scan_one_market(exchange, symbol, scan_tfs))
+            return scan_one_market(exchange, symbol, tuple(scan_tfs))
         except Exception as exc:
-            rows.append({
-                "بازار": symbol,
-                "امتیاز": None,
-                "سیگنال": "⚪ HOLD",
+            return {
+                "بازار": symbol, "امتیاز": None, "سیگنال": "⚪ HOLD",
                 "توضیح سیگنال": f"داده ناکافی: {str(exc)[:35]}",
                 "تایم‌فریم معتبر": 0,
-            })
-        progress.progress(i / max(total, 1), text=f"اسکن {symbol} — {i}/{total}")
+            }
+
+    # A small worker pool dramatically reduces total wait time while avoiding
+    # an aggressive request flood against public exchange APIs.
+    workers = min(5, max(1, total))
+    completed = 0
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(scan_symbol, symbol): symbol for symbol in candidates}
+        for future in as_completed(futures):
+            rows.append(future.result())
+            completed += 1
+            symbol = futures[future]
+            progress.progress(completed / max(total, 1), text=f"اسکن {symbol} — {completed}/{total}")
 
     progress.empty()
     df = pd.DataFrame(rows)
     if df.empty:
         return df
-
     df["امتیاز_sort"] = pd.to_numeric(df["امتیاز"], errors="coerce")
-    df = df.sort_values(
-        ["امتیاز_sort", "تایم‌فریم معتبر"],
-        ascending=[False, False],
-        na_position="last",
-    ).drop(columns=["امتیاز_sort"])
-    return df.reset_index(drop=True)
+    return df.sort_values(
+        ["امتیاز_sort", "تایم‌فریم معتبر"], ascending=[False, False], na_position="last"
+    ).drop(columns=["امتیاز_sort"]).reset_index(drop=True)
 
 # -------------------- UI / Dropdowns --------------------
 
@@ -1056,30 +923,40 @@ if not symbol:
 # -------------------- Analysis --------------------
 
 try:
-    price = get_price(exchange, symbol)
+    # Fetch the live price and all four timeframes concurrently.
+    tf_names = ["15m", "1h", "4h", "1d"]
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        price_future = pool.submit(get_price, exchange, symbol)
+        candle_futures = {name: pool.submit(get_candles, exchange, symbol, name) for name in tf_names}
+        price = price_future.result()
+        tf_data = {}
+        scores = {}
+        for name, future in candle_futures.items():
+            try:
+                d = future.result()
+                sc, rs, ind_tf = timeframe_score(d)
+                scores[name] = sc
+                tf_data[name] = (d, ind_tf, rs)
+            except Exception:
+                scores[name] = None
 
-    main_df = get_candles(exchange, symbol, tf)
+    # Reuse the already-fetched selected timeframe; never request it twice.
+    if tf in tf_data:
+        main_df, ind, reasons = tf_data[tf]
+    else:
+        valid_tf = next((name for name in tf_names if name in tf_data), None)
+        if valid_tf is None:
+            raise RuntimeError("هیچ تایم‌فریم معتبری برای تحلیل دریافت نشد.")
+        main_df, ind, reasons = tf_data[valid_tf]
 
-    scores = {}
-    tf_data = {}
-    for name in ["15m", "1h", "4h", "1d"]:
-        try:
-            d = get_candles(exchange, symbol, name)
-            sc, rs, ind = timeframe_score(d)
-            scores[name] = sc
-            tf_data[name] = (d, ind, rs)
-        except Exception:
-            scores[name] = None
-
-    main_score, reasons, ind = timeframe_score(main_df)
+    main_score = scores.get(tf) if scores.get(tf) is not None else timeframe_score(main_df)[0]
     if len(ind) < 10:
         raise RuntimeError("داده کافی برای تحلیل تکنیکال وجود ندارد.")
 
     last = ind.iloc[-1]
-
     weights = {"15m": 0.15, "1h": 0.25, "4h": 0.35, "1d": 0.25}
     valid = [(scores[k], weights[k]) for k in weights if scores.get(k) is not None]
-    mtf_score = round(sum(s*w for s, w in valid) / sum(w for s, w in valid)) if valid else main_score
+    mtf_score = round(sum(s * w for s, w in valid) / sum(w for _, w in valid)) if valid else main_score
 
     support, resistance = support_resistance(ind, 60)
     atr_value = float(last["atr"])
@@ -1245,11 +1122,11 @@ try:
         j3.metric("نسبت حجم", f"{last['vol_ratio']:.2f}x")
 
     with st.expander("🏦 وضعیت اتصال صرافی‌ها"):
-        st.write(f"منبع انتخاب‌شده: **{exchange}**")
-        st.write("Binance: منبع عمومی + چند مسیر جایگزین")
-        st.write("والکس: منبع عمومی؛ در USDT امکان fallback به Binance")
-        st.write("نوبیتکس: منبع عمومی؛ در USDT امکان fallback به Binance")
-        st.write("تبدیل: منبع عمومی؛ در USDT امکان fallback به Binance")
+        st.write(f"منبع فعال تحلیل: **{exchange}**")
+        st.write("Binance: متصل به داده عمومی")
+        st.write("والکس: متصل به داده عمومی")
+        st.write("نوبیتکس: متصل به داده عمومی")
+        st.write("تبدیل: متصل به داده عمومی")
         st.caption(
             "در تبدیل، کندل‌های تکنیکال از معاملات عمومی اخیر ساخته می‌شوند؛ "
             "اگر تاریخچه کافی نباشد، همان بازار باید منبع داده جایگزین داشته باشد."
@@ -1278,11 +1155,8 @@ try:
     )
 
 except requests.exceptions.RequestException as exc:
-    st.error("ارتباط با منبع داده برقرار نشد.")
-    st.caption(
-        "اتصال اصلی و مسیرهای جایگزین برای این بازار موفق نشدند. "
-        f"جزئیات فنی: {exc}"
-    )
+    st.error("ارتباط با API صرافی برقرار نشد.")
+    st.caption(str(exc))
 except Exception as exc:
     st.error(f"تحلیل {symbol} در {exchange} انجام نشد.")
     st.caption(f"جزئیات فنی: {exc}")

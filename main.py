@@ -65,6 +65,23 @@ def base_asset(symbol):
     s = normalize_symbol(symbol)
     return s[:-4] if s.endswith('USDT') else s
 
+
+def money(value):
+    """Format a price/value safely for display."""
+    try:
+        v = float(value)
+        if not np.isfinite(v):
+            return '-'
+        if abs(v) >= 1000:
+            return f'{v:,.2f}'
+        if abs(v) >= 1:
+            return f'{v:,.4f}'
+        if abs(v) >= 0.01:
+            return f'{v:,.6f}'
+        return f'{v:.10f}'.rstrip('0').rstrip('.')
+    except (TypeError, ValueError):
+        return '-'
+
 # ============================================================
 # TABDEAL — COMPLETE USDT MARKET UNIVERSE
 # ============================================================

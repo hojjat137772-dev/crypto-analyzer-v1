@@ -841,7 +841,6 @@ def smart_trade_levels(signal, price, atr_value, support=np.nan, resistance=np.n
 
     return np.nan, np.nan, np.nan, np.nan
 
-
 def scanner_candidates(exchange, markets, limit=20):
     """Build a clean scanner universe from the selected exchange."""
     cleaned = []
@@ -1546,6 +1545,8 @@ try:
     valid=[(scores[k],weights[k]) for k in weights if scores.get(k) is not None]
     mtf_score=round(sum(s*w for s,w in valid)/sum(w for _,w in valid))
     support,resistance=support_resistance(ind,60); market_price=float(price)
+    # The latest indicator row must be defined before any trade/indicator calculations.
+    last = ind.iloc[-1]
     atr_value=float(last["atr"]) if np.isfinite(last["atr"]) and last["atr"]>0 else market_price*.02
     ema20,ema50,ema200=map(float,[last["ema20"],last["ema50"],last["ema200"]]); rsi_v=float(last["rsi"]); macd_hist=float(last["macd_hist"]); adx_v=float(last["adx"])
     ich_bull=bool(last["close"]>max(last["ich_span_a"],last["ich_span_b"]) and last["ich_tenkan"]>last["ich_kijun"])

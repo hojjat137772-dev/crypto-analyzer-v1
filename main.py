@@ -168,25 +168,37 @@ def tabdeal_pair_name(symbol):
 
 
 @st.cache_data(ttl=30, show_spinner=False)
-def tabdeal_trades(symbol, limit=2000):
-    """Public recent trades.
+def tabdeal_trades(symbol, limit=1000):
+    """Public recent trades from Tabdeal.
 
-    Tabdeal's official public collection documents `tabdealSymbol` for this
-    endpoint and shows the optional limit disabled. Do not send `limit=2000`
-    because that combination can return HTTP 400 on the live API.
+    The official Tabdeal docs support both `symbol` and `tabdealSymbol` and
+    allow up to 1000 recent trades. We explicitly request the maximum public
+    history so the 15m/1h/4h aggregations have enough candles to work.
     """
-    tab_symbol = tabdeal_pair_name(symbol)
-    try:
-        data = http_get(
-            f"{TABDEAL_BASE}/r/api/v1/trades",
-            {"tabdealSymbol": tab_symbol},
-            15,
-        )
-        return parse_tabdeal_trade_rows(data)
-    except Exception as exc:
-        raise RuntimeError(
-            f"داده معاملات تبدیل برای {symbol} در دسترس نیست ({tab_symbol})."
-        ) from exc
+    compact = str(symbol).upper().replace("-", "").replace("_", "")
+    tab_symbol = tabdeal_pair_name(compact)
+    attempts = [
+        {"symbol": compact, "limit": min(int(limit), 1000)},
+        {"tabdealSymbol": tab_symbol, "limit": min(int(limit), 1000)},
+        {"tabdealSymbol": tab_symbol},
+    ]
+    last = None
+    for params in attempts:
+        try:
+            data = http_get(
+                f"{TABDEAL_BASE}/r/api/v1/trades",
+                params,
+                15,
+            )
+            rows = parse_tabdeal_trade_rows(data)
+            if rows:
+                return rows
+        except Exception as exc:
+            last = exc
+
+    raise RuntimeError(
+        f"داده معاملات تبدیل برای {symbol} در دسترس نیست ({tab_symbol})."
+    ) from last
 
 
 def trades_to_ohlcv(trades, interval):
@@ -207,7 +219,11 @@ def trades_to_ohlcv(trades, interval):
         "close": c.values,
         "volume": v.values,
     }).dropna()
-    if len(out) < 20:
+    # Do not reject a timeframe merely because it has fewer than 20 candles.
+    # The higher-level analyzer will select only timeframes with enough
+    # indicator history; this lets 15m data remain usable when 4h/1d history
+    # is naturally sparse on a recent-trades endpoint.
+    if len(out) < 2:
         raise RuntimeError("تاریخچه معاملاتی تبدیل برای این تایم‌فریم کافی نیست.")
     return out.tail(300)
 
@@ -1394,13 +1410,24 @@ def analyze_one_symbol(symbol, tf):
         price=price_future.result(); tf_data={}; scores={}
         for n,fut in futures.items():
             try:
-                d=fut.result(); sc,rs,ind_tf=timeframe_score(d); scores[n]=sc; tf_data[n]=(d,ind_tf,rs)
+                d=fut.result()
+                sc,rs,ind_tf=timeframe_score(d)
+                # `timeframe_score` drops indicator warm-up rows (EMA200,
+                # Ichimoku, etc.). Only treat a timeframe as valid when the
+                # resulting indicator frame has real history.
+                if len(ind_tf) >= 60 and np.isfinite(float(ind_tf["close"].iloc[-1])):
+                    scores[n]=sc; tf_data[n]=(d,ind_tf,rs)
+                else:
+                    scores[n]=None
             except Exception:
                 scores[n]=None
 
     valid_tf=next((n for n in tf_names if n in tf_data),None)
     if valid_tf is None:
-        raise RuntimeError("هیچ تایم‌فریم معتبری دریافت نشد.")
+        raise RuntimeError(
+            "از تبدیل داده کافی برای ساخت حداقل 60 کندل معتبر دریافت نشد. "
+            "ممکن است بازار کم‌معامله باشد یا API معاملات اخیر تاریخچه کافی ندهد."
+        )
     main_df,ind,reasons=tf_data.get(tf,tf_data[valid_tf])
     weights={"15m":.15,"1h":.25,"4h":.35,"1d":.25}
     valid=[(scores[k],weights[k]) for k in tf_names if scores.get(k) is not None]

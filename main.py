@@ -12,6 +12,9 @@ st.set_page_config(page_title='Crypto Analyzer Pro', page_icon='₿', layout='wi
 # ============================================================
 TIMEFRAMES = {'15m':'15m', '1H':'1h', '4H':'4h', '1D':'1d'}
 BINANCE = 'https://api.binance.com'
+OKX = 'https://www.okx.com'
+BYBIT = 'https://api.bybit.com'
+KUCOIN = 'https://api.kucoin.com'
 WALLEX = 'https://api.wallex.ir'
 TABDEAL = 'https://api1.tabdeal.org'
 SESSION = requests.Session()
@@ -152,16 +155,101 @@ def get_tabdeal_universe():
 # ============================================================
 # BINANCE MARKET DATA
 # ============================================================
-def binance_klines(symbol, interval, limit=500):
-    data = get_json(BINANCE + '/api/v3/klines', {'symbol':symbol, 'interval':interval, 'limit':limit})
-    if not isinstance(data, list) or len(data) < 40:
+def _df_from_rows(rows, source):
+    try:
+        if source == 'binance':
+            cols=['open_time','open','high','low','close','volume','close_time','qv','trades','tbv','tqv','ignore']
+            df=pd.DataFrame(rows, columns=cols)
+            for c in ['open','high','low','close','volume']:
+                df[c]=pd.to_numeric(df[c], errors='coerce')
+            df['time']=pd.to_datetime(df['open_time'], unit='ms', utc=True)
+            return df[['time','open','high','low','close','volume']].dropna().sort_values('time').reset_index(drop=True)
+        if source == 'okx':
+            # OKX: ts, open, high, low, close, volume, ...
+            df=pd.DataFrame(rows)
+            if len(df.columns)<6: return pd.DataFrame()
+            df=df.iloc[:,:6]
+            df.columns=['time','open','high','low','close','volume']
+            df['time']=pd.to_datetime(pd.to_numeric(df['time']), unit='ms', utc=True)
+            for c in ['open','high','low','close','volume']:
+                df[c]=pd.to_numeric(df[c], errors='coerce')
+            return df.dropna().sort_values('time').reset_index(drop=True)
+        if source == 'bybit':
+            # Bybit: startTime, open, high, low, close, volume, turnover
+            df=pd.DataFrame(rows)
+            if len(df.columns)<6: return pd.DataFrame()
+            df=df.iloc[:,:6]
+            df.columns=['time','open','high','low','close','volume']
+            df['time']=pd.to_datetime(pd.to_numeric(df['time']), unit='ms', utc=True)
+            for c in ['open','high','low','close','volume']:
+                df[c]=pd.to_numeric(df[c], errors='coerce')
+            return df.dropna().sort_values('time').reset_index(drop=True)
+        if source == 'kucoin':
+            # KuCoin: time, open, close, high, low, volume, turnover
+            df=pd.DataFrame(rows)
+            if len(df.columns)<6: return pd.DataFrame()
+            df=df.iloc[:,:6]
+            df.columns=['time','open','close','high','low','volume']
+            df['time']=pd.to_datetime(pd.to_numeric(df['time']), unit='s', utc=True)
+            df['high']=pd.to_numeric(df['high'], errors='coerce')
+            df['low']=pd.to_numeric(df['low'], errors='coerce')
+            for c in ['open','close','volume']:
+                df[c]=pd.to_numeric(df[c], errors='coerce')
+            df=df[['time','open','high','low','close','volume']]
+            return df.dropna().sort_values('time').reset_index(drop=True)
+    except Exception:
         return pd.DataFrame()
-    cols=['open_time','open','high','low','close','volume','close_time','qv','trades','tbv','tqv','ignore']
-    df=pd.DataFrame(data, columns=cols)
-    for c in ['open','high','low','close','volume']:
-        df[c]=pd.to_numeric(df[c], errors='coerce')
-    df['time']=pd.to_datetime(df['open_time'], unit='ms', utc=True)
-    return df[['time','open','high','low','close','volume']].dropna().reset_index(drop=True)
+    return pd.DataFrame()
+
+
+def binance_klines(symbol, interval, limit=500):
+    data=get_json(BINANCE + '/api/v3/klines', {'symbol':symbol, 'interval':interval, 'limit':limit})
+    if isinstance(data,list) and len(data)>=40:
+        df=_df_from_rows(data,'binance')
+        if len(df)>=40: return df
+    return pd.DataFrame()
+
+
+def okx_klines(symbol, interval, limit=300):
+    bar={'15m':'15m','1h':'1H','4h':'4H','1d':'1D'}.get(interval,interval)
+    inst=base_asset(symbol)+'-USDT'
+    d=get_json(OKX+'/api/v5/market/candles', {'instId':inst,'bar':bar,'limit':str(min(limit,300))})
+    rows=d.get('data',[]) if isinstance(d,dict) else []
+    return _df_from_rows(rows,'okx') if len(rows)>=40 else pd.DataFrame()
+
+
+def bybit_klines(symbol, interval, limit=200):
+    iv={'15m':'15','1h':'60','4h':'240','1d':'D'}.get(interval,interval)
+    d=get_json(BYBIT+'/v5/market/kline', {'category':'spot','symbol':symbol,'interval':iv,'limit':str(min(limit,200))})
+    rows=d.get('result',{}).get('list',[]) if isinstance(d,dict) else []
+    return _df_from_rows(rows,'bybit') if len(rows)>=40 else pd.DataFrame()
+
+
+def kucoin_klines(symbol, interval, limit=500):
+    typ={'15m':'15min','1h':'1hour','4h':'4hour','1d':'1day'}.get(interval,interval)
+    pair=base_asset(symbol)+'-USDT'
+    d=get_json(KUCOIN+'/api/v1/market/candles', {'symbol':pair,'type':typ})
+    rows=d.get('data',[]) if isinstance(d,dict) else []
+    df=_df_from_rows(rows,'kucoin') if len(rows)>=40 else pd.DataFrame()
+    return df.tail(limit).reset_index(drop=True) if not df.empty else df
+
+
+def market_klines(symbol, interval, limit=500):
+    # Primary + fallbacks. This is what lets Tabdeal-listed USDT coins
+    # still receive historical data when they are absent from Binance.
+    for fn in (
+        lambda: binance_klines(symbol,interval,limit),
+        lambda: okx_klines(symbol,interval,limit),
+        lambda: bybit_klines(symbol,interval,min(limit,200)),
+        lambda: kucoin_klines(symbol,interval,limit),
+    ):
+        try:
+            df=fn()
+            if not df.empty and len(df)>=40:
+                return df
+        except Exception:
+            pass
+    return pd.DataFrame()
 
 
 def binance_price(symbol):
@@ -205,6 +293,20 @@ def wallex_klines(symbol, resolution='60', days=12):
     except Exception: return pd.DataFrame()
 
 
+def alternate_price(symbol):
+    checks=[
+        (OKX+'/api/v5/market/ticker', {'instId':base_asset(symbol)+'-USDT'}, lambda d: d.get('data',[{}])[0].get('last')),
+        (BYBIT+'/v5/market/tickers', {'category':'spot','symbol':symbol}, lambda d: d.get('result',{}).get('list',[{}])[0].get('lastPrice')),
+        (KUCOIN+'/api/v1/market/orderbook/level1', {'symbol':base_asset(symbol)+'-USDT'}, lambda d: d.get('data',{}).get('price')),
+    ]
+    for url,params,getter in checks:
+        try:
+            d=get_json(url,params,timeout=8)
+            v=getter(d) if isinstance(d,dict) else None
+            if v is not None: return float(v)
+        except Exception: pass
+    return None
+
 def wallex_price(symbol):
     markets=wallex_markets()
     d=markets.get(symbol)
@@ -220,6 +322,8 @@ def source_prices(symbol):
     if p: vals['بایننس']=p
     p=wallex_price(symbol)
     if p: vals['والکس']=p
+    p=alternate_price(symbol)
+    if p: vals['بازارهای جایگزین']=p
     # Tabdeal current price: try ticker-like endpoints.
     base=base_asset(symbol)
     for ep in ['/v1/ticker/24hr','/v1/market/stats','/v1/market/ticker','/v1/markets']:
@@ -359,9 +463,8 @@ def aggregate(symbol):
     # Binance is the primary OHLC source because it has stable public historical candles.
     mapping={'15m':'15m','1H':'1h','4H':'4h','1D':'1d'}
     for tf,iv in mapping.items():
-        df=binance_klines(symbol,iv,500)
+        df=market_klines(symbol,iv,500)
         if df.empty and tf in ('1H','4H'):
-            # Wallex fallback
             df=wallex_klines(symbol,'60',14)
             if tf=='4H' and not df.empty:
                 x=df.set_index('time').resample('4h').agg({'open':'first','high':'max','low':'min','close':'last','volume':'sum'}).dropna().reset_index()

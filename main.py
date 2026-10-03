@@ -368,7 +368,11 @@ def get_price(exchange, symbol):
 def get_candles(exchange, symbol, interval):
     if exchange != EXCHANGE_NAME:
         raise RuntimeError("فقط صرافی تبدیل فعال است.")
-    return tabdeal_klines(symbol, interval)
+    # Tabdeal is the primary market source. If its recent-trade history is
+    # too short, transparently use the public Nobitex OHLC history for the
+    # same USDT pair. The displayed/live price remains from Tabdeal.
+    candles, _source = analysis_candles(symbol, interval)
+    return candles
 
 # -------------------- Indicators --------------------
 

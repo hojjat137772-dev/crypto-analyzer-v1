@@ -1404,6 +1404,9 @@ header[data-testid="stHeader"]{background:transparent;}
 [data-testid="stDataFrame"]{border-radius:15px;overflow:hidden}
 hr{margin:.45rem 0!important}
 .small-note{font-size:.72rem;color:#777}
+.final-decision{border-radius:20px;padding:14px 16px;margin:.35rem 0 .55rem;border:1px solid rgba(40,35,25,.08);background:#fff;box-shadow:0 5px 18px rgba(0,0,0,.035)}
+.final-decision.buy{border-right:5px solid #19a35a}.final-decision.sell{border-right:5px solid #d84b4b}.final-decision.wait{border-right:5px solid #e5ae2f}
+.final-top{display:flex;justify-content:space-between;align-items:center;gap:10px}.final-label{font-size:.72rem;color:#777}.final-title{font-size:1.35rem;font-weight:800;margin-top:2px}.final-confidence{text-align:center;font-size:.7rem;color:#777;line-height:1.25}.final-confidence b{font-size:1.05rem;color:#222}.final-reason{font-size:.78rem;color:#555;margin-top:7px}
 @media(max-width:700px){.block-container{padding:.3rem .45rem 1rem}.main-title{font-size:1.35rem}.stSelectbox label{font-size:.72rem}}
 </style>
 """, unsafe_allow_html=True)
@@ -1531,15 +1534,27 @@ try:
     status="صعودی" if mtf_score>=60 else "نزولی" if mtf_score<=40 else "رنج"
     status_icon="🟢" if status=="صعودی" else "🔴" if status=="نزولی" else "🟡"
 
-    st.markdown(f'<div class="card"><b>{exchange} · {symbol}</b><br><span class="small-note">تحلیل دقیق {tf} + تأیید 15m / 1h / 4h / 1d</span></div>',unsafe_allow_html=True)
+    aligned = sum(1 for k in tf_names if scores.get(k) is not None and ((signal == "BUY" and scores[k] >= 60) or (signal == "SELL" and scores[k] <= 40)))
+    final_title = "ورود" if signal != "HOLD" else "فعلاً صبر کن"
+    final_sub = signal_text if signal != "HOLD" else "تا تأیید بهتر، معامله جدید باز نکن."
+    final_bg = "buy" if signal == "BUY" else "sell" if signal == "SELL" else "wait"
+    st.markdown(f"""
+    <div class="final-decision {final_bg}">
+      <div class="final-top">
+        <div><span class="final-label">تصمیم نهایی</span><div class="final-title">{signal_icon} {final_title}</div></div>
+        <div class="final-confidence">اعتماد تحلیل<br><b>{confidence}%</b></div>
+      </div>
+      <div class="final-reason">{final_sub}</div>
+    </div>
+    """, unsafe_allow_html=True)
     a,b,c,d=st.columns(4)
-    a.metric("قیمت",money(price)); b.metric("امتیاز",f"{mtf_score}/100"); c.metric("وضعیت",f"{status_icon} {status}"); d.metric("اعتماد تحلیل",f"{confidence}%")
-    st.markdown('<div class="signal-card">',unsafe_allow_html=True)
-    a,b,c,d=st.columns(4); a.metric("تصمیم",f"{signal_icon} {signal}"); b.metric("RSI",f"{rsi_v:.1f}"); c.metric("ADX",f"{adx_v:.1f}"); d.metric("حجم",f"{float(last['vol_ratio']):.2f}x")
+    a.metric("قیمت",money(price)); b.metric("امتیاز",f"{mtf_score}/100"); c.metric("تأیید تایم‌فریم",f"{aligned}/{len([k for k in tf_names if scores.get(k) is not None])}"); d.metric("وضعیت",f"{status_icon} {status}")
     if signal!="HOLD":
-        e,f,g,h=st.columns(4); e.metric("ورود",money(entry)); f.metric("SL",money(sl)); g.metric("TP1",money(tp1)); h.metric("TP2",money(tp2))
-    st.caption(signal_text)
-    st.markdown('</div>',unsafe_allow_html=True)
+        e,f,g,h=st.columns(4); e.metric("ورود",money(entry)); f.metric("حدضرر",money(sl)); g.metric("TP1",money(tp1)); h.metric("TP2",money(tp2))
+    else:
+        st.info("🟡 برای ورود صبر کن تا روند، مومنتوم و چند تایم‌فریم هم‌جهت شوند.")
+
+    a,b,c,d=st.columns(4); a.metric("RSI",f"{rsi_v:.1f}"); b.metric("ADX",f"{adx_v:.1f}"); c.metric("حجم",f"{float(last['vol_ratio']):.2f}x"); d.metric("MACD",f"{macd_hist:.6f}")
 
     # Forecast is integrated here; no separate prediction button.
     try:

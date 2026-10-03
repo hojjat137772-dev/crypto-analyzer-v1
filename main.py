@@ -4,12 +4,13 @@ import pandas as pd
 import numpy as np
 import requests
 import time
+import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 
 # ============================================================
 # Crypto Analyzer Pro - Multi Exchange / Single File
-# Binance + Wallex + Nobitex + Tabdeal
+# Binance + Wallex + Bit24 + Tabdeal
 # Analysis only - no order placement
 # ============================================================
 
@@ -25,10 +26,11 @@ BINANCE_ENDPOINTS = [
     "https://data-api.binance.vision",
 ]
 WALLEX_BASE = "https://api.wallex.ir"
-NOBITEX_BASE = "https://api.nobitex.ir"
+BIT24_BASE = "https://rest.bit24.cash"
 TABDEAL_BASE = "https://api1.tabdeal.org"
 
-EXCHANGES = ["Binance", "والکس", "نوبیتکس", "تبدیل"]
+EXCHANGES = ["Binance", "والکس", "بیت۲۴", "تبدیل"]
+BIT24_API_KEY = os.getenv("BIT24_API_KEY", "").strip()
 
 INTERVALS = {
     "15m": "15m",
@@ -118,17 +120,6 @@ def wallex_markets():
             last = exc
     raise RuntimeError("لیست بازارهای والکس دریافت نشد.") from last
 
-@st.cache_data(ttl=180, show_spinner=False)
-def nobitex_markets():
-    data = http_get(f"{NOBITEX_BASE}/market/stats", timeout=15)
-    stats = data.get("stats", {})
-    out = []
-    for key in stats.keys():
-        k = str(key).upper().replace("-", "")
-        if k and k not in {"GLOBAL"}:
-            out.append(k)
-    return sorted(set(out))
-
 def _collect_symbols(obj):
     found = []
     if isinstance(obj, dict):
@@ -160,13 +151,50 @@ def tabdeal_markets():
     return sorted(set(symbols))
 
 @st.cache_data(ttl=180, show_spinner=False)
+def bit24_headers():
+    if not BIT24_API_KEY:
+        raise RuntimeError("کلید API بیت۲۴ تنظیم نشده است. متغیر BIT24_API_KEY را در Secrets/Environment تنظیم کن.")
+    return {"Accept": "application/json", "X-BIT24-APIKEY": BIT24_API_KEY}
+
+@st.cache_data(ttl=180, show_spinner=False)
+def bit24_markets():
+    rows = []
+    page = 1
+    while page <= 10:
+        r = _HTTP.get(f"{BIT24_BASE}/pro/capi/v1/markets", params={"page": page}, headers=bit24_headers(), timeout=7)
+        r.raise_for_status()
+        data = r.json()
+        results = data.get("data", {}).get("results", [])
+        if not isinstance(results, list) or not results:
+            break
+        for item in results:
+            if int(item.get("is_active", 1)) != 1:
+                continue
+            base = str(item.get("base_coin_symbol", "")).upper()
+            quote = str(item.get("quote_coin_symbol", "")).upper()
+            if base and quote in {"USDT", "IRT"}:
+                rows.append(f"{base}{quote}")
+        if not data.get("data", {}).get("has_paginate") or page >= int(data.get("data", {}).get("last_page", page)):
+            break
+        page += 1
+    if not rows:
+        raise RuntimeError("لیست بازارهای بیت۲۴ دریافت نشد.")
+    return sorted(set(rows))
+
+def bit24_parts(symbol):
+    symbol = str(symbol).upper().replace("_", "")
+    for q in ("USDT", "IRT"):
+        if symbol.endswith(q) and len(symbol) > len(q):
+            return symbol[:-len(q)], q
+    raise ValueError(f"نماد بیت۲۴ نامعتبر است: {symbol}")
+
 def get_markets(exchange):
     if exchange == "Binance":
         return binance_markets()
     if exchange == "والکس":
         return wallex_markets()
-    if exchange == "نوبیتکس":
-        return nobitex_markets()
+    if exchange == "بیت۲۴":
+        return bit24_markets()
     if exchange == "تبدیل":
         return tabdeal_markets()
     return []
@@ -215,7 +243,7 @@ def binance_price(symbol):
             last = exc
     raise RuntimeError("قیمت Binance دریافت نشد.") from last
 
-# -------------------- UDF adapters: Wallex / Nobitex --------------------
+# -------------------- UDF adapters: Wallex / Bit24 --------------------
 
 def udf_to_df(data):
     if not isinstance(data, dict) or data.get("s") not in {"ok", "no_data"}:
@@ -269,50 +297,49 @@ def wallex_price(symbol):
     return float(p)
 
 @st.cache_data(ttl=30, show_spinner=False)
-def nobitex_klines(symbol, interval, limit=300):
+@st.cache_data(ttl=30, show_spinner=False)
+def bit24_klines(symbol, interval, limit=300):
+    base, quote = bit24_parts(symbol)
+    to_ts = unix_now()
     seconds = resolution_seconds(interval)
-    end = unix_now()
-    start = end - seconds * (limit + 50)
-    resolution = {"5m": 5, "15m": 15, "1h": 60, "4h": 240, "1d": "D"}[interval]
-    data = http_get(
-        f"{NOBITEX_BASE}/market/udf/history",
-        {
-            "symbol": symbol,
-            "resolution": resolution,
-            "from": start,
-            "to": end,
-        },
-        15,
-    )
-    return udf_to_df(data).tail(limit)
+    from_ts = to_ts - seconds * max(limit, 200)
+    params = {
+        "from_ts": from_ts,
+        "to_ts": to_ts,
+        "base_coin_symbol": base,
+        "quote_coin_symbol": quote,
+        "resolution": interval,
+    }
+    r = _HTTP.get(f"{BIT24_BASE}/pro/capi/v1/markets/ohclv", params=params, headers=bit24_headers(), timeout=7)
+    r.raise_for_status()
+    data = r.json()
+    rows = data.get("data", {}).get("results", [])
+    if not rows:
+        raise RuntimeError("داده OHLC بیت۲۴ برای این بازار موجود نیست.")
+    out = pd.DataFrame(rows)
+    rename = {"t":"timestamp", "o":"open", "h":"high", "l":"low", "c":"close", "v":"volume"}
+    out = out.rename(columns=rename)
+    for c in ["open","high","low","close","volume"]:
+        out[c] = pd.to_numeric(out[c], errors="coerce")
+    out["timestamp"] = pd.to_datetime(pd.to_numeric(out["timestamp"], errors="coerce"), unit="s", utc=True)
+    out = out.dropna(subset=["timestamp","open","high","low","close"]).sort_values("timestamp").tail(limit).reset_index(drop=True)
+    return out[["timestamp","open","high","low","close","volume"]]
 
-@st.cache_data(ttl=20, show_spinner=False)
-def nobitex_price(symbol):
-    compact = symbol.upper().replace("-", "")
-    # Try common destination pairs first.
-    if compact.endswith("IRT"):
-        src, dst = compact[:-3], "rls"
-    elif compact.endswith("USDT"):
-        src, dst = compact[:-4], "usdt"
-    else:
-        src, dst = compact, "usdt"
-    data = http_get(
-        f"{NOBITEX_BASE}/market/stats",
-        {"srcCurrency": src.lower(), "dstCurrency": dst},
-        15,
-    )
-    stats = data.get("stats", {})
-    key = f"{src.lower()}-{dst}"
-    item = stats.get(key)
-    if not item:
-        raise RuntimeError("بازار نوبیتکس پیدا نشد.")
-    p = item.get("latest")
-    if p is None:
-        raise RuntimeError("قیمت نوبیتکس دریافت نشد.")
-    return float(p)
-
-# -------------------- Tabdeal --------------------
-
+@st.cache_data(ttl=10, show_spinner=False)
+def bit24_price(symbol):
+    base, quote = bit24_parts(symbol)
+    r = _HTTP.get(f"{BIT24_BASE}/pro/capi/v1/markets", params={"page":1}, headers=bit24_headers(), timeout=7)
+    r.raise_for_status()
+    data = r.json()
+    pages = int(data.get("data", {}).get("last_page", 1) or 1)
+    for page in range(1, min(pages, 10)+1):
+        if page != 1:
+            r = _HTTP.get(f"{BIT24_BASE}/pro/capi/v1/markets", params={"page":page}, headers=bit24_headers(), timeout=7)
+            r.raise_for_status(); data = r.json()
+        for item in data.get("data", {}).get("results", []):
+            if str(item.get("base_coin_symbol", "")).upper()==base and str(item.get("quote_coin_symbol", "")).upper()==quote:
+                return safe_float(item.get("each_price"))
+    raise RuntimeError("قیمت بیت۲۴ برای این نماد پیدا نشد.")
 
 def parse_tabdeal_trade_rows(data):
     rows = data
@@ -450,8 +477,8 @@ def get_price(exchange, symbol):
         return binance_price(symbol)
     if exchange == "والکس":
         return wallex_price(symbol)
-    if exchange == "نوبیتکس":
-        return nobitex_price(symbol)
+    if exchange == "بیت۲۴":
+        return bit24_price(symbol)
     if exchange == "تبدیل":
         return tabdeal_price(symbol)
     raise RuntimeError("صرافی نامعتبر است.")
@@ -461,8 +488,8 @@ def get_candles(exchange, symbol, interval):
         return binance_klines(symbol, interval)
     if exchange == "والکس":
         return wallex_klines(symbol, interval)
-    if exchange == "نوبیتکس":
-        return nobitex_klines(symbol, interval)
+    if exchange == "بیت۲۴":
+        return bit24_klines(symbol, interval)
     if exchange == "تبدیل":
         return tabdeal_klines(symbol, interval)
     raise RuntimeError("صرافی نامعتبر است.")
@@ -803,7 +830,7 @@ def scanner_candidates(exchange, markets, limit=20):
             continue
         if exchange == "Binance" and quote != "USDT":
             continue
-        if exchange in {"والکس", "نوبیتکس", "تبدیل"} and quote not in {"USDT", "IRT", "RLS"}:
+        if exchange in {"والکس", "بیت۲۴", "تبدیل"} and quote not in {"USDT", "IRT", "RLS"}:
             continue
         cleaned.append(m)
 
@@ -1411,13 +1438,15 @@ hr{margin:.45rem 0!important}
 </style>
 """, unsafe_allow_html=True)
 
-st.markdown('<div class="main-title">Crypto Analyzer</div><div class="sub-title">تحلیل چندلایه بازار • سیگنال • نوسان‌گیری</div>', unsafe_allow_html=True)
+st.markdown('<div class="main-title">Crypto Analyzer</div><div class="sub-title">تحلیل • سیگنال • نوسان‌گیری</div>', unsafe_allow_html=True)
 
 # Compact controls instead of a large sidebar.
 with st.container(border=True):
     c1,c2,c3 = st.columns([1.05,1.45,1.0])
     with c1:
         exchange = st.selectbox("صرافی", EXCHANGES, index=0, label_visibility="collapsed")
+    if exchange == "بیت۲۴" and not BIT24_API_KEY:
+        st.warning("برای بیت۲۴، کلید API را در Render → Environment Variables با نام BIT24_API_KEY قرار بده.")
     try:
         markets = get_markets(exchange)
     except Exception as exc:
@@ -1436,6 +1465,8 @@ with st.container(border=True):
 if not symbol:
     st.warning("یک بازار انتخاب کن.")
     st.stop()
+
+st.markdown(f'<div class="card"><b>نماد</b> <span style="font-size:1.1rem;font-weight:800">{base_asset(symbol)}</span> <span style="color:#777">({symbol})</span></div>', unsafe_allow_html=True)
 
 # Quick action row
 q1,q2,q3,q4=st.columns(4)
@@ -1464,7 +1495,6 @@ if scalp_button:
             st.markdown('</div>',unsafe_allow_html=True)
             st.caption(f"5m + 15m | حجم {sc['volume']:.2f}x | ADX {sc['adx']:.1f} | ATR {sc['atr_pct']:.2f}% | تأیید {sc['mtf']}")
             if sc["reasons"]: st.caption(" • ".join(sc["reasons"]))
-            st.line_chart(sc["df"].tail(100).set_index("open_time")[["close","ema20","ema50"]],use_container_width=True)
             with st.expander("بک‌تست نوسان‌گیری"):
                 bt=scalping_backtest(df5); aa,bb,cc,dd=st.columns(4)
                 aa.metric("معامله",bt["trades"]); bb.metric("موفقیت",f"{bt['win_rate']:.1f}%"); cc.metric("بازده",f"{bt['return_pct']:+.2f}%"); dd.metric("افت",f"{bt['max_dd']:.2f}%")
@@ -1483,6 +1513,7 @@ if full_scan_button:
             cols=["بازار","امتیاز","سیگنال","قیمت","ورود","حدضرر","حدسود 1","حدسود 2","حمایت","مقاومت","1h","4h"]
             cols=[c for c in cols if c in valid_full.columns]
             view=valid_full[cols].copy()
+            if "بازار" in view.columns: view=view.rename(columns={"بازار":"نماد"})
             for c in ["قیمت","ورود","حدضرر","حدسود 1","حدسود 2","حمایت","مقاومت"]:
                 if c in view.columns: view[c]=view[c].apply(lambda x: money(float(x)) if pd.notna(x) else "-")
             st.dataframe(view,use_container_width=True,hide_index=True)
@@ -1518,7 +1549,32 @@ try:
     ema20,ema50,ema200=map(float,[last["ema20"],last["ema50"],last["ema200"]]); rsi_v=float(last["rsi"]); macd_hist=float(last["macd_hist"]); adx_v=float(last["adx"])
     ich_bull=bool(last["close"]>max(last["ich_span_a"],last["ich_span_b"]) and last["ich_tenkan"]>last["ich_kijun"])
     ich_bear=bool(last["close"]<min(last["ich_span_a"],last["ich_span_b"]) and last["ich_tenkan"]<last["ich_kijun"])
-    signal,signal_icon,signal_text=signal_from_score(mtf_score,ema20,ema50,ema200,macd_hist,rsi_v,adx_v,ich_bull,ich_bear)
+    # Forecast is part of the final decision, not a separate optional section.
+    forecast_df=None
+    forecast_score=50.0
+    forecast_note="چشم‌انداز خنثی یا داده ناکافی"
+    try:
+        forecast_df,_=future_forecast(tf_data["1h"][0] if "1h" in tf_data else main_df)
+        probs=pd.to_numeric(forecast_df["probability_up"],errors="coerce").dropna()
+        if not probs.empty:
+            forecast_score=float(np.clip(probs.mean(),1,99))
+            if forecast_score >= 58:
+                forecast_note=f"چشم‌انداز احتمالی صعودی ({forecast_score:.0f}٪)"
+            elif forecast_score <= 42:
+                forecast_note=f"چشم‌انداز احتمالی نزولی ({100-forecast_score:.0f}٪)"
+            else:
+                forecast_note=f"چشم‌انداز احتمالی خنثی ({forecast_score:.0f}٪ صعود)"
+    except Exception:
+        forecast_df=None
+
+    # Give the forecast a meaningful but controlled weight in the final score.
+    final_score=round(float(np.clip(mtf_score*0.65 + forecast_score*0.35,0,100)))
+    signal,signal_icon,signal_text=signal_from_score(final_score,ema20,ema50,ema200,macd_hist,rsi_v,adx_v,ich_bull,ich_bear)
+    # Do not allow the forecast to override a strong opposite outlook.
+    if signal=="BUY" and forecast_score < 43:
+        signal,signal_icon,signal_text="HOLD","🟡","روند فنی مثبت است اما چشم‌انداز احتمالی تأیید کافی نمی‌دهد"
+    elif signal=="SELL" and forecast_score > 57:
+        signal,signal_icon,signal_text="HOLD","🟡","روند فنی منفی است اما چشم‌انداز احتمالی تأیید کافی نمی‌دهد"
     risk=max(1.5*atr_value,entry*.01)
     if signal=="BUY":
         sl=min(entry-risk,support*.995); sl=sl if 0<sl<entry else entry-risk; rrisk=max(entry-sl,entry*.01); tp1=entry+1.5*rrisk; tp2=entry+2.5*rrisk; tp3=entry+4*rrisk
@@ -1548,7 +1604,7 @@ try:
     </div>
     """, unsafe_allow_html=True)
     a,b,c,d=st.columns(4)
-    a.metric("قیمت",money(price)); b.metric("امتیاز",f"{mtf_score}/100"); c.metric("تأیید تایم‌فریم",f"{aligned}/{len([k for k in tf_names if scores.get(k) is not None])}"); d.metric("وضعیت",f"{status_icon} {status}")
+    a.metric("قیمت",money(price)); b.metric("امتیاز نهایی",f"{final_score}/100"); c.metric("تأیید تایم‌فریم",f"{aligned}/{len([k for k in tf_names if scores.get(k) is not None])}"); d.metric("وضعیت",f"{status_icon} {status}")
     if signal!="HOLD":
         e,f,g,h=st.columns(4); e.metric("ورود",money(entry)); f.metric("حدضرر",money(sl)); g.metric("TP1",money(tp1)); h.metric("TP2",money(tp2))
     else:
@@ -1556,40 +1612,19 @@ try:
 
     a,b,c,d=st.columns(4); a.metric("RSI",f"{rsi_v:.1f}"); b.metric("ADX",f"{adx_v:.1f}"); c.metric("حجم",f"{float(last['vol_ratio']):.2f}x"); d.metric("MACD",f"{macd_hist:.6f}")
 
-    # Forecast is integrated here; no separate prediction button.
-    try:
-        fc_df,_=future_forecast(tf_data["1h"][0] if "1h" in tf_data else main_df)
-        st.markdown("### 🔮 چشم‌انداز احتمالی")
-        cards=st.columns(len(fc_df))
-        for col,(_,row) in zip(cards,fc_df.iterrows()):
+    st.markdown(f"**نماد:** `{symbol}`  ·  **چشم‌انداز:** {forecast_note}")
+    if forecast_df is not None and not forecast_df.empty:
+        cards=st.columns(len(forecast_df))
+        for col,(_,row) in zip(cards,forecast_df.iterrows()):
             with col:
                 pct=(float(row["target_price"])/entry-1)*100
                 icon="🟢" if row["direction"]=="صعودی" else "🔴" if row["direction"]=="نزولی" else "🟡"
                 st.metric(f"{icon} {row['label']}",money(float(row["target_price"])),f"{pct:+.2f}%")
-                st.caption(f"احتمال صعود {row['probability_up']:.0f}% · اعتماد مدل {row['confidence']:.0f}%")
-    except Exception: pass
-
-    st.markdown("### 📊 هم‌جهتی بازار")
-    rows=[]
-    for k in tf_names:
-        sc=scores.get(k); label="—" if sc is None else "صعودی" if sc>=60 else "نزولی" if sc<=40 else "خنثی"
-        rows.append({"تایم‌فریم":k,"امتیاز":sc if sc is not None else "—","وضعیت":label})
-    st.dataframe(pd.DataFrame(rows),use_container_width=True,hide_index=True)
-
-    st.markdown("### 🎯 سطوح مهم")
-    a,b,c,d=st.columns(4); a.metric("حمایت",money(support)); b.metric("مقاومت",money(resistance)); c.metric("EMA20",money(ema20)); d.metric("EMA200",money(ema200))
-
-    st.markdown("### 📈 نمودار")
-    chart_df=ind.tail(140).set_index("open_time")[["close","ema20","ema50","ema200"]]
-    st.line_chart(chart_df,use_container_width=True)
+        st.caption("چشم‌انداز احتمالی در امتیاز نهایی اثر داده شده؛ احتمال صعود، احتمال سود معامله نیست.")
 
     with st.expander("🧠 چرا این نتیجه صادر شد",expanded=True):
         for item in reasons[-10:]: st.write("•",item)
         st.caption(f"اعتماد {confidence}% از هم‌جهتی تایم‌فریم‌ها، قدرت روند و کیفیت داده محاسبه شده و احتمال سود نیست.")
-
-    with st.expander("📐 جزئیات اندیکاتورها"):
-        a,b,c,d=st.columns(4); a.metric("RSI",f"{rsi_v:.1f}"); b.metric("MACD",f"{macd_hist:.6f}"); c.metric("ATR",money(atr_value)); d.metric("VWAP",money(float(last["vwap20"])))
-        a,b,c,d=st.columns(4); a.metric("ADX",f"{adx_v:.1f}"); b.metric("DI+",f"{float(last['plus_di']):.1f}"); c.metric("DI-",f"{float(last['minus_di']):.1f}"); d.metric("حجم",f"{float(last['vol_ratio']):.2f}x")
 
     st.caption(f"آخرین بروزرسانی {datetime.now().strftime('%H:%M:%S')} · داده عمومی · تحلیل بدون اجرای سفارش")
 except requests.exceptions.RequestException as exc:

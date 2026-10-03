@@ -10,7 +10,11 @@ st.set_page_config(page_title='Crypto Analyzer Pro', page_icon='₿', layout='wi
 # ============================================================
 # CONFIG
 # ============================================================
-TIMEFRAMES = {'15m':'15m', '1H':'1h', '4H':'4h', '1D':'1d'}
+TIMEFRAMES = {
+    '5m':'5m', '15m':'15m', '30m':'30m',
+    '1H':'1h', '2H':'2h', '4H':'4h', '6H':'6h', '12H':'12h',
+    '1D':'1d', '3D':'3d', '1W':'1w'
+}
 BINANCE = 'https://api.binance.com'
 OKX = 'https://www.okx.com'
 BYBIT = 'https://api.bybit.com'
@@ -211,7 +215,7 @@ def binance_klines(symbol, interval, limit=500):
 
 
 def okx_klines(symbol, interval, limit=300):
-    bar={'15m':'15m','1h':'1H','4h':'4H','1d':'1D'}.get(interval,interval)
+    bar={'5m':'5m','15m':'15m','30m':'30m','1h':'1H','2h':'2H','4h':'4H','6h':'6H','12h':'12H','1d':'1D','3d':'3D','1w':'1W'}.get(interval,interval)
     inst=base_asset(symbol)+'-USDT'
     d=get_json(OKX+'/api/v5/market/candles', {'instId':inst,'bar':bar,'limit':str(min(limit,300))})
     rows=d.get('data',[]) if isinstance(d,dict) else []
@@ -219,14 +223,14 @@ def okx_klines(symbol, interval, limit=300):
 
 
 def bybit_klines(symbol, interval, limit=200):
-    iv={'15m':'15','1h':'60','4h':'240','1d':'D'}.get(interval,interval)
+    iv={'5m':'5','15m':'15','30m':'30','1h':'60','2h':'120','4h':'240','6h':'360','12h':'720','1d':'D','3d':'3D','1w':'W'}.get(interval,interval)
     d=get_json(BYBIT+'/v5/market/kline', {'category':'spot','symbol':symbol,'interval':iv,'limit':str(min(limit,200))})
     rows=d.get('result',{}).get('list',[]) if isinstance(d,dict) else []
     return _df_from_rows(rows,'bybit') if len(rows)>=40 else pd.DataFrame()
 
 
 def kucoin_klines(symbol, interval, limit=500):
-    typ={'15m':'15min','1h':'1hour','4h':'4hour','1d':'1day'}.get(interval,interval)
+    typ={'5m':'5min','15m':'15min','30m':'30min','1h':'1hour','2h':'2hour','4h':'4hour','6h':'6hour','12h':'12hour','1d':'1day','3d':'3day','1w':'1week'}.get(interval,interval)
     pair=base_asset(symbol)+'-USDT'
     d=get_json(KUCOIN+'/api/v1/market/candles', {'symbol':pair,'type':typ})
     rows=d.get('data',[]) if isinstance(d,dict) else []
@@ -460,9 +464,9 @@ def timeframe_analysis(df):
 
 def aggregate(symbol):
     frames={}
-    # Binance is the primary OHLC source because it has stable public historical candles.
-    mapping={'15m':'15m','1H':'1h','4H':'4h','1D':'1d'}
-    for tf,iv in mapping.items():
+    # Analyze the full practical multi-timeframe set. The core decision still gives
+    # extra weight to 1H/4H/1D, while every available timeframe is displayed separately.
+    for tf,iv in TIMEFRAMES.items():
         df=market_klines(symbol,iv,500)
         if df.empty and tf in ('1H','4H'):
             df=wallex_klines(symbol,'60',14)
@@ -473,9 +477,9 @@ def aggregate(symbol):
     analyses={tf:timeframe_analysis(df) for tf,df in frames.items() if not df.empty}
     analyses={k:v for k,v in analyses.items() if v}
     if not analyses: return None
-    weights={'15m':1.0,'1H':1.2,'4H':1.5,'1D':1.3}
-    total=sum(weights[k] for k in analyses)
-    tech=sum(v['score']*weights[k] for k,v in analyses.items())/total
+    weights={'5m':0.45,'15m':0.75,'30m':0.9,'1H':1.15,'2H':1.25,'4H':1.5,'6H':1.35,'12H':1.25,'1D':1.35,'3D':1.0,'1W':0.9}
+    total=sum(weights.get(k,1.0) for k in analyses)
+    tech=sum(v['score']*weights.get(k,1.0) for k,v in analyses.items())/total
     p=analyses.get('15m',analyses.get('1H'))['price']
     source=source_prices(symbol)
     consensus=np.mean(list(source.values())) if source else p
@@ -499,7 +503,7 @@ def aggregate(symbol):
         elif dispersion<0.8: agreement=4
         elif dispersion>2: agreement=-5
     final_score=float(np.clip(tech*0.78+fscore*0.22+agreement,-100,100))
-    confidence=float(np.clip(50+abs(final_score)*0.42 + (5 if len(analyses)>=4 else 0) + max(0,agreement),50,96))
+    confidence=float(np.clip(50+abs(final_score)*0.42 + (6 if len(analyses)>=8 else 3 if len(analyses)>=5 else 0) + max(0,agreement),50,96))
     bullish=final_score>=18
     bearish=final_score<=-18
     decision='معامله کن' if bullish or bearish else 'صبر کن'
@@ -508,6 +512,11 @@ def aggregate(symbol):
     # Conservative levels based on ATR and recent structure.
     all_df=frames.get('4H') if not frames.get('4H',pd.DataFrame()).empty else frames.get('1H')
     supports,resistances=levels(all_df) if all_df is not None and not all_df.empty else ([],[])
+    sr_by_tf={}
+    for tf,df in frames.items():
+        if df is not None and not df.empty:
+            ss,rr=levels(df)
+            sr_by_tf[tf]={'supports':ss,'resistances':rr}
     entry=consensus
     if bullish:
         sl=(supports[0] if supports and supports[0]<entry else entry-1.35*atrv)
@@ -529,7 +538,7 @@ def aggregate(symbol):
         '24H':entry*(1+expected_24h/100),
         '72H':entry*(1+expected_72h/100),
     }
-    return {'symbol':symbol,'price':entry,'sources':source,'analyses':analyses,'technical':tech,'fundamental':fscore,'agreement':agreement,'score':final_score,'confidence':confidence,'decision':decision,'position':position,'entry':entry,'sl':sl,'t1':t1,'t2':t2,'t3':t3,'risk_pct':abs(entry-sl)/entry*100,'supports':supports,'resistances':resistances,'forecast':forecast,'forecast_pct':{'4H':expected_4h,'24H':expected_24h,'72H':expected_72h}}
+    return {'symbol':symbol,'price':entry,'sources':source,'analyses':analyses,'technical':tech,'fundamental':fscore,'agreement':agreement,'score':final_score,'confidence':confidence,'decision':decision,'position':position,'entry':entry,'sl':sl,'t1':t1,'t2':t2,'t3':t3,'risk_pct':abs(entry-sl)/entry*100,'supports':supports,'resistances':resistances,'sr_by_tf':sr_by_tf,'forecast':forecast,'forecast_pct':{'4H':expected_4h,'24H':expected_24h,'72H':expected_72h}}
 
 # ============================================================
 # UI — MOBILE / CARD LAYOUT
@@ -556,7 +565,7 @@ st.markdown("""
 .reason-box{background:#f8f8f9;border-radius:15px;padding:11px 13px;font-size:12px;line-height:2;margin-top:11px}
 .tf-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin-top:10px}.tf{background:#f7f8fa;border-radius:14px;padding:10px}
 .tf-k{font-size:10px;color:#777}.tf-v{font-size:15px;font-weight:850;margin-top:3px}
-.footer-note{color:#777;font-size:11px;text-align:center;line-height:1.9;padding:12px}
+.footer-note{color:#777;font-size:11px;text-align:center;line-height:1.9;padding:12px}.tf-detail{border:1px solid #ededed;border-radius:16px;padding:12px;margin:8px 0;background:#fafafa}.tf-detail-title{font-size:15px;font-weight:900;margin-bottom:7px}.sr-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}.sr-box{background:#fff;border:1px solid #eee;border-radius:12px;padding:9px}.sr-k{font-size:10px;color:#777}.sr-v{font-size:12px;font-weight:800;margin-top:4px;line-height:1.8}
 @media(max-width:700px){.block-container{padding-left:.65rem;padding-right:.65rem}.app-brand{font-size:22px}.level-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.level:last-child{grid-column:span 2}.tf-grid{grid-template-columns:1fr}.coin-name{font-size:20px}}
 </style>
 """, unsafe_allow_html=True)
@@ -669,16 +678,26 @@ for r in sorted(results,key=lambda x:x["score"],reverse=True):
     </div>
     """,unsafe_allow_html=True)
 
-    with st.expander(f"جزئیات تکنیکال {r['symbol'].replace('USDT','/USDT')}"):
+    with st.expander(f"تایم‌فریم‌ها و اندیکاتورها — {r['symbol'].replace('USDT','/USDT')}"):
+        st.markdown('**تمام تایم‌فریم‌های درخواستی**')
         rows=[]
-        for tf,a in r["analyses"].items():
-            rows.append({"تایم‌فریم":tf,"امتیاز":round(a["score"],1),"RSI":round(a["rsi"],1),"MACD":round(a["macd"],6),"Momentum %":round(a["momentum"],2),"ADX":round(a["adx"],1)})
+        for tf in TIMEFRAMES:
+            a=r["analyses"].get(tf)
+            if a:
+                rows.append({"تایم‌فریم":tf,"امتیاز":round(a["score"],1),"RSI":round(a["rsi"],1),"MACD":round(a["macd"],6),"Momentum %":round(a["momentum"],2),"ADX":round(a["adx"],1)})
+            else:
+                rows.append({"تایم‌فریم":tf,"امتیاز":"داده نیست","RSI":"-","MACD":"-","Momentum %":"-","ADX":"-"})
         st.dataframe(pd.DataFrame(rows),use_container_width=True,hide_index=True)
-        c1,c2=st.columns(2)
-        with c1:
-            st.markdown("**حمایت‌ها**"); st.write(", ".join(money(x) for x in r["supports"]) or "-")
-        with c2:
-            st.markdown("**مقاومت‌ها**"); st.write(", ".join(money(x) for x in r["resistances"]) or "-")
-        st.caption("مدل از ایچیموکو، MACD، RSI، Momentum، ATR، ADX، ساختار قیمت و پرایس‌اکشن استفاده می‌کند. داده‌های بازار/بنیادی عمومی نیز به‌عنوان فیلتر کمکی استفاده می‌شوند.")
+
+        st.markdown('**حمایت و مقاومت به تفکیک تایم‌فریم**')
+        for tf in TIMEFRAMES:
+            a=r["analyses"].get(tf)
+            sr=r["sr_by_tf"].get(tf,{"supports":[],"resistances":[]})
+            if not a and not sr["supports"] and not sr["resistances"]:
+                continue
+            supports_txt=", ".join(money(x) for x in sr["supports"]) or "-"
+            resistances_txt=", ".join(money(x) for x in sr["resistances"]) or "-"
+            st.markdown(f'''<div class="tf-detail"><div class="tf-detail-title">{tf}</div><div class="sr-grid"><div class="sr-box"><div class="sr-k">حمایت‌ها</div><div class="sr-v">{supports_txt}</div></div><div class="sr-box"><div class="sr-k">مقاومت‌ها</div><div class="sr-v">{resistances_txt}</div></div></div></div>''',unsafe_allow_html=True)
+        st.caption("اندیکاتورها: ایچیموکو، MACD، RSI، Momentum، ATR، ADX و پرایس‌اکشن. حمایت/مقاومت بر اساس ساختار سقف و کف‌های اخیر هر تایم‌فریم محاسبه می‌شود.")
 
 st.markdown('<div class="footer-note">هشدار: این برنامه ابزار تحقیق و تحلیل است. «اطمینان تحلیل» احتمال سود قطعی نیست. پیش‌بینی بازار قطعی نیست و قبل از معامله باید نقدشوندگی، کارمزد، اخبار و ریسک شخصی بررسی شود.</div>',unsafe_allow_html=True)

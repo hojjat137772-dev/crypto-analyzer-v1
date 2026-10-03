@@ -225,6 +225,7 @@ def ichimoku(df):
 # ============================================================
 def pivots(df, window=3):
     highs=df.high[(df.high==df.high.rolling(window*2+1,center=True).max())]
+
     lows=df.low[(df.low==df.low.rolling(window*2+1,center=True).min())]
     return highs.dropna(), lows.dropna()
 
@@ -430,7 +431,7 @@ for r in sorted(results,key=lambda x:x['score'],reverse=True):
     cls='buy' if r['decision']=='معامله کن' and r['position']=='لانگ' else ('sell' if r['position']=='شورت' else 'wait')
     icon='🟢' if r['position']=='لانگ' else ('🔴' if r['position']=='شورت' else '🟡')
     src=' | '.join(f'{k}: {money(v)}' for k,v in r['sources'].items()) or 'منبع قیمت در دسترس نیست'
-    reason='؛ '.join(r['analyses'][k]['reasons'][:3] for k in ['15m','1H','4H','1D'] if k in r['analyses'])
+    reason='؛ '.join(reason_text for k in ['15m','1H','4H','1D'] if k in r['analyses'] for reason_text in r['analyses'][k]['reasons'][:3])
     st.markdown(f'''<div class="card {cls}"><div class="big">{icon} {r['symbol']} — {r['decision']}</div>
     <div class="muted">نوع پوزیشن: <b>{r['position']}</b> &nbsp; | &nbsp; امتیاز مدل: <b>{r['score']:.0f}/100</b> &nbsp; | &nbsp; اطمینان تحلیل: <b>{r['confidence']:.0f}%</b></div>
     <hr><b>قیمت مرجع:</b> {money(r['price'])}<br>

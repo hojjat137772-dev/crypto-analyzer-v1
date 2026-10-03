@@ -21,6 +21,23 @@ st.set_page_config(
 
 TABDEAL_BASE = "https://api1.tabdeal.org"
 EXCHANGE_NAME = "تبدیل"
+# Historical candle fallback (not an exchange): Tabdeal public API exposes recent trades,
+# but its documented public trades endpoint does not provide arbitrary historical candles.
+# Current price/order book and market universe remain Tabdeal-only.
+COINGECKO_BASE = "https://api.coingecko.com/api/v3"
+COINGECKO_IDS = {
+    "BTC":"bitcoin", "ETH":"ethereum", "XRP":"ripple", "SOL":"solana",
+    "BNB":"binancecoin", "DOGE":"dogecoin", "SHIB":"shiba-inu",
+    "ADA":"cardano", "TRX":"tron", "LINK":"chainlink", "AVAX":"avalanche-2",
+    "DOT":"polkadot", "MATIC":"matic-network", "POL":"polygon-ecosystem-token",
+    "LTC":"litecoin", "BCH":"bitcoin-cash", "ATOM":"cosmos", "NEAR":"near",
+    "APT":"aptos", "ARB":"arbitrum", "OP":"optimism", "SUI":"sui",
+    "FIL":"filecoin", "ETC":"ethereum-classic", "UNI":"uniswap",
+    "AAVE":"aave", "XLM":"stellar", "ALGO":"algorand", "ICP":"internet-computer",
+    "VET":"vechain", "HBAR":"hedera-hashgraph", "INJ":"injective-protocol",
+    "IMX":"immutable-x", "SEI":"sei-network", "TIA":"celestia", "PEPE":"pepe",
+    "FLOKI":"floki", "WIF":"dogwifcoin", "BONK":"bonk"
+}
 
 INTERVALS = {
     "15m": "15m",
@@ -268,6 +285,97 @@ def tabdeal_price(symbol):
     raise RuntimeError(
         f"قیمت تبدیل برای {symbol} دریافت نشد ({tab_symbol})."
     ) from last
+
+# -------------------- Historical reference candles --------------------
+
+def _base_from_usdt(symbol):
+    s = str(symbol).upper().replace("-", "").replace("_", "")
+    return s[:-4] if s.endswith("USDT") else s
+
+@st.cache_data(ttl=900, show_spinner=False)
+def coingecko_id_for_symbol(symbol):
+    base = _base_from_usdt(symbol)
+    if base in COINGECKO_IDS:
+        return COINGECKO_IDS[base]
+    data = http_get(f"{COINGECKO_BASE}/search", {"query": base}, 10)
+    coins = data.get("coins", []) if isinstance(data, dict) else []
+    exact = [c for c in coins if str(c.get("symbol", "")).upper() == base]
+    candidates = exact or coins
+    if not candidates:
+        raise RuntimeError(f"شناسه تاریخی {base} در منبع عمومی پیدا نشد.")
+    # Search results include market-cap rank; choose the first exact symbol match.
+    return str(candidates[0].get("id"))
+
+
+def _prices_to_ohlcv(prices, volumes, rule):
+    if not prices:
+        raise RuntimeError("داده تاریخی قیمت خالی است.")
+    p = pd.DataFrame(prices, columns=["ts", "price"])
+    p["open_time"] = pd.to_datetime(p["ts"], unit="ms", utc=True).dt.tz_convert(None)
+    p["price"] = pd.to_numeric(p["price"], errors="coerce")
+    p = p.dropna(subset=["open_time", "price"]).set_index("open_time").sort_index()
+    if volumes:
+        v = pd.DataFrame(volumes, columns=["ts", "volume"])
+        v["open_time"] = pd.to_datetime(v["ts"], unit="ms", utc=True).dt.tz_convert(None)
+        v["volume"] = pd.to_numeric(v["volume"], errors="coerce")
+        v = v.dropna(subset=["open_time", "volume"]).set_index("open_time").sort_index()
+    else:
+        v = pd.DataFrame()
+    out = pd.DataFrame({
+        "open": p["price"].resample(rule).first(),
+        "high": p["price"].resample(rule).max(),
+        "low": p["price"].resample(rule).min(),
+        "close": p["price"].resample(rule).last(),
+    })
+    if not v.empty:
+        # CoinGecko exposes 24h volume observations rather than exchange candle volume;
+        # use the interval mean only as a relative volume proxy for indicators.
+        out["volume"] = v["volume"].resample(rule).mean()
+    else:
+        out["volume"] = 1.0
+    return out.dropna().reset_index().tail(600)
+
+@st.cache_data(ttl=600, show_spinner=False)
+def coingecko_candles(symbol, interval):
+    coin_id = coingecko_id_for_symbol(symbol)
+    # 89d keeps CoinGecko's hourly granularity on the public endpoint; 365d gives
+    # enough daily history for EMA200/Ichimoku on the 1d timeframe.
+    if interval == "1h":
+        days = 89
+        rule = "1h"
+    elif interval == "4h":
+        days = 89
+        rule = "4h"
+    elif interval == "1d":
+        days = 365
+        rule = "1D"
+    else:
+        raise RuntimeError("تاریخچه عمومی فقط برای 1h/4h/1d استفاده می‌شود.")
+    data = http_get(
+        f"{COINGECKO_BASE}/coins/{coin_id}/market_chart",
+        {"vs_currency": "usd", "days": days},
+        15,
+    )
+    df = _prices_to_ohlcv(data.get("prices", []), data.get("total_volumes", []), rule)
+    if len(df) < 60:
+        raise RuntimeError(f"تاریخچه عمومی {symbol} برای {interval} کافی نیست.")
+    return df
+
+
+def analysis_candles(symbol, interval):
+    """Use Tabdeal first; if recent trades are too sparse, use public historical
+    market data for candles. Tabdeal remains the only exchange used for current
+    price and the market list."""
+    try:
+        d = tabdeal_klines(symbol, interval)
+        x = add_indicators(d)
+        if len(x) >= 60:
+            return d, "تبدیل"
+    except Exception:
+        pass
+    if interval in {"1h", "4h", "1d"}:
+        return coingecko_candles(symbol, interval), "تاریخچه عمومی"
+    raise RuntimeError("برای 15m از تبدیل داده کافی موجود نیست.")
 
 # -------------------- Exchange router --------------------
 
@@ -1406,11 +1514,12 @@ def analyze_one_symbol(symbol, tf):
     tf_names=["15m","1h","4h","1d"]
     with ThreadPoolExecutor(max_workers=5) as pool:
         price_future=pool.submit(get_price,EXCHANGE_NAME,symbol)
-        futures={n:pool.submit(get_candles,EXCHANGE_NAME,symbol,n) for n in tf_names}
-        price=price_future.result(); tf_data={}; scores={}
+        futures={n:pool.submit(analysis_candles,symbol,n) for n in tf_names}
+        price=price_future.result(); tf_data={}; scores={}; sources={}
         for n,fut in futures.items():
             try:
-                d=fut.result()
+                d,source=fut.result()
+                sources[n]=source
                 sc,rs,ind_tf=timeframe_score(d)
                 # `timeframe_score` drops indicator warm-up rows (EMA200,
                 # Ichimoku, etc.). Only treat a timeframe as valid when the
@@ -1425,10 +1534,11 @@ def analyze_one_symbol(symbol, tf):
     valid_tf=next((n for n in tf_names if n in tf_data),None)
     if valid_tf is None:
         raise RuntimeError(
-            "از تبدیل داده کافی برای ساخت حداقل 60 کندل معتبر دریافت نشد. "
-            "ممکن است بازار کم‌معامله باشد یا API معاملات اخیر تاریخچه کافی ندهد."
+            "برای این ارز تاریخچه کافی از تبدیل و منبع تاریخی پشتیبان دریافت نشد. "
+            "برای بازارهای کم‌معامله، API عمومی تبدیل فقط معاملات اخیر را می‌دهد."
         )
     main_df,ind,reasons=tf_data.get(tf,tf_data[valid_tf])
+    source_note = "، ".join(f"{k}:{sources.get(k,'—')}" for k in tf_names if k in sources)
     weights={"15m":.15,"1h":.25,"4h":.35,"1d":.25}
     valid=[(scores[k],weights[k]) for k in tf_names if scores.get(k) is not None]
     mtf_score=round(sum(s*w for s,w in valid)/sum(w for _,w in valid))

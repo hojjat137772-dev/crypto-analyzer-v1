@@ -793,54 +793,6 @@ def base_asset(symbol):
     return s, ""
 
 
-# -------------------- Smart Trade Levels --------------------
-def smart_trade_levels(signal, price, atr_value, support=np.nan, resistance=np.nan,
-                       ema20=np.nan, ema50=np.nan, rr1=1.5, rr2=2.5):
-    """Calculate a practical entry price, stop and two targets from confluence levels."""
-    price = float(price)
-    atr_value = float(atr_value) if np.isfinite(atr_value) and atr_value > 0 else price * 0.02
-    support = float(support) if np.isfinite(support) and support > 0 else price - 1.5 * atr_value
-    resistance = float(resistance) if np.isfinite(resistance) and resistance > 0 else price + 2.0 * atr_value
-    ema20 = float(ema20) if np.isfinite(ema20) and ema20 > 0 else price
-    ema50 = float(ema50) if np.isfinite(ema50) and ema50 > 0 else ema20
-
-    if signal == "BUY":
-        # Pullback/confluence entry: prefer EMA20/support, but never quote above market.
-        base = max(support, ema20)
-        entry = min(price, base + 0.15 * atr_value)
-        entry = max(entry, price - 0.75 * atr_value)
-        risk_floor = max(1.0 * atr_value, price * 0.008)
-        sl = min(entry - risk_floor, support * 0.995)
-        if sl <= 0 or sl >= entry:
-            sl = entry - risk_floor
-        risk = max(entry - sl, price * 0.008)
-        tp1 = entry + rr1 * risk
-        tp2 = entry + rr2 * risk
-        # Do not put TP1 beyond a nearby resistance if it is realistically reachable.
-        if resistance > entry and resistance < tp1:
-            tp1 = max(entry + 0.75 * risk, resistance * 0.995)
-        if tp2 <= tp1:
-            tp2 = tp1 + max(0.75 * risk, 0.5 * atr_value)
-        return entry, sl, tp1, tp2
-
-    if signal == "SELL":
-        # Pullback/confluence entry: prefer EMA20/resistance, but never quote below market.
-        base = min(resistance, ema20)
-        entry = max(price, base - 0.15 * atr_value)
-        entry = min(entry, price + 0.75 * atr_value)
-        risk_floor = max(1.0 * atr_value, price * 0.008)
-        sl = max(entry + risk_floor, resistance * 1.005)
-        risk = max(sl - entry, price * 0.008)
-        tp1 = entry - rr1 * risk
-        tp2 = entry - rr2 * risk
-        if support < entry and support > tp1:
-            tp1 = min(entry - 0.75 * risk, support * 1.005)
-        if tp2 >= tp1:
-            tp2 = tp1 - max(0.75 * risk, 0.5 * atr_value)
-        return entry, sl, tp1, tp2
-
-    return np.nan, np.nan, np.nan, np.nan
-
 def scanner_candidates(exchange, markets, limit=20):
     """Build a clean scanner universe from the selected exchange."""
     cleaned = []
@@ -961,15 +913,31 @@ def scan_one_market(exchange, symbol, scan_tfs):
         bool(last.get("close", 0) > max(last.get("ich_span_a", 0), last.get("ich_span_b", 0)) and last.get("ich_tenkan", 0) > last.get("ich_kijun", 0)),
         bool(last.get("close", 0) < min(last.get("ich_span_a", 0), last.get("ich_span_b", 0)) and last.get("ich_tenkan", 0) < last.get("ich_kijun", 0)),
     )
-    entry, sl, tp1, tp2 = smart_trade_levels(
-        signal, latest_price, atr_value, support, resistance,
-        float(last["ema20"]), float(last["ema50"]), rr1=1.5, rr2=2.5
-    )
+    risk = max(1.5 * atr_value, latest_price * 0.01)
+
+    if signal == "BUY":
+        entry = latest_price
+        sl = min(entry - risk, support * 0.995)
+        if sl <= 0 or sl >= entry:
+            sl = entry - risk
+        risk_amount = max(entry - sl, entry * 0.01)
+        tp1, tp2 = entry + 1.5 * risk_amount, entry + 2.5 * risk_amount
+        if resistance > entry and resistance < tp1:
+            tp1 = max(entry + risk_amount, resistance * 0.995)
+    elif signal == "SELL":
+        entry = latest_price
+        sl = max(entry + risk, resistance * 1.005)
+        risk_amount = max(sl - entry, entry * 0.01)
+        tp1, tp2 = entry - 1.5 * risk_amount, entry - 2.5 * risk_amount
+        if support < entry and support > tp1:
+            tp1 = min(entry - risk_amount, support * 1.005)
+    else:
+        entry = latest_price
+        sl = tp1 = tp2 = np.nan
 
     return {
         "بازار": symbol, "امتیاز": score, "سیگنال": f"{icon} {signal}",
         "توضیح سیگنال": signal_text, "قیمت": latest_price,
-        "بهترین ورود": entry if signal != "HOLD" else np.nan,
         "ورود": entry if signal != "HOLD" else np.nan, "حدضرر": sl,
         "حدسود 1": tp1, "حدسود 2": tp2, "حمایت": support, "مقاومت": resistance,
         "15m": tf_scores.get("15m"), "1h": tf_scores.get("1h"),
@@ -1350,23 +1318,21 @@ def scalping_signal(df5, df15=None):
 
     # High-selectivity entry: score + separation + trend confirmation + no exhaustion.
     signal = "WAIT"
-    entry_best = sl = tp1 = tp2 = np.nan
+    sl = tp1 = tp2 = np.nan
     reasons = rl if long_score >= short_score else rs
     chosen = max(long_score, short_score)
     if (long_score >= 78 and long_score >= short_score + 10 and mtf == "LONG"
             and adx_v >= 20 and regime_ok and rsi_v < 70):
         signal = "LONG"
-        entry_best, sl, tp1, tp2 = smart_trade_levels(
-            "BUY", price, atr_v, float(x["low"].tail(8).min()),
-            float(x["high"].tail(20).max()), ema20, ema50, rr1=1.30, rr2=2.10
-        )
+        sl = min(price - 1.15 * atr_v, float(x["low"].tail(8).min()) * .998)
+        risk = max(price - sl, price * .002)
+        tp1, tp2 = price + 1.30 * risk, price + 2.10 * risk
     elif (short_score >= 78 and short_score >= long_score + 10 and mtf == "SHORT"
           and adx_v >= 20 and regime_ok and rsi_v > 30):
         signal = "SHORT"
-        entry_best, sl, tp1, tp2 = smart_trade_levels(
-            "SELL", price, atr_v, float(x["low"].tail(20).min()),
-            float(x["high"].tail(8).max()), ema20, ema50, rr1=1.30, rr2=2.10
-        )
+        sl = max(price + 1.15 * atr_v, float(x["high"].tail(8).max()) * 1.002)
+        risk = max(sl - price, price * .002)
+        tp1, tp2 = price - 1.30 * risk, price - 2.10 * risk
     else:
         risk = np.nan
         if chosen >= 65:
@@ -1374,7 +1340,7 @@ def scalping_signal(df5, df15=None):
 
     return {
         "signal": signal, "score": chosen, "long_score": long_score, "short_score": short_score,
-        "price": price, "entry": entry_best, "sl": sl, "tp1": tp1, "tp2": tp2, "rsi": rsi_v,
+        "price": price, "sl": sl, "tp1": tp1, "tp2": tp2, "rsi": rsi_v,
         "volume": vr, "adx": adx_v, "atr_pct": atr_pct, "mtf": mtf,
         "regime_ok": regime_ok, "reasons": reasons[-6:], "df": x,
     }
@@ -1511,10 +1477,10 @@ if full_scan_button:
             valid_full=full_df[pd.to_numeric(full_df["امتیاز"],errors="coerce").notna()].copy()
             st.markdown("### 🔎 اسکن کل بازار")
             st.caption(f"{len(valid_full)} بازار دارای داده معتبر")
-            cols=["بازار","امتیاز","سیگنال","قیمت","بهترین ورود","حدضرر","حدسود 1","حدسود 2","حمایت","مقاومت","1h","4h"]
+            cols=["بازار","امتیاز","سیگنال","قیمت","ورود","حدضرر","حدسود 1","حدسود 2","حمایت","مقاومت","1h","4h"]
             cols=[c for c in cols if c in valid_full.columns]
             view=valid_full[cols].copy()
-            for c in ["قیمت","بهترین ورود","ورود","حدضرر","حدسود 1","حدسود 2","حمایت","مقاومت"]:
+            for c in ["قیمت","ورود","حدضرر","حدسود 1","حدسود 2","حمایت","مقاومت"]:
                 if c in view.columns: view[c]=view[c].apply(lambda x: money(float(x)) if pd.notna(x) else "-")
             st.dataframe(view,use_container_width=True,hide_index=True)
 
@@ -1544,18 +1510,18 @@ try:
     weights={"15m":.15,"1h":.25,"4h":.35,"1d":.25}
     valid=[(scores[k],weights[k]) for k in weights if scores.get(k) is not None]
     mtf_score=round(sum(s*w for s,w in valid)/sum(w for _,w in valid))
-    support,resistance=support_resistance(ind,60); market_price=float(price)
-    # The latest indicator row must be defined before any trade/indicator calculations.
-    last = ind.iloc[-1]
-    atr_value=float(last["atr"]) if np.isfinite(last["atr"]) and last["atr"]>0 else market_price*.02
+    support,resistance=support_resistance(ind,60); last=ind.iloc[-1]; entry=float(price)
+    atr_value=float(last["atr"]) if np.isfinite(last["atr"]) and last["atr"]>0 else entry*.02
     ema20,ema50,ema200=map(float,[last["ema20"],last["ema50"],last["ema200"]]); rsi_v=float(last["rsi"]); macd_hist=float(last["macd_hist"]); adx_v=float(last["adx"])
     ich_bull=bool(last["close"]>max(last["ich_span_a"],last["ich_span_b"]) and last["ich_tenkan"]>last["ich_kijun"])
     ich_bear=bool(last["close"]<min(last["ich_span_a"],last["ich_span_b"]) and last["ich_tenkan"]<last["ich_kijun"])
     signal,signal_icon,signal_text=signal_from_score(mtf_score,ema20,ema50,ema200,macd_hist,rsi_v,adx_v,ich_bull,ich_bear)
-    entry,sl,tp1,tp2=smart_trade_levels(
-        signal, market_price, atr_value, support, resistance, ema20, ema50, rr1=1.5, rr2=2.5
-    )
-    tp3 = (entry + 4*(entry-sl)) if signal=="BUY" else (entry - 4*(sl-entry)) if signal=="SELL" else np.nan
+    risk=max(1.5*atr_value,entry*.01)
+    if signal=="BUY":
+        sl=min(entry-risk,support*.995); sl=sl if 0<sl<entry else entry-risk; rrisk=max(entry-sl,entry*.01); tp1=entry+1.5*rrisk; tp2=entry+2.5*rrisk; tp3=entry+4*rrisk
+    elif signal=="SELL":
+        sl=max(entry+risk,resistance*1.005); rrisk=max(sl-entry,entry*.01); tp1=entry-1.5*rrisk; tp2=entry-2.5*rrisk; tp3=entry-4*rrisk
+    else: sl=tp1=tp2=tp3=np.nan
 
     # Confidence = agreement + trend strength + data quality, not a profit probability.
     vals=[scores[k] for k in tf_names if scores.get(k) is not None]

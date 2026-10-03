@@ -614,6 +614,52 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 universe=get_tabdeal_universe()
+
+# ============================================================
+# FULL CRYPTO LIST — added without changing the existing analysis flow
+# ============================================================
+with st.expander(f"فهرست کامل تمام رمز ارزهای USDT — {len(universe):,} بازار", expanded=False):
+    if universe:
+        st.caption("برای جلوگیری از اجرای تحلیل سنگین هنگام باز شدن صفحه، نوع معامله و اطمینان مدل با اسکن سریع چندتایم‌فریمی محاسبه می‌شود.")
+        if st.button("محاسبه نوع معامله و اطمینان برای کل جدول", key="scan_all_table", use_container_width=True):
+            table_scan = {}
+            progress = st.progress(0)
+            with st.spinner(f"در حال بررسی {len(universe):,} بازار..."):
+                with ThreadPoolExecutor(max_workers=8) as ex:
+                    jobs = {ex.submit(quick_scan, sym): sym for sym in universe}
+                    done = 0
+                    for job in as_completed(jobs):
+                        done += 1
+                        progress.progress(done / max(len(jobs), 1))
+                        try:
+                            rr = job.result()
+                            if rr:
+                                conf = float(np.clip(50 + abs(rr["score"]) * 0.42 + (5 if rr.get("coverage", 0) >= 4 else 0), 50, 96))
+                                table_scan[rr["symbol"]] = {
+                                    "نوع معامله": rr["position"],
+                                    "اطمینان مدل": f"{conf:.0f}%"
+                                }
+                        except Exception:
+                            pass
+            progress.empty()
+            st.session_state["all_coins_table_scan"] = table_scan
+
+        table_scan = st.session_state.get("all_coins_table_scan", {})
+        all_coins = pd.DataFrame({
+            "ردیف": range(1, len(universe) + 1),
+            "رمزارز": [sym.replace("USDT", "/USDT") for sym in universe],
+            "نوع معامله": [table_scan.get(sym, {}).get("نوع معامله", "—") for sym in universe],
+            "درصد اطمینان": [table_scan.get(sym, {}).get("اطمینان مدل", "—") for sym in universe],
+        })
+        st.dataframe(
+            all_coins,
+            use_container_width=True,
+            hide_index=True,
+            height=520,
+        )
+        st.caption("«درصد اطمینان» شاخص اطمینان مدل است و احتمال قطعی موفقیت یا تضمین سود نیست.")
+    else:
+        st.warning("فهرست بازارهای USDT دریافت نشد.")
 if "watch" not in st.session_state: st.session_state.watch=[]
 
 st.markdown('<div class="menu-wrap">', unsafe_allow_html=True)

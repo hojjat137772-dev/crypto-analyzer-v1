@@ -21,23 +21,11 @@ st.set_page_config(
 
 TABDEAL_BASE = "https://api1.tabdeal.org"
 EXCHANGE_NAME = "تبدیل"
-# Historical candle fallback (not an exchange): Tabdeal public API exposes recent trades,
-# but its documented public trades endpoint does not provide arbitrary historical candles.
-# Current price/order book and market universe remain Tabdeal-only.
-COINGECKO_BASE = "https://api.coingecko.com/api/v3"
-COINGECKO_IDS = {
-    "BTC":"bitcoin", "ETH":"ethereum", "XRP":"ripple", "SOL":"solana",
-    "BNB":"binancecoin", "DOGE":"dogecoin", "SHIB":"shiba-inu",
-    "ADA":"cardano", "TRX":"tron", "LINK":"chainlink", "AVAX":"avalanche-2",
-    "DOT":"polkadot", "MATIC":"matic-network", "POL":"polygon-ecosystem-token",
-    "LTC":"litecoin", "BCH":"bitcoin-cash", "ATOM":"cosmos", "NEAR":"near",
-    "APT":"aptos", "ARB":"arbitrum", "OP":"optimism", "SUI":"sui",
-    "FIL":"filecoin", "ETC":"ethereum-classic", "UNI":"uniswap",
-    "AAVE":"aave", "XLM":"stellar", "ALGO":"algorand", "ICP":"internet-computer",
-    "VET":"vechain", "HBAR":"hedera-hashgraph", "INJ":"injective-protocol",
-    "IMX":"immutable-x", "SEI":"sei-network", "TIA":"celestia", "PEPE":"pepe",
-    "FLOKI":"floki", "WIF":"dogwifcoin", "BONK":"bonk"
-}
+# Historical candle fallback (public, no API key): Nobitex OHLC
+# Tabdeal remains the source of the live price and the market universe.
+# Nobitex is used only when Tabdeal recent trades do not contain enough history.
+NOBITEX_BASE = "https://api.nobitex.ir"
+NOBITEX_NAME = "نوبیتکس (فقط تاریخچه)"
 
 INTERVALS = {
     "15m": "15m",
@@ -288,94 +276,87 @@ def tabdeal_price(symbol):
 
 # -------------------- Historical reference candles --------------------
 
-def _base_from_usdt(symbol):
-    s = str(symbol).upper().replace("-", "").replace("_", "")
-    return s[:-4] if s.endswith("USDT") else s
+def nobitex_resolution(interval):
+    return {
+        "15m": "15",
+        "1h": "60",
+        "4h": "240",
+        "1d": "D",
+    }[interval]
 
-@st.cache_data(ttl=900, show_spinner=False)
-def coingecko_id_for_symbol(symbol):
-    base = _base_from_usdt(symbol)
-    if base in COINGECKO_IDS:
-        return COINGECKO_IDS[base]
-    data = http_get(f"{COINGECKO_BASE}/search", {"query": base}, 10)
-    coins = data.get("coins", []) if isinstance(data, dict) else []
-    exact = [c for c in coins if str(c.get("symbol", "")).upper() == base]
-    candidates = exact or coins
-    if not candidates:
-        raise RuntimeError(f"شناسه تاریخی {base} در منبع عمومی پیدا نشد.")
-    # Search results include market-cap rank; choose the first exact symbol match.
-    return str(candidates[0].get("id"))
+def nobitex_symbol(symbol):
+    compact = str(symbol).upper().replace("-", "").replace("_", "")
+    if not compact.endswith("USDT"):
+        raise RuntimeError("تاریخچه نوبیتکس فقط برای بازارهای USDT درخواست می‌شود.")
+    return compact
 
+@st.cache_data(ttl=300, show_spinner=False)
+def nobitex_candles(symbol, interval, countback=500):
+    """Public Nobitex OHLC. No API key/token is required.
 
-def _prices_to_ohlcv(prices, volumes, rule):
-    if not prices:
-        raise RuntimeError("داده تاریخی قیمت خالی است.")
-    p = pd.DataFrame(prices, columns=["ts", "price"])
-    p["open_time"] = pd.to_datetime(p["ts"], unit="ms", utc=True).dt.tz_convert(None)
-    p["price"] = pd.to_numeric(p["price"], errors="coerce")
-    p = p.dropna(subset=["open_time", "price"]).set_index("open_time").sort_index()
-    if volumes:
-        v = pd.DataFrame(volumes, columns=["ts", "volume"])
-        v["open_time"] = pd.to_datetime(v["ts"], unit="ms", utc=True).dt.tz_convert(None)
-        v["volume"] = pd.to_numeric(v["volume"], errors="coerce")
-        v = v.dropna(subset=["open_time", "volume"]).set_index("open_time").sort_index()
-    else:
-        v = pd.DataFrame()
-    out = pd.DataFrame({
-        "open": p["price"].resample(rule).first(),
-        "high": p["price"].resample(rule).max(),
-        "low": p["price"].resample(rule).min(),
-        "close": p["price"].resample(rule).last(),
-    })
-    if not v.empty:
-        # CoinGecko exposes 24h volume observations rather than exchange candle volume;
-        # use the interval mean only as a relative volume proxy for indicators.
-        out["volume"] = v["volume"].resample(rule).mean()
-    else:
-        out["volume"] = 1.0
-    return out.dropna().reset_index().tail(600)
+    Uses the USDT market matching the Tabdeal symbol, e.g. BTCUSDT.
+    Up to 500 candles are requested, which is enough for the indicators and
+    the 1h forecast used by this app.
+    """
+    nsym = nobitex_symbol(symbol)
+    resolution = nobitex_resolution(interval)
+    params = {
+        "symbol": nsym,
+        "resolution": resolution,
+        "to": unix_now(),
+        "countback": min(int(countback), 500),
+    }
+    data = http_get(f"{NOBITEX_BASE}/market/udf/history", params, 10)
+    if not isinstance(data, dict) or data.get("s") != "ok":
+        msg = data.get("errmsg", "داده‌ای برای این بازار وجود ندارد.") if isinstance(data, dict) else "پاسخ نامعتبر"
+        raise RuntimeError(f"تاریخچه نوبیتکس برای {nsym} در دسترس نیست: {msg}")
 
-@st.cache_data(ttl=600, show_spinner=False)
-def coingecko_candles(symbol, interval):
-    coin_id = coingecko_id_for_symbol(symbol)
-    # 89d keeps CoinGecko's hourly granularity on the public endpoint; 365d gives
-    # enough daily history for EMA200/Ichimoku on the 1d timeframe.
-    if interval == "1h":
-        days = 89
-        rule = "1h"
-    elif interval == "4h":
-        days = 89
-        rule = "4h"
-    elif interval == "1d":
-        days = 365
-        rule = "1D"
-    else:
-        raise RuntimeError("تاریخچه عمومی فقط برای 1h/4h/1d استفاده می‌شود.")
-    data = http_get(
-        f"{COINGECKO_BASE}/coins/{coin_id}/market_chart",
-        {"vs_currency": "usd", "days": days},
-        15,
-    )
-    df = _prices_to_ohlcv(data.get("prices", []), data.get("total_volumes", []), rule)
+    t = data.get("t", [])
+    o = data.get("o", [])
+    h = data.get("h", [])
+    l = data.get("l", [])
+    c = data.get("c", [])
+    v = data.get("v", [])
+    n = min(len(t), len(o), len(h), len(l), len(c), len(v))
+    if n < 60:
+        raise RuntimeError(f"تاریخچه نوبیتکس {nsym} برای {interval} کافی نیست ({n} کندل).")
+
+    df = pd.DataFrame({
+        "open_time": pd.to_datetime(pd.to_numeric(t[:n]), unit="s"),
+        "open": pd.to_numeric(o[:n], errors="coerce"),
+        "high": pd.to_numeric(h[:n], errors="coerce"),
+        "low": pd.to_numeric(l[:n], errors="coerce"),
+        "close": pd.to_numeric(c[:n], errors="coerce"),
+        "volume": pd.to_numeric(v[:n], errors="coerce"),
+    }).dropna(subset=["open_time", "open", "high", "low", "close"])
+    df = df.sort_values("open_time").drop_duplicates("open_time").reset_index(drop=True)
     if len(df) < 60:
-        raise RuntimeError(f"تاریخچه عمومی {symbol} برای {interval} کافی نیست.")
-    return df
-
+        raise RuntimeError(f"تاریخچه نوبیتکس {nsym} برای {interval} کافی نیست.")
+    if "volume" not in df or df["volume"].isna().all():
+        df["volume"] = 0.0
+    df["volume"] = df["volume"].fillna(0.0)
+    return df.tail(min(int(countback), 500))
 
 def analysis_candles(symbol, interval):
-    """Use Tabdeal first; if recent trades are too sparse, use public historical
-    market data for candles. Tabdeal remains the only exchange used for current
-    price and the market list."""
+    """Use Tabdeal first; if its recent trades are too sparse, fall back to
+    Nobitex public OHLC for the same USDT market. Live price remains Tabdeal.
+    """
     try:
         d = tabdeal_klines(symbol, interval)
         x = add_indicators(d)
+        # Require enough history for the indicator stack; otherwise use the
+        # public historical OHLC source.
         if len(x) >= 60:
-            return d, "تبدیل"
+            return d, EXCHANGE_NAME
     except Exception:
         pass
-    if interval in {"1h", "4h", "1d"}:
-        return coingecko_candles(symbol, interval), "تاریخچه عمومی"
-    raise RuntimeError("برای 15m از تبدیل داده کافی موجود نیست.")
+
+    try:
+        return nobitex_candles(symbol, interval), NOBITEX_NAME
+    except Exception as exc:
+        raise RuntimeError(
+            f"برای {symbol} در تایم‌فریم {interval} نه تاریخچه کافی از تبدیل و نه نوبیتکس دریافت نشد: {exc}"
+        ) from exc
 
 # -------------------- Exchange router --------------------
 

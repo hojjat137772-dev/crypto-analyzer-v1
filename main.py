@@ -13,14 +13,17 @@ st.set_page_config(page_title='Crypto Analyzer Pro', page_icon='₿', layout='wi
 TIMEFRAMES = {'15m':'15m', '1H':'1h', '4H':'4h', '1D':'1d'}
 BINANCE = 'https://api.binance.com'
 WALLEX = 'https://api.wallex.ir'
-TABDEAL = 'https://api.tabdeal.org'
+TABDEAL = 'https://api1.tabdeal.org'
 SESSION = requests.Session()
 SESSION.headers.update({'User-Agent':'CryptoAnalyzerPro/1.0'})
 
-# Tabdeal endpoints can change. The adapter tries the public variants below.
+# Official public Tabdeal market endpoint. It returns the complete spot market list.
 TABDEAL_MARKET_ENDPOINTS = [
-    '/v1/market/symbols', '/v1/markets', '/api/v1/markets',
-    '/v1/market/stats', '/api/v1/market/stats', '/v1/ticker/24hr'
+    '/r/api/v1/exchangeInfo',
+    '/api/v1/exchangeInfo',
+    '/v1/market/symbols',
+    '/v1/markets',
+    '/api/v1/markets',
 ]
 
 # ============================================================
@@ -63,30 +66,71 @@ def base_asset(symbol):
     return s[:-4] if s.endswith('USDT') else s
 
 # ============================================================
-# TABDEAL — MARKET UNIVERSE
+# TABDEAL — COMPLETE USDT MARKET UNIVERSE
 # ============================================================
 def tabdeal_markets():
-    symbols = {}
+    """Return all active Tabdeal spot markets quoted in USDT.
+
+    The official exchangeInfo endpoint returns the complete market universe;
+    no fixed coin list is used.
+    """
+    symbols = set()
+
     for ep in TABDEAL_MARKET_ENDPOINTS:
-        data = get_json(TABDEAL + ep)
-        if not data: continue
+        data = get_json(TABDEAL + ep, timeout=15)
+        if not data:
+            continue
+
+        # Official response is normally a list of market dictionaries.
         for d in flatten_dicts(data):
-            s = symbol_from_any(d)
-            if s and s.endswith('USDT'):
-                symbols[s] = d
-        if len(symbols) > 20:
+            if not isinstance(d, dict):
+                continue
+
+            raw = None
+            for key in ('symbol', 'tabdealSymbol', 'market', 'pair'):
+                v = d.get(key)
+                if isinstance(v, str) and v.strip():
+                    raw = v
+                    break
+
+            if not raw:
+                continue
+
+            s = normalize_symbol(raw)
+            status = str(d.get('status', 'TRADING')).upper()
+            quote = str(d.get('quoteAsset', '')).upper()
+
+            # Accept explicit USDT markets, and also symbols ending in USDT
+            # when quoteAsset is absent in an alternative endpoint.
+            if (quote == 'USDT' or s.endswith('USDT')) and status in ('TRADING', 'ACTIVE', 'ENABLED', ''):
+                if s.endswith('USDT'):
+                    symbols.add(s)
+
+        # exchangeInfo is authoritative; stop after obtaining a real universe.
+        if len(symbols) > 0 and ('exchangeInfo' in ep):
             break
-    # Some public APIs use nested symbol metadata.
-    return sorted(symbols.keys())
+
+    return sorted(symbols)
 
 
 @st.cache_data(ttl=120, show_spinner=False)
 def get_tabdeal_universe():
     syms = tabdeal_markets()
-    # Conservative fallback for installation/testing when Tabdeal changes its public endpoint.
+
+    # Dynamic fallback: if Tabdeal is temporarily unavailable, use Binance's
+    # live USDT spot universe instead of a small hard-coded coin list.
     if not syms:
-        syms = ['BTCUSDT','ETHUSDT','BNBUSDT','SOLUSDT','XRPUSDT','ADAUSDT','DOGEUSDT','TRXUSDT','AVAXUSDT','LINKUSDT','DOTUSDT','LTCUSDT','SHIBUSDT','ATOMUSDT','NEARUSDT','APTUSDT','SUIUSDT','ARBUSDT','OPUSDT','PEPEUSDT']
-    return syms
+        data = get_json(BINANCE + '/api/v3/exchangeInfo', timeout=15)
+        if isinstance(data, dict):
+            for d in data.get('symbols', []):
+                if not isinstance(d, dict):
+                    continue
+                if str(d.get('status', '')).upper() == 'TRADING' and str(d.get('quoteAsset', '')).upper() == 'USDT':
+                    s = normalize_symbol(d.get('symbol', ''))
+                    if s.endswith('USDT'):
+                        syms.append(s)
+
+    return sorted(set(syms))
 
 # ============================================================
 # BINANCE MARKET DATA
@@ -368,57 +412,91 @@ def aggregate(symbol):
     return {'symbol':symbol,'price':entry,'sources':source,'analyses':analyses,'technical':tech,'fundamental':fscore,'agreement':agreement,'score':final_score,'confidence':confidence,'decision':decision,'position':position,'entry':entry,'sl':sl,'t1':t1,'t2':t2,'t3':t3,'risk_pct':abs(entry-sl)/entry*100,'supports':supports,'resistances':resistances,'forecast':forecast,'forecast_pct':{'4H':expected_4h,'24H':expected_24h,'72H':expected_72h}}
 
 # ============================================================
-# UI
+# UI — MOBILE / CARD LAYOUT
 # ============================================================
-def money(x):
-    if x is None or not np.isfinite(x): return '-'
-    if abs(x)>=1000:return f'{x:,.2f}'
-    if abs(x)>=1:return f'{x:,.4f}'
-    return f'{x:.8f}'.rstrip('0').rstrip('.')
+st.markdown("""
+<style>
+.block-container{padding-top:1rem;padding-bottom:2rem;max-width:1050px}
+.app-head{background:linear-gradient(135deg,#111318,#24272d);color:white;border-radius:24px;padding:20px 22px;margin-bottom:14px;box-shadow:0 8px 24px rgba(0,0,0,.12)}
+.app-brand{font-size:26px;font-weight:900;line-height:1.2}.app-sub{font-size:12px;color:#cfd2d7;margin-top:6px}
+.menu-wrap{background:#fff;border:1px solid #ececec;border-radius:20px;padding:8px;margin-bottom:14px;box-shadow:0 3px 14px rgba(0,0,0,.05)}
+.menu-wrap [role="radiogroup"]{gap:6px;flex-wrap:wrap}.menu-wrap label{border-radius:14px!important;padding:8px 12px!important}
+.section-card{background:#fff;border:1px solid #ececec;border-radius:20px;padding:16px;margin-bottom:14px;box-shadow:0 3px 14px rgba(0,0,0,.045)}
+.section-title{font-size:17px;font-weight:850;margin-bottom:4px}.section-sub{font-size:12px;color:#777;margin-bottom:12px}
+.stat-row{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}.stat{flex:1;min-width:120px;background:#f7f7f8;border-radius:14px;padding:10px 12px}
+.stat-k{font-size:11px;color:#777}.stat-v{font-size:17px;font-weight:850;margin-top:3px}
+.result-card{background:#fff;border:1px solid #e9e9e9;border-radius:22px;padding:17px;margin:14px 0;box-shadow:0 5px 18px rgba(0,0,0,.055)}
+.result-head{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap}
+.coin-name{font-size:23px;font-weight:900}.decision{padding:7px 12px;border-radius:14px;font-size:13px;font-weight:850}
+.decision-buy{background:#e9f8ef;color:#138a45}.decision-sell{background:#fdecec;color:#c62828}.decision-wait{background:#fff7d9;color:#8a6900}
+.price-box{background:#f7f8fa;border-radius:17px;padding:13px;margin:12px 0}.price-label{font-size:11px;color:#777}
+.price-main{font-size:26px;font-weight:900;margin-top:3px}.level-grid{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:8px;margin-top:10px}
+.level{background:#fafafa;border:1px solid #ededed;border-radius:14px;padding:10px}.level.entry{border-top:4px solid #eab308}.level.sl{border-top:4px solid #dc2626}.level.tp{border-top:4px solid #16a34a}
+.level-k{font-size:10px;color:#777}.level-v{font-size:14px;font-weight:850;margin-top:4px;word-break:break-word}
+.reason-box{background:#f8f8f9;border-radius:15px;padding:11px 13px;font-size:12px;line-height:2;margin-top:11px}
+.tf-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin-top:10px}.tf{background:#f7f8fa;border-radius:14px;padding:10px}
+.tf-k{font-size:10px;color:#777}.tf-v{font-size:15px;font-weight:850;margin-top:3px}
+.footer-note{color:#777;font-size:11px;text-align:center;line-height:1.9;padding:12px}
+@media(max-width:700px){.block-container{padding-left:.65rem;padding-right:.65rem}.app-brand{font-size:22px}.level-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.level:last-child{grid-column:span 2}.tf-grid{grid-template-columns:1fr}.coin-name{font-size:20px}}
+</style>
+""", unsafe_allow_html=True)
 
-st.markdown('''<style>
-.block-container{padding-top:1.1rem;max-width:1250px}
-.card{border:1px solid #e7e7e7;border-radius:18px;padding:18px;background:#fff;box-shadow:0 3px 14px rgba(0,0,0,.05);margin-bottom:16px}
-.buy{border-right:6px solid #16a34a}.sell{border-right:6px solid #dc2626}.wait{border-right:6px solid #eab308}
-.big{font-size:30px;font-weight:800}.muted{color:#666;font-size:13px}.pill{display:inline-block;padding:5px 10px;border-radius:20px;background:#f5f5f5;margin-left:5px;font-size:12px}
-</style>''',unsafe_allow_html=True)
-
-st.title('₿ تحلیل‌گر حرفه‌ای رمزارز')
-st.caption('بازار USDT صرافی تبدیل • تأیید چندمنبعی با بایننس و والکس • تکنیکال + شرایط بازار • بدون اجرای سفارش')
+st.markdown("""
+<div class="app-head">
+  <div class="app-brand">₿ تحلیل‌گر حرفه‌ای رمزارز</div>
+  <div class="app-sub">بازار USDT صرافی تبدیل • تأیید با Binance و Wallex • تکنیکال + شرایط بازار • بدون اجرای سفارش</div>
+</div>
+""", unsafe_allow_html=True)
 
 universe=get_tabdeal_universe()
+if "watch" not in st.session_state: st.session_state.watch=[]
 
-if 'watch' not in st.session_state: st.session_state.watch=[]
+st.markdown('<div class="menu-wrap">', unsafe_allow_html=True)
+menu=st.radio("منوی اصلی",["بازارها","تحلیل انتخابی","⭐ نشانه‌گذاری","راهنما"],horizontal=True,label_visibility="collapsed",key="main_menu")
+st.markdown('</div>', unsafe_allow_html=True)
 
-with st.sidebar:
-    st.subheader('تنظیمات')
-    search=st.text_input('جستجوی ارز',placeholder='BTC / ETH / SOL ...')
-    filtered=[s for s in universe if search.upper() in s] if search else universe
-    watch_only=st.checkbox('فقط نشانه‌گذاری‌شده‌ها')
-    options=[s for s in (st.session_state.watch if watch_only else filtered)]
-    if not options: options=filtered
-    selected=st.multiselect('انتخاب حداکثر ۵ ارز',options=options,default=[x for x in st.session_state.watch if x in options][:5],max_selections=5)
-    st.session_state.watch=selected
-    st.divider()
-    st.write(f'تعداد بازارهای USDT تبدیل: **{len(universe)}**')
-    st.caption('تحلیل با داده‌های عمومی بازار انجام می‌شود و سیگنال سود قطعی نیست.')
+if menu=="راهنما":
+    st.markdown("""
+    <div class="section-card">
+      <div class="section-title">راهنمای برنامه</div>
+      <div class="section-sub">منو و کارت‌های تحلیل از هم جدا شده‌اند تا روی موبایل مرتب‌تر دیده شوند.</div>
+      <b>بازارها:</b> انتخاب تا ۵ ارز از بازار USDT تبدیل.<br>
+      <b>تحلیل انتخابی:</b> نمایش کارت تحلیل ارزهای انتخاب‌شده.<br>
+      <b>⭐ نشانه‌گذاری:</b> نگهداری ارزهای موردنظر برای دسترسی سریع.<br>
+      <b>کارت تحلیل:</b> ورود، حد ضرر، تارگت‌ها، نوع پوزیشن، اطمینان مدل و دلایل اصلی.
+    </div>
+    """,unsafe_allow_html=True)
+    st.markdown('<div class="footer-note">درصد اطمینان، شاخص اطمینان مدل است و تضمین سود یا موفقیت معامله نیست.</div>',unsafe_allow_html=True)
+    st.stop()
 
-# Main selection also visible for phone users.
-search2=st.text_input('🔎 جستجوی ارز از میان بازارهای تبدیل',placeholder='مثلاً BTCUSDT یا BTC')
-view=[s for s in universe if search2.upper() in s] if search2 else universe
-if st.session_state.watch:
-    pinned=[s for s in st.session_state.watch if s in universe]
-    view=list(dict.fromkeys(pinned+view))
+st.markdown('<div class="section-card">',unsafe_allow_html=True)
+st.markdown('<div class="section-title">بازار و انتخاب ارز</div>',unsafe_allow_html=True)
+st.markdown('<div class="section-sub">از میان تمام بازارهای USDT تبدیل جستجو کن و حداکثر ۵ ارز را همزمان انتخاب کن.</div>',unsafe_allow_html=True)
 
-selected=st.multiselect('⭐ حداکثر ۵ ارز برای تحلیل همزمان',view,default=st.session_state.watch[:5],max_selections=5)
-st.session_state.watch=selected
+search=st.text_input("جستجو",placeholder="مثلاً BTC، ETH، SOL یا BTCUSDT",label_visibility="collapsed",key="coin_search")
+filtered=[s for s in universe if search.upper() in s] if search else universe
+if menu=="⭐ نشانه‌گذاری": filtered=[s for s in filtered if s in st.session_state.watch]
+if menu=="تحلیل انتخابی" and st.session_state.watch: filtered=[s for s in filtered if s in st.session_state.watch]
+
+default_selected=[x for x in st.session_state.watch if x in filtered][:5]
+selected=st.multiselect("انتخاب حداکثر ۵ ارز",options=filtered,default=default_selected,max_selections=5,format_func=lambda x:x.replace("USDT","/USDT"),key="selected_coins")
+st.session_state.watch=list(dict.fromkeys(selected))
+
+st.markdown(f"""
+<div class="stat-row">
+  <div class="stat"><div class="stat-k">بازارهای USDT</div><div class="stat-v">{len(universe):,}</div></div>
+  <div class="stat"><div class="stat-k">انتخاب‌شده</div><div class="stat-v">{len(selected)}/5</div></div>
+  <div class="stat"><div class="stat-k">نشانه‌گذاری</div><div class="stat-v">⭐ {len(st.session_state.watch)}</div></div>
+</div>
+""",unsafe_allow_html=True)
+st.markdown('</div>',unsafe_allow_html=True)
 
 if not selected:
-    st.info('از منوی بالا تا ۵ ارز را انتخاب کنید.')
+    st.markdown('<div class="section-card"><div class="section-title">برای شروع یک یا چند ارز انتخاب کن</div><div class="section-sub">پس از انتخاب، کارت تحلیل هر ارز جداگانه نمایش داده می‌شود.</div></div>',unsafe_allow_html=True)
     st.stop()
 
 results=[]
-with st.spinner('در حال جمع‌آوری داده از منابع و اجرای تحلیل...'):
+with st.spinner("در حال دریافت داده و اجرای تحلیل چندمنبعی..."):
     with ThreadPoolExecutor(max_workers=5) as ex:
         jobs={ex.submit(aggregate,s):s for s in selected}
         for job in as_completed(jobs):
@@ -427,29 +505,60 @@ with st.spinner('در حال جمع‌آوری داده از منابع و اج�
                 if r: results.append(r)
             except Exception: pass
 
-for r in sorted(results,key=lambda x:x['score'],reverse=True):
-    cls='buy' if r['decision']=='معامله کن' and r['position']=='لانگ' else ('sell' if r['position']=='شورت' else 'wait')
-    icon='🟢' if r['position']=='لانگ' else ('🔴' if r['position']=='شورت' else '🟡')
-    src=' | '.join(f'{k}: {money(v)}' for k,v in r['sources'].items()) or 'منبع قیمت در دسترس نیست'
-    reason='؛ '.join(reason_text for k in ['15m','1H','4H','1D'] if k in r['analyses'] for reason_text in r['analyses'][k]['reasons'][:3])
-    st.markdown(f'''<div class="card {cls}"><div class="big">{icon} {r['symbol']} — {r['decision']}</div>
-    <div class="muted">نوع پوزیشن: <b>{r['position']}</b> &nbsp; | &nbsp; امتیاز مدل: <b>{r['score']:.0f}/100</b> &nbsp; | &nbsp; اطمینان تحلیل: <b>{r['confidence']:.0f}%</b></div>
-    <hr><b>قیمت مرجع:</b> {money(r['price'])}<br>
-    <b>ورود:</b> {money(r['entry'])} &nbsp; <b>حد ضرر:</b> {money(r['sl'])} &nbsp; <b>ریسک:</b> {r['risk_pct']:.2f}%<br>
-    <b>Target 1:</b> {money(r['t1'])} &nbsp; <b>Target 2:</b> {money(r['t2'])} &nbsp; <b>Target 3:</b> {money(r['t3'])}<br>
-    <b>پیش‌بینی مدل:</b> 4H {r['forecast_pct']['4H']:+.1f}% → {money(r['forecast']['4H'])} &nbsp; | &nbsp; 24H {r['forecast_pct']['24H']:+.1f}% → {money(r['forecast']['24H'])} &nbsp; | &nbsp; 72H {r['forecast_pct']['72H']:+.1f}% → {money(r['forecast']['72H'])}<br>
-    <b>دلایل کلیدی:</b> {reason}<br><span class="muted">منابع قیمت: {src}</span></div>''',unsafe_allow_html=True)
-    with st.expander(f'جزئیات تحلیل {r["symbol"]}'):
+if not results:
+    st.error("برای ارزهای انتخاب‌شده داده کافی دریافت نشد. چند لحظه بعد دوباره امتحان کن.")
+    st.stop()
+
+st.markdown(f'<div class="section-card"><div class="section-title">نتیجه تحلیل</div><div class="section-sub">{len(results)} کارت تحلیل آماده شد؛ هر کارت مستقل از کارت‌های دیگر است.</div></div>',unsafe_allow_html=True)
+
+for r in sorted(results,key=lambda x:x["score"],reverse=True):
+    if r["position"]=="لانگ":
+        decision_cls="decision-buy"; decision_icon="🟢"
+    elif r["position"]=="شورت":
+        decision_cls="decision-sell"; decision_icon="🔴"
+    else:
+        decision_cls="decision-wait"; decision_icon="🟡"
+
+    reason="؛ ".join(reason_text for tf in ["15m","1H","4H","1D"] if tf in r["analyses"] for reason_text in r["analyses"][tf]["reasons"][:3])
+    src=" | ".join(f"{k}: {money(v)}" for k,v in r["sources"].items()) or "-"
+
+    st.markdown(f"""
+    <div class="result-card">
+      <div class="result-head">
+        <div class="coin-name">{decision_icon} {r["symbol"].replace("USDT","/USDT")}</div>
+        <div class="decision {decision_cls}">{r["decision"]}</div>
+      </div>
+      <div class="price-box">
+        <div class="price-label">قیمت مرجع چندمنبعی</div>
+        <div class="price-main">{money(r["price"])}</div>
+        <div class="muted">نوع پوزیشن: <b>{r["position"]}</b> &nbsp; • &nbsp; امتیاز مدل: <b>{r["score"]:.0f}/100</b> &nbsp; • &nbsp; اطمینان تحلیل: <b>{r["confidence"]:.0f}%</b></div>
+      </div>
+      <div class="level-grid">
+        <div class="level entry"><div class="level-k">ورود</div><div class="level-v">{money(r["entry"])}</div></div>
+        <div class="level sl"><div class="level-k">حد ضرر</div><div class="level-v">{money(r["sl"])}</div></div>
+        <div class="level tp"><div class="level-k">Target 1</div><div class="level-v">{money(r["t1"])}</div></div>
+        <div class="level tp"><div class="level-k">Target 2</div><div class="level-v">{money(r["t2"])}</div></div>
+        <div class="level tp"><div class="level-k">Target 3</div><div class="level-v">{money(r["t3"])}</div></div>
+      </div>
+      <div class="tf-grid">
+        <div class="tf"><div class="tf-k">پیش‌بینی 4H</div><div class="tf-v">{r["forecast_pct"]["4H"]:+.1f}% → {money(r["forecast"]["4H"])}</div></div>
+        <div class="tf"><div class="tf-k">پیش‌بینی 24H</div><div class="tf-v">{r["forecast_pct"]["24H"]:+.1f}% → {money(r["forecast"]["24H"])}</div></div>
+        <div class="tf"><div class="tf-k">پیش‌بینی 72H</div><div class="tf-v">{r["forecast_pct"]["72H"]:+.1f}% → {money(r["forecast"]["72H"])}</div></div>
+      </div>
+      <div class="reason-box"><b>دلایل کلیدی:</b> {reason or "-"}<br><b>ریسک تا حد ضرر:</b> {r["risk_pct"]:.2f}%<br><span class="muted">منابع قیمت: {src}</span></div>
+    </div>
+    """,unsafe_allow_html=True)
+
+    with st.expander(f"جزئیات تکنیکال {r['symbol'].replace('USDT','/USDT')}"):
         rows=[]
-        for tf,a in r['analyses'].items():
-            rows.append({'تایم‌فریم':tf,'امتیاز':round(a['score'],1),'RSI':round(a['rsi'],1),'MACD':round(a['macd'],6),'Momentum %':round(a['momentum'],2),'ADX':round(a['adx'],1)})
+        for tf,a in r["analyses"].items():
+            rows.append({"تایم‌فریم":tf,"امتیاز":round(a["score"],1),"RSI":round(a["rsi"],1),"MACD":round(a["macd"],6),"Momentum %":round(a["momentum"],2),"ADX":round(a["adx"],1)})
         st.dataframe(pd.DataFrame(rows),use_container_width=True,hide_index=True)
         c1,c2=st.columns(2)
         with c1:
-            st.write('**حمایت‌ها:**', ', '.join(money(x) for x in r['supports']) or '-')
+            st.markdown("**حمایت‌ها**"); st.write(", ".join(money(x) for x in r["supports"]) or "-")
         with c2:
-            st.write('**مقاومت‌ها:**', ', '.join(money(x) for x in r['resistances']) or '-')
-        st.caption('مدل از ایچیموکو، MACD، RSI، Momentum، ATR، ADX، ساختار قیمت و پرایس‌اکشن استفاده می‌کند. بخش بنیادی/بازاری از داده‌های عمومی رتبه، ارزش بازار و حجم والکس به‌عنوان فیلتر کمکی استفاده می‌کند.')
+            st.markdown("**مقاومت‌ها**"); st.write(", ".join(money(x) for x in r["resistances"]) or "-")
+        st.caption("مدل از ایچیموکو، MACD، RSI، Momentum، ATR، ADX، ساختار قیمت و پرایس‌اکشن استفاده می‌کند. داده‌های بازار/بنیادی عمومی نیز به‌عنوان فیلتر کمکی استفاده می‌شوند.")
 
-st.divider()
-st.caption('هشدار: این برنامه ابزار تحقیق و تحلیل است. درصد اطمینان، احتمال سود قطعی نیست و پیش‌بینی بازار ذاتاً نامطمئن است. قبل از معامله شرایط نقدشوندگی، کارمزد، اخبار و ریسک شخصی را بررسی کنید.')
+st.markdown('<div class="footer-note">هشدار: این برنامه ابزار تحقیق و تحلیل است. «اطمینان تحلیل» احتمال سود قطعی نیست. پیش‌بینی بازار قطعی نیست و قبل از معامله باید نقدشوندگی، کارمزد، اخبار و ریسک شخصی بررسی شود.</div>',unsafe_allow_html=True)

@@ -972,6 +972,125 @@ def scan_one_market(exchange, symbol, scan_tfs):
         "تایم‌فریم معتبر": len(scores),
     }
 
+
+def pump_setup_score(ind_1h, ind_4h, ind_1d, forecast_score):
+    """Score an early bullish setup, not an already-completed pump."""
+    a = ind_1h.iloc[-1]
+    b = ind_4h.iloc[-1]
+    d = ind_1d.iloc[-1]
+    price = float(a["close"])
+    resistance = support_resistance(ind_4h, 60)[1]
+    dist_res = ((resistance / price) - 1) * 100 if price > 0 else 999
+    vr = float(a["vol_ratio"]) if np.isfinite(a["vol_ratio"]) else 1.0
+    ret4 = float(a["close"] / ind_1h["close"].iloc[-5] - 1) if len(ind_1h) >= 5 else 0.0
+    ret24 = float(a["close"] / ind_1h["close"].iloc[-25] - 1) if len(ind_1h) >= 25 else 0.0
+    rsi = float(a["rsi"])
+
+    volume_score = 100 if vr >= 2.0 else 85 if vr >= 1.5 else 70 if vr >= 1.2 else 50 if vr >= 0.9 else 25
+    momentum_score = 100 if 0.01 <= ret4 <= 0.08 else 85 if 0.0 <= ret4 < 0.01 else 55 if ret4 < 0.0 else 25
+    early_score = 100 if 0.3 <= dist_res <= 3.0 else 88 if 0.0 < dist_res <= 5.0 else 65 if 5.0 < dist_res <= 8.0 else 35
+    not_pumped = 100 if ret24 <= 0.08 else 75 if ret24 <= 0.12 else 30 if ret24 <= 0.20 else 0
+    rsi_score = 100 if 52 <= rsi <= 66 else 82 if 48 <= rsi <= 70 else 45
+
+    trend_bonus = 0
+    if float(a["ema20"]) > float(a["ema50"]): trend_bonus += 8
+    if float(b["ema20"]) > float(b["ema50"]): trend_bonus += 8
+    if float(d["ema20"]) > float(d["ema50"]): trend_bonus += 8
+    trend_score = min(100, 55 + trend_bonus)
+
+    score = (
+        0.35 * float(forecast_score) +
+        0.20 * trend_score +
+        0.15 * volume_score +
+        0.10 * momentum_score +
+        0.10 * early_score +
+        0.05 * not_pumped +
+        0.05 * rsi_score
+    )
+    # Hard penalty for a move that has already become extended.
+    if ret24 > 0.20:
+        score -= 18
+    elif ret24 > 0.12:
+        score -= 8
+    return float(np.clip(score, 0, 100)), {
+        "price": price, "resistance": resistance, "dist_res": dist_res,
+        "vol_ratio": vr, "ret4": ret4, "ret24": ret24, "rsi": rsi,
+    }
+
+
+@st.cache_data(ttl=90, show_spinner=False)
+def pump_scan_one_market(exchange, symbol):
+    """Find early-stage bullish candidates using technical + forecast agreement."""
+    tfs = ["1h", "4h", "1d"]
+    data = {}
+    scores = {}
+    inds = {}
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        futures = {tf: pool.submit(get_candles, exchange, symbol, tf) for tf in tfs}
+        for tf, fut in futures.items():
+            df = fut.result()
+            sc, _, ind = timeframe_score(df)
+            if len(ind) < 30:
+                raise RuntimeError("داده کافی نیست")
+            data[tf] = df; inds[tf] = ind; scores[tf] = float(sc)
+
+    forecast_df, _ = future_forecast(data["1h"])
+    probs = pd.to_numeric(forecast_df["probability_up"], errors="coerce").dropna()
+    fconfs = pd.to_numeric(forecast_df["confidence"], errors="coerce").dropna()
+    if probs.empty:
+        raise RuntimeError("پیش‌بینی معتبر نیست")
+    forecast_score = float(np.clip(probs.mean(), 1, 99))
+    forecast_conf = float(fconfs.mean()) if not fconfs.empty else 0.0
+    tech_score = 0.25*scores["1h"] + 0.40*scores["4h"] + 0.35*scores["1d"]
+    combined, meta = pump_setup_score(inds["1h"], inds["4h"], inds["1d"], forecast_score)
+
+    vals = np.array([scores["1h"], scores["4h"], scores["1d"], forecast_score], dtype=float)
+    agreement = float(np.clip(100 - np.std(vals)*2.5, 0, 100))
+    data_quality = float(np.clip(min(len(inds["1h"]), len(inds["4h"]), len(inds["1d"]) ) / 220 * 100, 0, 100))
+    volume_quality = float(np.clip(meta["vol_ratio"] / 1.5 * 100, 0, 100))
+    confidence = float(np.clip(0.42*agreement + 0.33*forecast_conf + 0.15*data_quality + 0.10*volume_quality, 0, 100))
+
+    # Only label a candidate as high-confidence when multiple independent checks agree.
+    if forecast_score < 62 or tech_score < 62 or confidence < 90:
+        return None
+    if meta["ret24"] > 0.20 or meta["dist_res"] < 0 or meta["dist_res"] > 8.0:
+        return None
+    if meta["rsi"] > 72:
+        return None
+
+    reason = f"فنی {tech_score:.0f}/100 | آینده‌نگری {forecast_score:.0f}% | حجم {meta['vol_ratio']:.1f}x | فاصله مقاومت {meta['dist_res']:.1f}%"
+    return {
+        "نماد": symbol, "امتیاز پامپ": round(combined), "اعتماد تحلیل": round(confidence),
+        "چشم‌انداز": f"{forecast_score:.0f}% صعود احتمالی", "قیمت": money(meta["price"]),
+        "فاصله تا مقاومت": f"{meta['dist_res']:.1f}%", "حجم 1h": f"{meta['vol_ratio']:.2f}x",
+        "بازده 4h": f"{meta['ret4']*100:+.2f}%", "بازده 24h": f"{meta['ret24']*100:+.2f}%",
+        "دلیل": reason, "_sort": combined,
+    }
+
+
+def run_pump_scanner(exchange, markets):
+    candidates = full_market_candidates(exchange, markets)
+    rows = []
+    progress = st.progress(0, text="جستجوی ارزهای مستعد حرکت صعودی...")
+    total = len(candidates)
+    workers = min(5, max(1, total))
+    completed = 0
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(pump_scan_one_market, exchange, symbol): symbol for symbol in candidates}
+        for future in as_completed(futures):
+            completed += 1
+            try:
+                row = future.result()
+                if row is not None:
+                    rows.append(row)
+            except Exception:
+                pass
+            progress.progress(completed/max(total,1), text=f"اسکن {futures[future]} — {completed}/{total}")
+    progress.empty()
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows).sort_values("_sort", ascending=False).drop(columns=["_sort"]).reset_index(drop=True)
+
 def run_scanner(exchange, markets, scan_tfs, limit):
     candidates = scanner_candidates(exchange, markets, limit)
     rows = []
@@ -1438,7 +1557,7 @@ hr{margin:.45rem 0!important}
 </style>
 """, unsafe_allow_html=True)
 
-st.markdown('<div class="main-title">Crypto Analyzer</div><div class="sub-title">تحلیل • سیگنال • نوسان‌گیری</div>', unsafe_allow_html=True)
+st.markdown('<div class="main-title">Crypto Analyzer</div><div class="sub-title">تحلیل تکنیکال • آینده‌نگری • کشف ارزهای مستعد پامپ</div>', unsafe_allow_html=True)
 
 # Compact controls instead of a large sidebar.
 with st.container(border=True):
@@ -1468,55 +1587,27 @@ if not symbol:
 
 st.markdown(f'<div class="card"><b>نماد</b> <span style="font-size:1.1rem;font-weight:800">{base_asset(symbol)}</span> <span style="color:#777">({symbol})</span></div>', unsafe_allow_html=True)
 
-# Quick action row
-q1,q2,q3,q4=st.columns(4)
-with q1: analyze_button=st.button("📊 تحلیل",use_container_width=True)
-with q2: scalp_button=st.button("⚡ نوسان",use_container_width=True)
-with q3: full_scan_button=st.button("🔎 اسکن بازار",use_container_width=True)
-with q4: backtest_button=st.button("🧪 بک‌تست",use_container_width=True)
+# Quick action row — the old signal/scalping panel is replaced by a pump-opportunity scanner.
+q1,q2,q3=st.columns(3)
+with q1: analyze_button=st.button("📊 تحلیل ترکیبی",use_container_width=True)
+with q2: pump_scan_button=st.button("🚀 جستجوی ارز مستعد پامپ",use_container_width=True)
+with q3: backtest_button=st.button("🧪 بک‌تست",use_container_width=True)
 
-if scalp_button:
-    with st.spinner("در حال بررسی نوسان‌گیری..."):
-        try:
-            df5=get_candles(exchange,symbol,"5m")
-            try: df15=get_candles(exchange,symbol,"15m")
-            except Exception: df15=None
-            sc=scalping_signal(df5,df15)
-            icon="🟢" if sc["signal"]=="LONG" else "🔴" if sc["signal"]=="SHORT" else "🟡"
-            st.markdown('<div class="signal-card">',unsafe_allow_html=True)
-            a,b,c,d=st.columns(4)
-            a.metric("سیگنال",f"{icon} {sc['signal']}")
-            b.metric("قدرت",f"{sc['score']}/100")
-            c.metric("قیمت",money(sc["price"]))
-            d.metric("RSI",f"{sc['rsi']:.1f}")
-            if sc["signal"]!="WAIT":
-                e,f,g,h=st.columns(4)
-                e.metric("ورود",money(sc["price"])); f.metric("SL",money(sc["sl"])); g.metric("TP1",money(sc["tp1"])); h.metric("TP2",money(sc["tp2"]))
-            st.markdown('</div>',unsafe_allow_html=True)
-            st.caption(f"5m + 15m | حجم {sc['volume']:.2f}x | ADX {sc['adx']:.1f} | ATR {sc['atr_pct']:.2f}% | تأیید {sc['mtf']}")
-            if sc["reasons"]: st.caption(" • ".join(sc["reasons"]))
-            with st.expander("بک‌تست نوسان‌گیری"):
-                bt=scalping_backtest(df5); aa,bb,cc,dd=st.columns(4)
-                aa.metric("معامله",bt["trades"]); bb.metric("موفقیت",f"{bt['win_rate']:.1f}%"); cc.metric("بازده",f"{bt['return_pct']:+.2f}%"); dd.metric("افت",f"{bt['max_dd']:.2f}%")
-        except Exception as exc: st.error(f"نوسان‌گیری اجرا نشد: {exc}")
-
-if full_scan_button:
-    if not markets: st.error("لیست بازارها در دسترس نیست.")
+if pump_scan_button:
+    if not markets:
+        st.error("لیست بازارها در دسترس نیست.")
     else:
-        with st.spinner("در حال اسکن کل بازار..."):
-            full_df=run_full_market_scanner(exchange,markets)
-        if full_df.empty: st.warning("نتیجه‌ای پیدا نشد.")
+        with st.spinner("در حال اسکن کل بازار برای پیدا کردن حرکت صعودیِ هنوز شروع‌نشده..."):
+            pump_df=run_pump_scanner(exchange,markets)
+        if pump_df.empty:
+            st.warning("هیچ گزینه‌ای با معیارهای سخت‌گیرانه پیدا نشد؛ این نتیجه بهتر از نمایش سیگنال کم‌اعتماد است.")
         else:
-            valid_full=full_df[pd.to_numeric(full_df["امتیاز"],errors="coerce").notna()].copy()
-            st.markdown("### 🔎 اسکن کل بازار")
-            st.caption(f"{len(valid_full)} بازار دارای داده معتبر")
-            cols=["بازار","امتیاز","سیگنال","قیمت","ورود","حدضرر","حدسود 1","حدسود 2","حمایت","مقاومت","1h","4h"]
-            cols=[c for c in cols if c in valid_full.columns]
-            view=valid_full[cols].copy()
-            if "بازار" in view.columns: view=view.rename(columns={"بازار":"نماد"})
-            for c in ["قیمت","ورود","حدضرر","حدسود 1","حدسود 2","حمایت","مقاومت"]:
-                if c in view.columns: view[c]=view[c].apply(lambda x: money(float(x)) if pd.notna(x) else "-")
-            st.dataframe(view,use_container_width=True,hide_index=True)
+            st.markdown("### 🚀 ارزهای مستعد حرکت صعودی")
+            st.caption("رتبه‌بندی با ترکیب روند چندتایم‌فریمی، آینده‌نگری، حجم، مومنتوم و فاصله تا مقاومت انجام شده است؛ «پامپ» قطعی یا تضمین سود نیست.")
+            view=pump_df.head(5).copy()
+            cols=["نماد","امتیاز پامپ","اعتماد تحلیل","چشم‌انداز","قیمت","فاصله تا مقاومت","حجم 1h","بازده 4h","بازده 24h","دلیل"]
+            cols=[c for c in cols if c in view.columns]
+            st.dataframe(view[cols],use_container_width=True,hide_index=True)
 
 if backtest_button:
     with st.spinner("در حال اجرای بک‌تست..."):
@@ -1567,14 +1658,18 @@ try:
     except Exception:
         forecast_df=None
 
-    # Give the forecast a meaningful but controlled weight in the final score.
-    final_score=round(float(np.clip(mtf_score*0.65 + forecast_score*0.35,0,100)))
+    # Final decision = technical multi-timeframe analysis + future forecast.
+    # The forecast has a larger role now, but it can never override a strong technical contradiction.
+    final_score=round(float(np.clip(mtf_score*0.55 + forecast_score*0.45,0,100)))
     signal,signal_icon,signal_text=signal_from_score(final_score,ema20,ema50,ema200,macd_hist,rsi_v,adx_v,ich_bull,ich_bear)
-    # Do not allow the forecast to override a strong opposite outlook.
-    if signal=="BUY" and forecast_score < 43:
-        signal,signal_icon,signal_text="HOLD","🟡","روند فنی مثبت است اما چشم‌انداز احتمالی تأیید کافی نمی‌دهد"
-    elif signal=="SELL" and forecast_score > 57:
-        signal,signal_icon,signal_text="HOLD","🟡","روند فنی منفی است اما چشم‌انداز احتمالی تأیید کافی نمی‌دهد"
+    if signal=="BUY" and forecast_score < 55:
+        signal,signal_icon,signal_text="HOLD","🟡","تحلیل تکنیکال مثبت است اما آینده‌نگری صعود را تأیید نمی‌کند"
+    elif signal=="SELL" and forecast_score > 45:
+        signal,signal_icon,signal_text="HOLD","🟡","تحلیل تکنیکال منفی است اما آینده‌نگری نزول را تأیید نمی‌کند"
+    elif signal=="HOLD" and mtf_score >= 60 and forecast_score >= 62:
+        signal,signal_icon,signal_text="BUY","🟢","تأیید هم‌زمان تحلیل تکنیکال و آینده‌نگری"
+    elif signal=="HOLD" and mtf_score <= 40 and forecast_score <= 38:
+        signal,signal_icon,signal_text="SELL","🔴","تأیید هم‌زمان نزولی در تحلیل تکنیکال و آینده‌نگری"
     risk=max(1.5*atr_value,entry*.01)
     if signal=="BUY":
         sl=min(entry-risk,support*.995); sl=sl if 0<sl<entry else entry-risk; rrisk=max(entry-sl,entry*.01); tp1=entry+1.5*rrisk; tp2=entry+2.5*rrisk; tp3=entry+4*rrisk
@@ -1582,23 +1677,26 @@ try:
         sl=max(entry+risk,resistance*1.005); rrisk=max(sl-entry,entry*.01); tp1=entry-1.5*rrisk; tp2=entry-2.5*rrisk; tp3=entry-4*rrisk
     else: sl=tp1=tp2=tp3=np.nan
 
-    # Confidence = agreement + trend strength + data quality, not a profit probability.
+    # Strict confidence index: 90-100 is reserved for strong agreement + validated forecast + good data.
+    # It is NOT a probability of profit and is never presented as a guarantee.
     vals=[scores[k] for k in tf_names if scores.get(k) is not None]
     agreement=100-(np.std(vals)*2.2 if len(vals)>1 else 35); agreement=float(np.clip(agreement,0,100))
     trend=min(adx_v/35*100,100); data_quality=min(len(ind)/250*100,100)
-    confidence=round(.5*agreement+.3*trend+.2*data_quality)
+    forecast_validation=float(forecast_df["confidence"].mean()) if forecast_df is not None and not forecast_df.empty else 0.0
+    confidence=round(float(np.clip(.38*agreement+.22*trend+.18*data_quality+.22*forecast_validation,0,100)))
+    confidence_band="بالا" if confidence>=90 else "متوسط" if confidence>=75 else "نیازمند تأیید"
     status="صعودی" if mtf_score>=60 else "نزولی" if mtf_score<=40 else "رنج"
     status_icon="🟢" if status=="صعودی" else "🔴" if status=="نزولی" else "🟡"
 
     aligned = sum(1 for k in tf_names if scores.get(k) is not None and ((signal == "BUY" and scores[k] >= 60) or (signal == "SELL" and scores[k] <= 40)))
-    final_title = "ورود" if signal != "HOLD" else "فعلاً صبر کن"
-    final_sub = signal_text if signal != "HOLD" else "تا تأیید بهتر، معامله جدید باز نکن."
+    final_title = "خرید" if signal == "BUY" else "فروش" if signal == "SELL" else "صبر"
+    final_sub = signal_text if signal != "HOLD" else "ترکیب فعلی تکنیکال و آینده‌نگری هنوز تأیید کافی برای تصمیم قطعی نمی‌دهد."
     final_bg = "buy" if signal == "BUY" else "sell" if signal == "SELL" else "wait"
     st.markdown(f"""
     <div class="final-decision {final_bg}">
       <div class="final-top">
         <div><span class="final-label">تصمیم نهایی</span><div class="final-title">{signal_icon} {final_title}</div></div>
-        <div class="final-confidence">اعتماد تحلیل<br><b>{confidence}%</b></div>
+        <div class="final-confidence">اعتماد تحلیل<br><b>{confidence}%</b><br><span style="font-size:.65rem">{confidence_band}</span></div>
       </div>
       <div class="final-reason">{final_sub}</div>
     </div>
@@ -1620,11 +1718,11 @@ try:
                 pct=(float(row["target_price"])/entry-1)*100
                 icon="🟢" if row["direction"]=="صعودی" else "🔴" if row["direction"]=="نزولی" else "🟡"
                 st.metric(f"{icon} {row['label']}",money(float(row["target_price"])),f"{pct:+.2f}%")
-        st.caption("چشم‌انداز احتمالی در امتیاز نهایی اثر داده شده؛ احتمال صعود، احتمال سود معامله نیست.")
+        st.caption("آینده‌نگری مستقیماً در تصمیم نهایی وزن دارد؛ احتمال صعود مدل، احتمال سود قطعی نیست.")
 
     with st.expander("🧠 چرا این نتیجه صادر شد",expanded=True):
         for item in reasons[-10:]: st.write("•",item)
-        st.caption(f"اعتماد {confidence}% از هم‌جهتی تایم‌فریم‌ها، قدرت روند و کیفیت داده محاسبه شده و احتمال سود نیست.")
+        st.caption(f"شاخص اعتماد {confidence}% ({confidence_band}) از هم‌جهتی تایم‌فریم‌ها، قدرت روند، کیفیت داده و اعتبارسنجی آینده‌نگری ساخته شده است؛ این عدد احتمال سود یا تضمین پامپ نیست.")
 
     st.caption(f"آخرین بروزرسانی {datetime.now().strftime('%H:%M:%S')} · داده عمومی · تحلیل بدون اجرای سفارش")
 except requests.exceptions.RequestException as exc:

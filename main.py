@@ -462,6 +462,42 @@ def timeframe_analysis(df):
     return {'score':float(np.clip(score,-100,100)),'rsi':float(r),'macd':float(mac),'signal':float(sig),'momentum':float(mom),'adx':float(ad),'atr':float(at),'price':float(price),'reasons':reasons,'tenkan':float(ten.iloc[-1]),'kijun':float(kij.iloc[-1]),'cloud_top':float(cloud),'cloud_bottom':float(cloud_low)}
 
 
+
+def tf_position(score):
+    if score >= 18:
+        return 'لانگ'
+    if score <= -18:
+        return 'شورت'
+    return 'صبر'
+
+
+def quick_scan(symbol):
+    """Fast whole-market screening; full analysis runs only for strongest candidates."""
+    scan_tfs = ['15m','1H','4H','1D']
+    weights = {'15m':0.8,'1H':1.2,'4H':1.6,'1D':1.35}
+    analyses = {}
+    for tf in scan_tfs:
+        df = market_klines(symbol, TIMEFRAMES[tf], 180)
+        if df.empty and tf in ('1H','4H'):
+            df = wallex_klines(symbol, '60', 12)
+            if tf == '4H' and not df.empty:
+                df = df.set_index('time').resample('4h').agg({'open':'first','high':'max','low':'min','close':'last','volume':'sum'}).dropna().reset_index()
+        if not df.empty:
+            a = timeframe_analysis(df)
+            if a:
+                analyses[tf] = a
+    if not analyses:
+        return None
+    total = sum(weights.get(tf,1) for tf in analyses)
+    score = sum(a['score']*weights.get(tf,1) for tf,a in analyses.items()) / total
+    ref = analyses.get('4H', analyses.get('1H', next(iter(analyses.values()))))
+    price = ref['price']
+    df4 = market_klines(symbol, '4h', 180)
+    if df4.empty:
+        df4 = market_klines(symbol, '1h', 180)
+    supports, resistances = levels(df4) if not df4.empty else ([],[])
+    return {'symbol':symbol,'score':float(score),'position':tf_position(score),'price':float(price),'supports':supports,'resistances':resistances,'analyses':analyses,'coverage':len(analyses)}
+
 def aggregate(symbol):
     frames={}
     # Analyze the full practical multi-timeframe set. The core decision still gives
@@ -581,7 +617,7 @@ universe=get_tabdeal_universe()
 if "watch" not in st.session_state: st.session_state.watch=[]
 
 st.markdown('<div class="menu-wrap">', unsafe_allow_html=True)
-menu=st.radio("منوی اصلی",["بازارها","تحلیل انتخابی","⭐ نشانه‌گذاری","راهنما"],horizontal=True,label_visibility="collapsed",key="main_menu")
+menu=st.radio("منوی اصلی",["بازارها","تحلیل انتخابی","⭐ نشانه‌گذاری","اسکن کل بازار","راهنما"],horizontal=True,label_visibility="collapsed",key="main_menu")
 st.markdown('</div>', unsafe_allow_html=True)
 
 if menu=="راهنما":
@@ -597,6 +633,60 @@ if menu=="راهنما":
     """,unsafe_allow_html=True)
     st.markdown('<div class="footer-note">درصد اطمینان، شاخص اطمینان مدل است و تضمین سود یا موفقیت معامله نیست.</div>',unsafe_allow_html=True)
     st.stop()
+
+if menu=="اسکن کل بازار":
+    st.markdown("""
+    <div class="section-card">
+      <div class="section-title">اسکن کل بازار USDT</div>
+      <div class="section-sub">تمام بازارهای USDT موجود در فهرست تبدیل بررسی می‌شوند. ابتدا 15m، 1H، 4H و 1D غربال می‌شوند و سپس گزینه‌های برتر تحلیل کامل چندتایم‌فریمی می‌گیرند.</div>
+    </div>
+    """,unsafe_allow_html=True)
+    if not universe:
+        st.error("فهرست بازارهای USDT دریافت نشد.")
+        st.stop()
+    scan_n = st.slider("تعداد نتایج نهایی اسکن", min_value=5, max_value=20, value=10, step=5)
+    if st.button("شروع اسکن کل بازار", type="primary", use_container_width=True):
+        scan_results=[]
+        progress=st.progress(0)
+        with st.spinner(f"در حال غربال {len(universe):,} بازار USDT..."):
+            with ThreadPoolExecutor(max_workers=8) as ex:
+                jobs={ex.submit(quick_scan,s):s for s in universe}
+                done=0
+                for job in as_completed(jobs):
+                    done += 1
+                    progress.progress(done/max(len(jobs),1))
+                    try:
+                        r=job.result()
+                        if r and abs(r['score'])>=10:
+                            scan_results.append(r)
+                    except Exception:
+                        pass
+        progress.empty()
+        scan_results=sorted(scan_results,key=lambda x:abs(x['score']),reverse=True)[:max(scan_n*2,20)]
+        if not scan_results:
+            st.warning("در این نوبت گزینه قابل‌اتکایی برای ادامه تحلیل پیدا نشد.")
+            st.stop()
+        st.markdown(f"<div class='section-card'><div class='section-title'>گزینه‌های مناسب برای بررسی</div><div class='section-sub'>از بین {len(universe):,} بازار، {len(scan_results)} گزینه برای مرحله تحلیل انتخاب شدند.</div></div>",unsafe_allow_html=True)
+        full=[]
+        with st.spinner("در حال تحلیل کامل گزینه‌های برتر با تمام تایم‌فریم‌ها..."):
+            with ThreadPoolExecutor(max_workers=5) as ex:
+                jobs={ex.submit(aggregate,r['symbol']):r['symbol'] for r in scan_results[:min(len(scan_results),scan_n*2)]}
+                for job in as_completed(jobs):
+                    try:
+                        r=job.result()
+                        if r and r['decision']=='معامله کن': full.append(r)
+                    except Exception:
+                        pass
+        full=sorted(full,key=lambda x:abs(x['score']),reverse=True)[:scan_n]
+        if not full:
+            st.info("پس از تحلیل کامل، موردی با شرایط فعلی برای معامله تشخیص داده نشد.")
+        else:
+            st.markdown("<div class='section-card'><div class='section-title'>رمزارزهای مناسب معامله</div><div class='section-sub'>این فهرست رتبه‌بندی یا تضمین سود نیست؛ فقط خروجی فعلی مدل برای بررسی دستی است.</div></div>",unsafe_allow_html=True)
+            for i,r in enumerate(full,1):
+                cls='decision-buy' if r['position']=='لانگ' else 'decision-sell'
+                icon='🟢' if r['position']=='لانگ' else '🔴'
+                st.markdown(f"<div class='result-card'><div class='result-head'><div class='coin-name'>{i}. {icon} {r['symbol'].replace('USDT','/USDT')}</div><div class='decision {cls}'>{r['position']}</div></div><div class='price-box'><div class='price-label'>قیمت مرجع</div><div class='price-main'>{money(r['price'])}</div><div class='muted'>امتیاز مدل: <b>{r['score']:.0f}</b> • اطمینان: <b>{r['confidence']:.0f}%</b> • ریسک تا حد ضرر: <b>{r['risk_pct']:.2f}%</b></div></div><div class='level-grid'><div class='level entry'><div class='level-k'>ورود</div><div class='level-v'>{money(r['entry'])}</div></div><div class='level sl'><div class='level-k'>حد ضرر</div><div class='level-v'>{money(r['sl'])}</div></div><div class='level tp'><div class='level-k'>Target 1</div><div class='level-v'>{money(r['t1'])}</div></div><div class='level tp'><div class='level-k'>Target 2</div><div class='level-v'>{money(r['t2'])}</div></div><div class='level tp'><div class='level-k'>Target 3</div><div class='level-v'>{money(r['t3'])}</div></div></div></div>",unsafe_allow_html=True)
+        st.stop()
 
 st.markdown('<div class="section-card">',unsafe_allow_html=True)
 st.markdown('<div class="section-title">بازار و انتخاب ارز</div>',unsafe_allow_html=True)
@@ -684,9 +774,9 @@ for r in sorted(results,key=lambda x:x["score"],reverse=True):
         for tf in TIMEFRAMES:
             a=r["analyses"].get(tf)
             if a:
-                rows.append({"تایم‌فریم":tf,"امتیاز":round(a["score"],1),"RSI":round(a["rsi"],1),"MACD":round(a["macd"],6),"Momentum %":round(a["momentum"],2),"ADX":round(a["adx"],1)})
+                rows.append({"تایم‌فریم":tf,"نوع معامله":tf_position(a["score"]),"امتیاز":round(a["score"],1),"RSI":round(a["rsi"],1),"MACD":round(a["macd"],6),"Momentum %":round(a["momentum"],2),"ADX":round(a["adx"],1)})
             else:
-                rows.append({"تایم‌فریم":tf,"امتیاز":"داده نیست","RSI":"-","MACD":"-","Momentum %":"-","ADX":"-"})
+                rows.append({"تایم‌فریم":tf,"نوع معامله":"داده نیست","امتیاز":"داده نیست","RSI":"-","MACD":"-","Momentum %":"-","ADX":"-"})
         st.dataframe(pd.DataFrame(rows),use_container_width=True,hide_index=True)
 
         st.markdown('**حمایت و مقاومت به تفکیک تایم‌فریم**')

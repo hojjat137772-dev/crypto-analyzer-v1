@@ -148,12 +148,28 @@ def extract_markets(data):
     return out
 
 
+def to_tabdeal_symbol(symbol):
+    """
+    Tabdeal's public API uses tabdealSymbol format, e.g. BTC_USDT,
+    while the UI/internal symbol is normalized as BTCUSDT.
+    """
+    s = norm_symbol(symbol)
+    if s.endswith("USDT"):
+        return s[:-4] + "_USDT"
+    if s.endswith("IRT"):
+        return s[:-3] + "_IRT"
+    return s
+
+
 @st.cache_data(ttl=15, show_spinner=False)
 def recent_trades(symbol, limit=1000):
     # Official public recent-trades endpoint.
+    # Important: tabdealSymbol uses the exchange's underscore format.
+    # Example: BTCUSDT -> BTC_USDT.
+    tabdeal_symbol = to_tabdeal_symbol(symbol)
     data = api_get(
         "/r/api/v1/trades",
-        {"tabdealSymbol": symbol, "limit": min(int(limit), 1000)},
+        {"tabdealSymbol": tabdeal_symbol, "limit": min(int(limit), 1000)},
     )
 
     if isinstance(data, dict):
@@ -630,7 +646,10 @@ with tab1:
         trades = pd.DataFrame()
 
     if trades.empty:
-        st.warning("برای این بازار داده معامله‌ای از API تبدیل دریافت نشد.")
+        st.warning(
+            f"برای {selected} داده معامله‌ای از API تبدیل دریافت نشد. "
+            f"شناسه ارسالی به Tabdeal: {to_tabdeal_symbol(selected)}"
+        )
     else:
         result = analyze_symbol(selected, trades)
         latest = trades["time"].max()

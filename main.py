@@ -1,3 +1,4 @@
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -5,37 +6,56 @@ import requests
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-st.set_page_config(page_title='Crypto Analyzer Pro', page_icon='₿', layout='wide', initial_sidebar_state='collapsed')
+# ============================================================
+# Crypto Analyzer Pro — Robust / Backtestable Edition
+# ============================================================
+# IMPORTANT:
+# - Spot mode is long-only by default. Short is disabled unless Futures mode is selected.
+# - "Confidence" is calibrated from historical out-of-sample-style rolling outcomes,
+#   not from an arbitrary score-to-percent formula.
+# - Forecast percentages are NOT fabricated from the score.
+# - Signals are generated only from CLOSED candles.
+# - Backtest enters on the NEXT candle open and includes configurable fee + slippage.
+# - If TP and SL are both touched in the same candle, the conservative assumption is SL first.
+# ============================================================
 
-# ============================================================
-# CONFIG
-# ============================================================
+st.set_page_config(
+    page_title="Crypto Analyzer Pro",
+    page_icon="₿",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
+
 TIMEFRAMES = {
-    '5m':'5m', '15m':'15m', '30m':'30m',
-    '1H':'1h', '2H':'2h', '4H':'4h', '6H':'6h', '12H':'12h',
-    '1D':'1d', '3D':'3d', '1W':'1w'
+    "5m": "5m", "15m": "15m", "30m": "30m",
+    "1H": "1h", "2H": "2h", "4H": "4h", "6H": "6h",
+    "12H": "12h", "1D": "1d", "3D": "3d", "1W": "1w"
 }
-BINANCE = 'https://api.binance.com'
-OKX = 'https://www.okx.com'
-BYBIT = 'https://api.bybit.com'
-KUCOIN = 'https://api.kucoin.com'
-WALLEX = 'https://api.wallex.ir'
-TABDEAL = 'https://api1.tabdeal.org'
-SESSION = requests.Session()
-SESSION.headers.update({'User-Agent':'CryptoAnalyzerPro/1.0'})
 
-# Official public Tabdeal market endpoint. It returns the complete spot market list.
+BINANCE = "https://api.binance.com"
+BINANCE_DATA = "https://data-api.binance.vision"
+TABDEAL = "https://api1.tabdeal.org"
+SESSION = requests.Session()
+SESSION.headers.update({"User-Agent": "CryptoAnalyzerPro/2.0"})
+
+# Trading assumptions. Change these in the sidebar.
+DEFAULT_FEE_PCT = 0.10
+DEFAULT_SLIPPAGE_PCT = 0.05
+DEFAULT_HORIZON_BARS = 24
+
 TABDEAL_MARKET_ENDPOINTS = [
-    '/r/api/v1/exchangeInfo',
-    '/api/v1/exchangeInfo',
-    '/v1/market/symbols',
-    '/v1/markets',
-    '/api/v1/markets',
+    "/r/api/v1/exchangeInfo",
+    "/api/v1/exchangeInfo",
+    "/v1/market/symbols",
+    "/v1/markets",
+    "/api/v1/markets",
 ]
 
+
 # ============================================================
-# HTTP / JSON HELPERS
+# HTTP
 # ============================================================
+@st.cache_data(ttl=60, show_spinner=False)
 def get_json(url, params=None, timeout=12):
     try:
         r = SESSION.get(url, params=params, timeout=timeout)
@@ -55,785 +75,839 @@ def flatten_dicts(obj):
             yield from flatten_dicts(x)
 
 
-def symbol_from_any(x):
-    if not isinstance(x, dict): return None
-    for k in ('symbol','market','pair','ticker','code'):
-        v = x.get(k)
-        if isinstance(v, str) and v:
-            return v.upper().replace('-', '').replace('_','').replace('/','')
-    return None
-
-
 def normalize_symbol(s):
-    return str(s).upper().replace('-', '').replace('_','').replace('/','')
+    return str(s).upper().replace("-", "").replace("_", "").replace("/", "")
 
 
 def base_asset(symbol):
     s = normalize_symbol(symbol)
-    return s[:-4] if s.endswith('USDT') else s
+    return s[:-4] if s.endswith("USDT") else s
 
 
 def money(value):
-    """Format a price/value safely for display."""
     try:
         v = float(value)
         if not np.isfinite(v):
-            return '-'
+            return "-"
         if abs(v) >= 1000:
-            return f'{v:,.2f}'
+            return f"{v:,.2f}"
         if abs(v) >= 1:
-            return f'{v:,.4f}'
+            return f"{v:,.4f}"
         if abs(v) >= 0.01:
-            return f'{v:,.6f}'
-        return f'{v:.10f}'.rstrip('0').rstrip('.')
-    except (TypeError, ValueError):
-        return '-'
+            return f"{v:,.6f}"
+        return f"{v:.10f}".rstrip("0").rstrip(".")
+    except Exception:
+        return "-"
+
 
 # ============================================================
-# TABDEAL — COMPLETE USDT MARKET UNIVERSE
+# MARKET UNIVERSE
 # ============================================================
 def tabdeal_markets():
-    """Return all active Tabdeal spot markets quoted in USDT.
-
-    The official exchangeInfo endpoint returns the complete market universe;
-    no fixed coin list is used.
-    """
     symbols = set()
-
     for ep in TABDEAL_MARKET_ENDPOINTS:
         data = get_json(TABDEAL + ep, timeout=15)
         if not data:
             continue
-
-        # Official response is normally a list of market dictionaries.
         for d in flatten_dicts(data):
             if not isinstance(d, dict):
                 continue
-
             raw = None
-            for key in ('symbol', 'tabdealSymbol', 'market', 'pair'):
-                v = d.get(key)
-                if isinstance(v, str) and v.strip():
-                    raw = v
+            for key in ("symbol", "tabdealSymbol", "market", "pair"):
+                if isinstance(d.get(key), str) and d.get(key).strip():
+                    raw = d[key]
                     break
-
             if not raw:
                 continue
-
             s = normalize_symbol(raw)
-            status = str(d.get('status', 'TRADING')).upper()
-            quote = str(d.get('quoteAsset', '')).upper()
-
-            # Accept explicit USDT markets, and also symbols ending in USDT
-            # when quoteAsset is absent in an alternative endpoint.
-            if (quote == 'USDT' or s.endswith('USDT')) and status in ('TRADING', 'ACTIVE', 'ENABLED', ''):
-                if s.endswith('USDT'):
+            status = str(d.get("status", "TRADING")).upper()
+            quote = str(d.get("quoteAsset", "")).upper()
+            if (quote == "USDT" or s.endswith("USDT")) and status in (
+                "TRADING", "ACTIVE", "ENABLED", ""
+            ):
+                if s.endswith("USDT"):
                     symbols.add(s)
-
-        # exchangeInfo is authoritative; stop after obtaining a real universe.
-        if len(symbols) > 0 and ('exchangeInfo' in ep):
+        if symbols and "exchangeInfo" in ep:
             break
-
     return sorted(symbols)
 
 
-@st.cache_data(ttl=120, show_spinner=False)
-def get_tabdeal_universe():
+@st.cache_data(ttl=180, show_spinner=False)
+def get_universe():
     syms = tabdeal_markets()
+    if syms:
+        return syms
 
-    # Dynamic fallback: if Tabdeal is temporarily unavailable, use Binance's
-    # live USDT spot universe instead of a small hard-coded coin list.
-    if not syms:
-        data = get_json(BINANCE + '/api/v3/exchangeInfo', timeout=15)
-        if isinstance(data, dict):
-            for d in data.get('symbols', []):
-                if not isinstance(d, dict):
-                    continue
-                if str(d.get('status', '')).upper() == 'TRADING' and str(d.get('quoteAsset', '')).upper() == 'USDT':
-                    s = normalize_symbol(d.get('symbol', ''))
-                    if s.endswith('USDT'):
-                        syms.append(s)
-
+    # Dynamic Binance fallback.
+    data = get_json(BINANCE_DATA + "/api/v3/exchangeInfo", timeout=15)
+    if isinstance(data, dict):
+        for d in data.get("symbols", []):
+            if (
+                str(d.get("status", "")).upper() == "TRADING"
+                and str(d.get("quoteAsset", "")).upper() == "USDT"
+            ):
+                s = normalize_symbol(d.get("symbol", ""))
+                if s.endswith("USDT"):
+                    syms.append(s)
     return sorted(set(syms))
 
+
 # ============================================================
-# BINANCE MARKET DATA
+# KLINES
 # ============================================================
-def _df_from_rows(rows, source):
+def rows_to_df(rows):
+    if not isinstance(rows, list) or len(rows) < 40:
+        return pd.DataFrame()
     try:
-        if source == 'binance':
-            cols=['open_time','open','high','low','close','volume','close_time','qv','trades','tbv','tqv','ignore']
-            df=pd.DataFrame(rows, columns=cols)
-            for c in ['open','high','low','close','volume']:
-                df[c]=pd.to_numeric(df[c], errors='coerce')
-            df['time']=pd.to_datetime(df['open_time'], unit='ms', utc=True)
-            return df[['time','open','high','low','close','volume']].dropna().sort_values('time').reset_index(drop=True)
-        if source == 'okx':
-            # OKX: ts, open, high, low, close, volume, ...
-            df=pd.DataFrame(rows)
-            if len(df.columns)<6: return pd.DataFrame()
-            df=df.iloc[:,:6]
-            df.columns=['time','open','high','low','close','volume']
-            df['time']=pd.to_datetime(pd.to_numeric(df['time']), unit='ms', utc=True)
-            for c in ['open','high','low','close','volume']:
-                df[c]=pd.to_numeric(df[c], errors='coerce')
-            return df.dropna().sort_values('time').reset_index(drop=True)
-        if source == 'bybit':
-            # Bybit: startTime, open, high, low, close, volume, turnover
-            df=pd.DataFrame(rows)
-            if len(df.columns)<6: return pd.DataFrame()
-            df=df.iloc[:,:6]
-            df.columns=['time','open','high','low','close','volume']
-            df['time']=pd.to_datetime(pd.to_numeric(df['time']), unit='ms', utc=True)
-            for c in ['open','high','low','close','volume']:
-                df[c]=pd.to_numeric(df[c], errors='coerce')
-            return df.dropna().sort_values('time').reset_index(drop=True)
-        if source == 'kucoin':
-            # KuCoin: time, open, close, high, low, volume, turnover
-            df=pd.DataFrame(rows)
-            if len(df.columns)<6: return pd.DataFrame()
-            df=df.iloc[:,:6]
-            df.columns=['time','open','close','high','low','volume']
-            df['time']=pd.to_datetime(pd.to_numeric(df['time']), unit='s', utc=True)
-            df['high']=pd.to_numeric(df['high'], errors='coerce')
-            df['low']=pd.to_numeric(df['low'], errors='coerce')
-            for c in ['open','close','volume']:
-                df[c]=pd.to_numeric(df[c], errors='coerce')
-            df=df[['time','open','high','low','close','volume']]
-            return df.dropna().sort_values('time').reset_index(drop=True)
+        df = pd.DataFrame(rows)
+        df = df.iloc[:, :6]
+        df.columns = ["time", "open", "high", "low", "close", "volume"]
+        # Binance API normally returns ms. Public archive/API can evolve, so infer.
+        t = pd.to_numeric(df["time"], errors="coerce")
+        unit = "us" if t.dropna().median() > 1e14 else "ms"
+        df["time"] = pd.to_datetime(t, unit=unit, utc=True)
+        for c in ["open", "high", "low", "close", "volume"]:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        return (
+            df.dropna()
+            .drop_duplicates("time")
+            .sort_values("time")
+            .reset_index(drop=True)
+        )
     except Exception:
         return pd.DataFrame()
-    return pd.DataFrame()
 
 
-def binance_klines(symbol, interval, limit=500):
-    data=get_json(BINANCE + '/api/v3/klines', {'symbol':symbol, 'interval':interval, 'limit':limit})
-    if isinstance(data,list) and len(data)>=40:
-        df=_df_from_rows(data,'binance')
-        if len(df)>=40: return df
-    return pd.DataFrame()
+@st.cache_data(ttl=30, show_spinner=False)
+def binance_klines(symbol, interval, limit=1000, end_time=None):
+    params = {
+        "symbol": symbol,
+        "interval": interval,
+        "limit": min(int(limit), 1000),
+    }
+    if end_time is not None:
+        params["endTime"] = int(end_time)
+    data = get_json(BINANCE_DATA + "/api/v3/klines", params, timeout=15)
+    return rows_to_df(data)
 
 
-def okx_klines(symbol, interval, limit=300):
-    bar={'5m':'5m','15m':'15m','30m':'30m','1h':'1H','2h':'2H','4h':'4H','6h':'6H','12h':'12H','1d':'1D','3d':'3D','1w':'1W'}.get(interval,interval)
-    inst=base_asset(symbol)+'-USDT'
-    d=get_json(OKX+'/api/v5/market/candles', {'instId':inst,'bar':bar,'limit':str(min(limit,300))})
-    rows=d.get('data',[]) if isinstance(d,dict) else []
-    return _df_from_rows(rows,'okx') if len(rows)>=40 else pd.DataFrame()
+def fetch_klines(symbol, interval, limit=1000):
+    return binance_klines(symbol, interval, limit)
 
 
-def bybit_klines(symbol, interval, limit=200):
-    iv={'5m':'5','15m':'15','30m':'30','1h':'60','2h':'120','4h':'240','6h':'360','12h':'720','1d':'D','3d':'3D','1w':'W'}.get(interval,interval)
-    d=get_json(BYBIT+'/v5/market/kline', {'category':'spot','symbol':symbol,'interval':iv,'limit':str(min(limit,200))})
-    rows=d.get('result',{}).get('list',[]) if isinstance(d,dict) else []
-    return _df_from_rows(rows,'bybit') if len(rows)>=40 else pd.DataFrame()
-
-
-def kucoin_klines(symbol, interval, limit=500):
-    typ={'5m':'5min','15m':'15min','30m':'30min','1h':'1hour','2h':'2hour','4h':'4hour','6h':'6hour','12h':'12hour','1d':'1day','3d':'3day','1w':'1week'}.get(interval,interval)
-    pair=base_asset(symbol)+'-USDT'
-    d=get_json(KUCOIN+'/api/v1/market/candles', {'symbol':pair,'type':typ})
-    rows=d.get('data',[]) if isinstance(d,dict) else []
-    df=_df_from_rows(rows,'kucoin') if len(rows)>=40 else pd.DataFrame()
-    return df.tail(limit).reset_index(drop=True) if not df.empty else df
-
-
-def market_klines(symbol, interval, limit=500):
-    # Primary + fallbacks. This is what lets Tabdeal-listed USDT coins
-    # still receive historical data when they are absent from Binance.
-    for fn in (
-        lambda: binance_klines(symbol,interval,limit),
-        lambda: okx_klines(symbol,interval,limit),
-        lambda: bybit_klines(symbol,interval,min(limit,200)),
-        lambda: kucoin_klines(symbol,interval,limit),
-    ):
-        try:
-            df=fn()
-            if not df.empty and len(df)>=40:
-                return df
-        except Exception:
-            pass
-    return pd.DataFrame()
-
-
-def binance_price(symbol):
-    d=get_json(BINANCE + '/api/v3/ticker/price', {'symbol':symbol})
-    try: return float(d['price'])
-    except Exception: return None
-
-# ============================================================
-# WALLEX PUBLIC DATA
-# ============================================================
-def wallex_markets():
-    data=get_json(WALLEX + '/v1/markets')
-    out={}
-    try:
-        syms=data['result']['symbols']
-        for s,d in syms.items():
-            if normalize_symbol(s).endswith('USDT'): out[normalize_symbol(s)]=d
-    except Exception: pass
+def resample_from_1h(df, rule):
+    if df.empty:
+        return df
+    x = df.set_index("time").sort_index()
+    out = x.resample(rule).agg({
+        "open": "first",
+        "high": "max",
+        "low": "min",
+        "close": "last",
+        "volume": "sum",
+    }).dropna().reset_index()
     return out
 
-@st.cache_data(ttl=120, show_spinner=False)
-def wallex_currency_stats():
-    data=get_json(WALLEX + '/v1/currencies/stats')
-    rows={}
-    if isinstance(data,dict):
-        arr=data.get('result', data.get('data', []))
-        if isinstance(arr,list):
-            for x in arr:
-                if isinstance(x,dict) and x.get('key'): rows[str(x['key']).upper()]=x
-    return rows
 
+def get_tf_data(symbol, tf, limit=1000):
+    iv = TIMEFRAMES[tf]
+    # Binance natively supports all requested intervals.
+    df = fetch_klines(symbol, iv, limit)
+    if len(df) >= 80:
+        return df
 
-def wallex_klines(symbol, resolution='60', days=12):
-    end=int(time.time())
-    start=end-days*86400
-    d=get_json(WALLEX + '/v1/udf/history', {'symbol':symbol,'resolution':resolution,'from':start,'to':end})
-    if not isinstance(d,dict) or d.get('s')!='ok': return pd.DataFrame()
-    try:
-        df=pd.DataFrame({'time':pd.to_datetime(d['t'],unit='s',utc=True),'open':pd.to_numeric(d['o']),'high':pd.to_numeric(d['h']),'low':pd.to_numeric(d['l']),'close':pd.to_numeric(d['c']),'volume':pd.to_numeric(d['v'])})
-        return df.dropna().reset_index(drop=True)
-    except Exception: return pd.DataFrame()
+    # Fallback aggregation for larger intervals if a provider rejects one.
+    if tf in ("2H", "6H", "12H", "3D"):
+        base = fetch_klines(symbol, "1h" if tf != "3D" else "1d", 1000)
+        rules = {"2H": "2h", "6H": "6h", "12H": "12h", "3D": "3D"}
+        if len(base) >= 80:
+            return resample_from_1h(base, rules[tf])
+    return pd.DataFrame()
 
-
-def alternate_price(symbol):
-    checks=[
-        (OKX+'/api/v5/market/ticker', {'instId':base_asset(symbol)+'-USDT'}, lambda d: d.get('data',[{}])[0].get('last')),
-        (BYBIT+'/v5/market/tickers', {'category':'spot','symbol':symbol}, lambda d: d.get('result',{}).get('list',[{}])[0].get('lastPrice')),
-        (KUCOIN+'/api/v1/market/orderbook/level1', {'symbol':base_asset(symbol)+'-USDT'}, lambda d: d.get('data',{}).get('price')),
-    ]
-    for url,params,getter in checks:
-        try:
-            d=get_json(url,params,timeout=8)
-            v=getter(d) if isinstance(d,dict) else None
-            if v is not None: return float(v)
-        except Exception: pass
-    return None
-
-def wallex_price(symbol):
-    markets=wallex_markets()
-    d=markets.get(symbol)
-    try: return float(d['stats']['lastPrice'])
-    except Exception: return None
 
 # ============================================================
-# MULTI-SOURCE PRICE CONSENSUS
+# INDICATORS
 # ============================================================
-def source_prices(symbol):
-    vals={}
-    p=binance_price(symbol)
-    if p: vals['بایننس']=p
-    p=wallex_price(symbol)
-    if p: vals['والکس']=p
-    p=alternate_price(symbol)
-    if p: vals['بازارهای جایگزین']=p
-    # Tabdeal current price: try ticker-like endpoints.
-    base=base_asset(symbol)
-    for ep in ['/v1/ticker/24hr','/v1/market/stats','/v1/market/ticker','/v1/markets']:
-        d=get_json(TABDEAL+ep, {'symbol':symbol})
-        found=None
-        for x in flatten_dicts(d):
-            s=symbol_from_any(x)
-            if s==symbol:
-                for k in ('lastPrice','last_price','price','last','close'):
-                    try:
-                        if x.get(k) is not None: found=float(x[k]); break
-                    except Exception: pass
-        if found:
-            vals['تبدیل']=found; break
-    return vals
+def ema(s, n):
+    return s.ewm(span=n, adjust=False).mean()
 
-# ============================================================
-# TECHNICAL INDICATORS
-# ============================================================
-def ema(s,n): return s.ewm(span=n, adjust=False).mean()
-def sma(s,n): return s.rolling(n).mean()
 
-def rsi(close,n=14):
-    delta=close.diff()
-    gain=delta.clip(lower=0).ewm(alpha=1/n,adjust=False).mean()
-    loss=(-delta.clip(upper=0)).ewm(alpha=1/n,adjust=False).mean()
-    rs=gain/(loss.replace(0,np.nan))
-    return (100-(100/(1+rs))).fillna(50)
+def rsi(close, n=14):
+    delta = close.diff()
+    gain = delta.clip(lower=0).ewm(alpha=1 / n, adjust=False).mean()
+    loss = (-delta.clip(upper=0)).ewm(alpha=1 / n, adjust=False).mean()
+    rs = gain / loss.replace(0, np.nan)
+    return (100 - 100 / (1 + rs)).fillna(50)
+
 
 def macd(close):
-    line=ema(close,12)-ema(close,26)
-    signal=ema(line,9)
-    return line,signal,line-signal
+    line = ema(close, 12) - ema(close, 26)
+    signal = ema(line, 9)
+    return line, signal, line - signal
 
-def atr(df,n=14):
-    pc=df.close.shift(1)
-    tr=pd.concat([(df.high-df.low),(df.high-pc).abs(),(df.low-pc).abs()],axis=1).max(axis=1)
-    return tr.ewm(alpha=1/n,adjust=False).mean()
 
-def stochastic(df,n=14):
-    lo=df.low.rolling(n).min(); hi=df.high.rolling(n).max()
-    k=100*(df.close-lo)/(hi-lo).replace(0,np.nan)
-    return k.fillna(50)
+def atr(df, n=14):
+    pc = df.close.shift(1)
+    tr = pd.concat([
+        df.high - df.low,
+        (df.high - pc).abs(),
+        (df.low - pc).abs()
+    ], axis=1).max(axis=1)
+    return tr.ewm(alpha=1 / n, adjust=False).mean()
 
-def adx(df,n=14):
-    up=df.high.diff(); down=-df.low.diff()
-    plus=np.where((up>down)&(up>0),up,0.0); minus=np.where((down>up)&(down>0),down,0.0)
-    a=atr(df,n)
-    pdi=100*pd.Series(plus,index=df.index).ewm(alpha=1/n,adjust=False).mean()/a.replace(0,np.nan)
-    mdi=100*pd.Series(minus,index=df.index).ewm(alpha=1/n,adjust=False).mean()/a.replace(0,np.nan)
-    dx=100*(pdi-mdi).abs()/(pdi+mdi).replace(0,np.nan)
-    return dx.ewm(alpha=1/n,adjust=False).mean().fillna(20)
+
+def adx(df, n=14):
+    up = df.high.diff()
+    down = -df.low.diff()
+    plus = pd.Series(
+        np.where((up > down) & (up > 0), up, 0.0), index=df.index
+    )
+    minus = pd.Series(
+        np.where((down > up) & (down > 0), down, 0.0), index=df.index
+    )
+    a = atr(df, n).replace(0, np.nan)
+    pdi = 100 * plus.ewm(alpha=1 / n, adjust=False).mean() / a
+    mdi = 100 * minus.ewm(alpha=1 / n, adjust=False).mean() / a
+    dx = 100 * (pdi - mdi).abs() / (pdi + mdi).replace(0, np.nan)
+    return dx.ewm(alpha=1 / n, adjust=False).mean().fillna(20)
+
 
 def ichimoku(df):
-    h9=df.high.rolling(9).max(); l9=df.low.rolling(9).min()
-    h26=df.high.rolling(26).max(); l26=df.low.rolling(26).min()
-    h52=df.high.rolling(52).max(); l52=df.low.rolling(52).min()
-    ten=(h9+l9)/2; kij=(h26+l26)/2
-    span_a=(ten+kij)/2; span_b=(h52+l52)/2
-    return ten,kij,span_a,span_b
-
-# ============================================================
-# PRICE ACTION / SUPPORT / RESISTANCE
-# ============================================================
-def pivots(df, window=3):
-    highs=df.high[(df.high==df.high.rolling(window*2+1,center=True).max())]
-
-    lows=df.low[(df.low==df.low.rolling(window*2+1,center=True).min())]
-    return highs.dropna(), lows.dropna()
-
-
-def levels(df):
-    highs,lows=pivots(df.tail(180),3)
-    price=float(df.close.iloc[-1])
-    supports=[float(x) for x in lows if x<price]
-    resistances=[float(x) for x in highs if x>price]
-    supports=sorted(supports,reverse=True)[:4]
-    resistances=sorted(resistances)[:4]
-    return supports,resistances
+    h9, l9 = df.high.rolling(9).max(), df.low.rolling(9).min()
+    h26, l26 = df.high.rolling(26).max(), df.low.rolling(26).min()
+    h52, l52 = df.high.rolling(52).max(), df.low.rolling(52).min()
+    tenkan = (h9 + l9) / 2
+    kijun = (h26 + l26) / 2
+    span_a = (tenkan + kijun) / 2
+    span_b = (h52 + l52) / 2
+    return tenkan, kijun, span_a, span_b
 
 
 def price_action_score(df):
-    if len(df)<20:return 0
-    c=df.iloc[-1]; p=df.iloc[-2]
-    rng=max(c.high-c.low,1e-12)
-    body=abs(c.close-c.open)
-    upper=c.high-max(c.open,c.close); lower=min(c.open,c.close)-c.low
-    score=0
-    if c.close>c.open: score+=8
-    if c.close>p.high: score+=12
-    if c.close<p.low: score-=12
-    if lower>body*1.5 and c.close>c.open: score+=8
-    if upper>body*1.5 and c.close<c.open: score-=8
-    if body/rng>0.65 and c.close>c.open: score+=6
-    if body/rng>0.65 and c.close<c.open: score-=6
-    return float(np.clip(score,-25,25))
+    if len(df) < 20:
+        return 0.0
+    c, p = df.iloc[-1], df.iloc[-2]
+    rng = max(float(c.high - c.low), 1e-12)
+    body = abs(float(c.close - c.open))
+    upper = float(c.high - max(c.open, c.close))
+    lower = float(min(c.open, c.close) - c.low)
+    score = 0
+    if c.close > c.open:
+        score += 7
+    else:
+        score -= 7
+    if c.close > p.high:
+        score += 12
+    if c.close < p.low:
+        score -= 12
+    if lower > body * 1.5 and c.close > c.open:
+        score += 7
+    if upper > body * 1.5 and c.close < c.open:
+        score -= 7
+    if body / rng > 0.65:
+        score += 5 if c.close > c.open else -5
+    return float(np.clip(score, -25, 25))
+
+
+def structure_levels(df, lookback=120):
+    if df.empty:
+        return [], []
+    x = df.tail(lookback)
+    price = float(x.close.iloc[-1])
+    high_roll = x.high.rolling(7, center=True).max()
+    low_roll = x.low.rolling(7, center=True).min()
+    highs = x.high[high_roll.eq(x.high)].dropna().tolist()
+    lows = x.low[low_roll.eq(x.low)].dropna().tolist()
+    supports = sorted([v for v in lows if v < price], reverse=True)[:4]
+    resistances = sorted([v for v in highs if v > price])[:4]
+    return [float(v) for v in supports], [float(v) for v in resistances]
+
 
 # ============================================================
-# ANALYSIS ENGINE
+# SINGLE-TF SIGNAL
 # ============================================================
-def timeframe_analysis(df):
-    if len(df)<80: return None
-    close=df.close
-    r=rsi(close).iloc[-1]
-    ml,ms,mh=macd(close)
-    mac=ml.iloc[-1]; sig=ms.iloc[-1]; hist=mh.iloc[-1]
-    at=atr(df).iloc[-1]
-    ad=adx(df).iloc[-1]
-    ten,kij,sa,sb=ichimoku(df)
-    price=close.iloc[-1]
-    cloud=max(sa.iloc[-1],sb.iloc[-1]); cloud_low=min(sa.iloc[-1],sb.iloc[-1])
-    score=0; reasons=[]
-    if price>cloud: score+=18; reasons.append('قیمت بالای ایچیموکو')
-    elif price<cloud_low: score-=18; reasons.append('قیمت زیر ایچیموکو')
-    else: reasons.append('قیمت داخل کلود')
-    if ten.iloc[-1]>kij.iloc[-1]: score+=10; reasons.append('تنکن بالای کیجون')
-    else: score-=10
-    if mac>sig: score+=14; reasons.append('MACD صعودی')
-    else: score-=14
-    if hist>0 and hist>mh.iloc[-2]: score+=5
-    elif hist<0 and hist<mh.iloc[-2]: score-=5
-    if 50<r<70: score+=10; reasons.append('RSI سالم صعودی')
-    elif r>=75: score-=5; reasons.append('RSI داغ')
-    elif r<30: score+=4; reasons.append('RSI اشباع فروش')
-    elif r<45: score-=7
-    mom=(close.iloc[-1]/close.iloc[-min(13,len(close))]-1)*100
-    score+=float(np.clip(mom*2,-15,15))
-    if mom>0: reasons.append('مومنتوم مثبت')
-    if ad>25:
-        score += 8 if price>kij.iloc[-1] else -8
-    score+=price_action_score(df)
-    return {'score':float(np.clip(score,-100,100)),'rsi':float(r),'macd':float(mac),'signal':float(sig),'momentum':float(mom),'adx':float(ad),'atr':float(at),'price':float(price),'reasons':reasons,'tenkan':float(ten.iloc[-1]),'kijun':float(kij.iloc[-1]),'cloud_top':float(cloud),'cloud_bottom':float(cloud_low)}
+def tf_signal(df):
+    if len(df) < 80:
+        return None
+
+    close = df.close
+    r = float(rsi(close).iloc[-1])
+    ml, ms, mh = macd(close)
+    mac, sig, hist = float(ml.iloc[-1]), float(ms.iloc[-1]), float(mh.iloc[-1])
+    at = float(atr(df).iloc[-1])
+    ad = float(adx(df).iloc[-1])
+    ten, kij, sa, sb = ichimoku(df)
+    price = float(close.iloc[-1])
+
+    cloud_top = max(float(sa.iloc[-1]), float(sb.iloc[-1]))
+    cloud_bottom = min(float(sa.iloc[-1]), float(sb.iloc[-1]))
+
+    score = 0.0
+    reasons = []
+
+    # Trend / Ichimoku
+    if price > cloud_top:
+        score += 20
+        reasons.append("بالای کلود")
+    elif price < cloud_bottom:
+        score -= 20
+        reasons.append("زیر کلود")
+    else:
+        reasons.append("داخل کلود")
+
+    if float(ten.iloc[-1]) > float(kij.iloc[-1]):
+        score += 9
+        reasons.append("تنکن بالای کیجون")
+    else:
+        score -= 9
+
+    # MACD
+    if mac > sig:
+        score += 13
+        reasons.append("MACD صعودی")
+    else:
+        score -= 13
+        reasons.append("MACD نزولی")
+
+    if hist > 0 and hist > float(mh.iloc[-2]):
+        score += 5
+    elif hist < 0 and hist < float(mh.iloc[-2]):
+        score -= 5
+
+    # RSI: avoid buying an already extreme RSI.
+    if 52 <= r <= 68:
+        score += 9
+        reasons.append("RSI مناسب")
+    elif 68 < r < 75:
+        score += 3
+        reasons.append("RSI نسبتاً داغ")
+    elif r >= 75:
+        score -= 7
+        reasons.append("RSI بسیار داغ")
+    elif r <= 30:
+        score += 2
+        reasons.append("اشباع فروش")
+    elif r < 45:
+        score -= 6
+
+    mom = float((close.iloc[-1] / close.iloc[-13] - 1) * 100)
+    score += float(np.clip(mom * 2.0, -12, 12))
+
+    if ad >= 25:
+        score += 7 if price > float(kij.iloc[-1]) else -7
+    else:
+        # Low ADX = less confidence in trend-following signals.
+        score *= 0.92
+
+    score += price_action_score(df)
+
+    return {
+        "score": float(np.clip(score, -100, 100)),
+        "rsi": r,
+        "macd": mac,
+        "signal": sig,
+        "momentum": mom,
+        "adx": ad,
+        "atr": at,
+        "price": price,
+        "reasons": reasons,
+    }
 
 
+# ============================================================
+# MULTI-TIMEFRAME CURRENT ANALYSIS
+# ============================================================
+TF_WEIGHTS = {
+    "5m": 0.35, "15m": 0.60, "30m": 0.75,
+    "1H": 1.10, "2H": 1.25, "4H": 1.55,
+    "6H": 1.35, "12H": 1.25, "1D": 1.45,
+    "3D": 1.05, "1W": 0.85,
+}
 
-def tf_position(score):
-    if score >= 18:
-        return 'لانگ'
-    if score <= -18:
-        return 'شورت'
-    return 'صبر'
 
-
-def quick_scan(symbol):
-    """Fast whole-market screening; full analysis runs only for strongest candidates."""
-    scan_tfs = ['15m','1H','4H','1D']
-    weights = {'15m':0.8,'1H':1.2,'4H':1.6,'1D':1.35}
-    analyses = {}
-    for tf in scan_tfs:
-        df = market_klines(symbol, TIMEFRAMES[tf], 180)
-        if df.empty and tf in ('1H','4H'):
-            df = wallex_klines(symbol, '60', 12)
-            if tf == '4H' and not df.empty:
-                df = df.set_index('time').resample('4h').agg({'open':'first','high':'max','low':'min','close':'last','volume':'sum'}).dropna().reset_index()
-        if not df.empty:
-            a = timeframe_analysis(df)
-            if a:
-                analyses[tf] = a
+def aggregate_score(analyses):
     if not analyses:
         return None
-    total = sum(weights.get(tf,1) for tf in analyses)
-    score = sum(a['score']*weights.get(tf,1) for tf,a in analyses.items()) / total
-    ref = analyses.get('4H', analyses.get('1H', next(iter(analyses.values()))))
-    price = ref['price']
-    df4 = market_klines(symbol, '4h', 180)
-    if df4.empty:
-        df4 = market_klines(symbol, '1h', 180)
-    supports, resistances = levels(df4) if not df4.empty else ([],[])
-    return {'symbol':symbol,'score':float(score),'position':tf_position(score),'price':float(price),'supports':supports,'resistances':resistances,'analyses':analyses,'coverage':len(analyses)}
+    total_w = sum(TF_WEIGHTS.get(tf, 1.0) for tf in analyses)
+    weighted = sum(
+        a["score"] * TF_WEIGHTS.get(tf, 1.0)
+        for tf, a in analyses.items()
+    ) / total_w
 
-def aggregate(symbol):
-    frames={}
-    # Analyze the full practical multi-timeframe set. The core decision still gives
-    # extra weight to 1H/4H/1D, while every available timeframe is displayed separately.
-    for tf,iv in TIMEFRAMES.items():
-        df=market_klines(symbol,iv,500)
-        if df.empty and tf in ('1H','4H'):
-            df=wallex_klines(symbol,'60',14)
-            if tf=='4H' and not df.empty:
-                x=df.set_index('time').resample('4h').agg({'open':'first','high':'max','low':'min','close':'last','volume':'sum'}).dropna().reset_index()
-                df=x
-        frames[tf]=df
-    analyses={tf:timeframe_analysis(df) for tf,df in frames.items() if not df.empty}
-    analyses={k:v for k,v in analyses.items() if v}
-    if not analyses: return None
-    weights={'5m':0.45,'15m':0.75,'30m':0.9,'1H':1.15,'2H':1.25,'4H':1.5,'6H':1.35,'12H':1.25,'1D':1.35,'3D':1.0,'1W':0.9}
-    total=sum(weights.get(k,1.0) for k in analyses)
-    tech=sum(v['score']*weights.get(k,1.0) for k,v in analyses.items())/total
-    p=analyses.get('15m',analyses.get('1H'))['price']
-    source=source_prices(symbol)
-    consensus=np.mean(list(source.values())) if source else p
-    # Fundamental/market-context score from Wallex public currency stats when available.
-    stats=wallex_currency_stats().get(base_asset(symbol),{})
-    fscore=0
-    if stats:
-        rank=stats.get('rank'); dom=stats.get('dominance'); vol=stats.get('volume_24h'); mcap=stats.get('market_cap')
-        try:
-            if rank and float(rank)<=20: fscore+=10
-            elif rank and float(rank)<=100: fscore+=5
-            if dom and float(dom)>0.01: fscore+=3
-            if vol and mcap and float(mcap)>0 and float(vol)/float(mcap)>0.05: fscore+=5
-        except Exception: pass
-    # Market-source agreement bonus.
-    agreement=0
-    if len(source)>=2:
-        arr=np.array(list(source.values()),dtype=float)
-        dispersion=np.std(arr)/max(np.mean(arr),1e-12)*100
-        if dispersion<0.3: agreement=8
-        elif dispersion<0.8: agreement=4
-        elif dispersion>2: agreement=-5
-    final_score=float(np.clip(tech*0.78+fscore*0.22+agreement,-100,100))
-    confidence=float(np.clip(50+abs(final_score)*0.42 + (6 if len(analyses)>=8 else 3 if len(analyses)>=5 else 0) + max(0,agreement),50,96))
-    bullish=final_score>=18
-    bearish=final_score<=-18
-    decision='معامله کن' if bullish or bearish else 'صبر کن'
-    position='لانگ' if bullish else ('شورت' if bearish else 'بدون پوزیشن')
-    atrv=analyses.get('4H',analyses.get('1H',next(iter(analyses.values()))))['atr']
-    # Conservative levels based on ATR and recent structure.
-    all_df=frames.get('4H') if not frames.get('4H',pd.DataFrame()).empty else frames.get('1H')
-    supports,resistances=levels(all_df) if all_df is not None and not all_df.empty else ([],[])
-    sr_by_tf={}
-    for tf,df in frames.items():
-        if df is not None and not df.empty:
-            ss,rr=levels(df)
-            sr_by_tf[tf]={'supports':ss,'resistances':rr}
-    entry=consensus
-    if bullish:
-        sl=(supports[0] if supports and supports[0]<entry else entry-1.35*atrv)
-        if sl>=entry: sl=entry-1.35*atrv
-        risk=max(entry-sl,entry*0.006)
-        t1=entry+1.6*risk; t2=entry+2.6*risk; t3=entry+3.8*risk
-    elif bearish:
-        sl=(resistances[0] if resistances and resistances[0]>entry else entry+1.35*atrv)
-        if sl<=entry: sl=entry+1.35*atrv
-        risk=max(sl-entry,entry*0.006)
-        t1=entry-1.6*risk; t2=entry-2.6*risk; t3=entry-3.8*risk
-    else:
-        sl=entry-1.2*atrv; risk=abs(entry-sl); t1=entry+1.5*risk; t2=entry+2.5*risk; t3=entry+3.5*risk
-    expected_4h=float(np.clip(final_score*0.055, -9, 9))
-    expected_24h=float(np.clip(final_score*0.11, -18, 18))
-    expected_72h=float(np.clip(final_score*0.18, -30, 30))
-    forecast={
-        '4H':entry*(1+expected_4h/100),
-        '24H':entry*(1+expected_24h/100),
-        '72H':entry*(1+expected_72h/100),
-    }
-    return {'symbol':symbol,'price':entry,'sources':source,'analyses':analyses,'technical':tech,'fundamental':fscore,'agreement':agreement,'score':final_score,'confidence':confidence,'decision':decision,'position':position,'entry':entry,'sl':sl,'t1':t1,'t2':t2,'t3':t3,'risk_pct':abs(entry-sl)/entry*100,'supports':supports,'resistances':resistances,'sr_by_tf':sr_by_tf,'forecast':forecast,'forecast_pct':{'4H':expected_4h,'24H':expected_24h,'72H':expected_72h}}
+    # Agreement between the important timeframes.
+    core = [
+        analyses[tf]["score"]
+        for tf in ("1H", "4H", "1D")
+        if tf in analyses
+    ]
+    agreement_bonus = 0.0
+    if len(core) >= 2:
+        same_bull = all(x >= 10 for x in core)
+        same_bear = all(x <= -10 for x in core)
+        if same_bull or same_bear:
+            agreement_bonus = 8
+        elif any(x > 10 for x in core) and any(x < -10 for x in core):
+            agreement_bonus = -8
+
+    final = float(np.clip(weighted + agreement_bonus, -100, 100))
+    return final
+
+
+def position_from_score(score, mode="SPOT"):
+    if mode == "SPOT":
+        return "لانگ" if score >= 24 else "صبر"
+    return "لانگ" if score >= 24 else ("شورت" if score <= -24 else "صبر")
+
 
 # ============================================================
-# UI — MOBILE / CARD LAYOUT
+# HISTORICAL SIGNAL ENGINE FOR CALIBRATION
+# ============================================================
+def historical_signal_score(df, idx):
+    """Signal using only rows <= idx. No future candles are used."""
+    if idx < 100:
+        return None
+
+    x = df.iloc[:idx + 1].copy()
+    a = tf_signal(x)
+    if not a:
+        return None
+    return float(a["score"])
+
+
+def simulate_trade(df, signal_idx, direction, fee_pct, slippage_pct,
+                    horizon_bars=24, rr1=1.6, rr2=2.6):
+    """
+    Entry = next candle open.
+    SL/TP calculated from information available at signal candle only.
+    Conservative same-candle collision: SL first.
+    """
+    if signal_idx + 1 >= len(df):
+        return None
+
+    sig = df.iloc[signal_idx]
+    entry_raw = float(df.iloc[signal_idx + 1].open)
+
+    atrv = float(atr(df.iloc[:signal_idx + 1]).iloc[-1])
+    if not np.isfinite(atrv) or atrv <= 0:
+        return None
+
+    supports, resistances = structure_levels(df.iloc[:signal_idx + 1])
+    if direction == "LONG":
+        entry = entry_raw * (1 + slippage_pct / 100)
+        candidate_sl = supports[0] if supports and supports[0] < entry else entry - 1.35 * atrv
+        sl = min(candidate_sl, entry - 0.006 * entry)
+        risk = max(entry - sl, 0.006 * entry)
+        tp1 = entry + rr1 * risk
+        tp2 = entry + rr2 * risk
+    else:
+        entry = entry_raw * (1 - slippage_pct / 100)
+        candidate_sl = resistances[0] if resistances and resistances[0] > entry else entry + 1.35 * atrv
+        sl = max(candidate_sl, entry + 0.006 * entry)
+        risk = max(sl - entry, 0.006 * entry)
+        tp1 = entry - rr1 * risk
+        tp2 = entry - rr2 * risk
+
+    end = min(len(df), signal_idx + 1 + horizon_bars)
+    result = "TIMEOUT"
+    exit_price = float(df.iloc[end - 1].close)
+    exit_idx = end - 1
+    tp1_hit = False
+    tp2_hit = False
+
+    for j in range(signal_idx + 1, end):
+        bar = df.iloc[j]
+        hi, lo = float(bar.high), float(bar.low)
+
+        if direction == "LONG":
+            hit_sl = lo <= sl
+            hit_tp1 = hi >= tp1
+            hit_tp2 = hi >= tp2
+
+            # Conservative ordering when both occur in one candle.
+            if hit_sl:
+                result = "SL"
+                exit_price = sl
+                exit_idx = j
+                break
+            if hit_tp2:
+                result = "TP2"
+                exit_price = tp2
+                exit_idx = j
+                tp1_hit = True
+                tp2_hit = True
+                break
+            if hit_tp1:
+                result = "TP1"
+                exit_price = tp1
+                exit_idx = j
+                tp1_hit = True
+                break
+        else:
+            hit_sl = hi >= sl
+            hit_tp1 = lo <= tp1
+            hit_tp2 = lo <= tp2
+            if hit_sl:
+                result = "SL"
+                exit_price = sl
+                exit_idx = j
+                break
+            if hit_tp2:
+                result = "TP2"
+                exit_price = tp2
+                exit_idx = j
+                tp1_hit = True
+                tp2_hit = True
+                break
+            if hit_tp1:
+                result = "TP1"
+                exit_price = tp1
+                exit_idx = j
+                tp1_hit = True
+                break
+
+    # Approximate round-trip costs.
+    cost = 2 * (fee_pct + slippage_pct) / 100
+    gross_return = (
+        (exit_price / entry - 1) if direction == "LONG"
+        else (entry / exit_price - 1)
+    )
+    net_return = gross_return - cost
+
+    return {
+        "signal_idx": signal_idx,
+        "exit_idx": exit_idx,
+        "direction": direction,
+        "entry": entry,
+        "sl": sl,
+        "tp1": tp1,
+        "tp2": tp2,
+        "result": result,
+        "tp1_hit": tp1_hit,
+        "tp2_hit": tp2_hit,
+        "net_return": float(net_return),
+        "bars_held": int(exit_idx - signal_idx),
+        "score": None,
+    }
+
+
+def backtest_1h(symbol, fee_pct=0.10, slippage_pct=0.05,
+                horizon_bars=24, min_score=24, max_trades=180):
+    """
+    Rolling historical test on 1H data.
+    This deliberately tests the same core signal on unseen future candles.
+    """
+    df = fetch_klines(symbol, "1h", 1000)
+    if len(df) < 300:
+        return None
+
+    trades = []
+    # Step through history; skip ahead after a trade to reduce overlapping signals.
+    i = 120
+    while i < len(df) - horizon_bars - 2 and len(trades) < max_trades:
+        score = historical_signal_score(df, i)
+        if score is None:
+            i += 1
+            continue
+
+        # Calibration is for long-only Spot by default.
+        if score >= min_score:
+            tr = simulate_trade(
+                df, i, "LONG",
+                fee_pct, slippage_pct,
+                horizon_bars=horizon_bars
+            )
+            if tr:
+                tr["score"] = score
+                trades.append(tr)
+                # Avoid counting every consecutive candle as a separate position.
+                i = tr["exit_idx"] + 1
+                continue
+        i += 1
+
+    if not trades:
+        return None
+
+    t = pd.DataFrame(trades)
+    wins = t["net_return"] > 0
+    tp1 = t["tp1_hit"].mean()
+    tp2 = t["tp2_hit"].mean()
+    win_rate = wins.mean()
+
+    gross_profit = t.loc[t.net_return > 0, "net_return"].sum()
+    gross_loss = -t.loc[t.net_return < 0, "net_return"].sum()
+    pf = gross_profit / gross_loss if gross_loss > 0 else np.inf
+
+    equity = (1 + t["net_return"]).cumprod()
+    peak = equity.cummax()
+    dd = equity / peak - 1
+    max_dd = float(dd.min())
+
+    expectancy = float(t["net_return"].mean())
+
+    # Empirical confidence: smoothed TP1 probability.
+    # Beta(1,1) prior prevents 100% with tiny sample sizes.
+    n = len(t)
+    successes = int(t["tp1_hit"].sum())
+    calibrated_tp1 = (successes + 1) / (n + 2)
+
+    return {
+        "symbol": symbol,
+        "trades": n,
+        "win_rate": float(win_rate),
+        "tp1_rate": float(tp1),
+        "tp2_rate": float(tp2),
+        "calibrated_tp1": float(calibrated_tp1),
+        "profit_factor": float(pf) if np.isfinite(pf) else 999.0,
+        "max_drawdown": max_dd,
+        "expectancy": expectancy,
+        "net_return": float(equity.iloc[-1] - 1),
+        "trades_df": t,
+    }
+
+
+# ============================================================
+# LIVE ANALYSIS
+# ============================================================
+@st.cache_data(ttl=60, show_spinner=False)
+def analyze_symbol(symbol, mode="SPOT", fee_pct=0.10, slippage_pct=0.05):
+    frames = {}
+    for tf in TIMEFRAMES:
+        df = get_tf_data(symbol, tf, 1000)
+        if len(df) >= 80:
+            frames[tf] = df
+
+    if not frames:
+        return None
+
+    analyses = {
+        tf: tf_signal(df)
+        for tf, df in frames.items()
+        if tf_signal(df) is not None
+    }
+    if not analyses:
+        return None
+
+    score = aggregate_score(analyses)
+    position = position_from_score(score, mode)
+
+    # Use 4H for risk structure where available.
+    ref_tf = "4H" if "4H" in frames else ("1H" if "1H" in frames else next(iter(frames)))
+    ref_df = frames[ref_tf]
+    ref_a = analyses[ref_tf]
+    entry = float(ref_df.close.iloc[-1])
+    atrv = float(ref_a["atr"])
+
+    supports, resistances = structure_levels(ref_df)
+
+    if position == "لانگ":
+        sl = supports[0] if supports and supports[0] < entry else entry - 1.35 * atrv
+        sl = min(sl, entry - 0.006 * entry)
+        risk = max(entry - sl, 0.006 * entry)
+        tp1 = entry + 1.6 * risk
+        tp2 = entry + 2.6 * risk
+        tp3 = entry + 3.8 * risk
+    elif position == "شورت":
+        sl = resistances[0] if resistances and resistances[0] > entry else entry + 1.35 * atrv
+        sl = max(sl, entry + 0.006 * entry)
+        risk = max(sl - entry, 0.006 * entry)
+        tp1 = entry - 1.6 * risk
+        tp2 = entry - 2.6 * risk
+        tp3 = entry - 3.8 * risk
+    else:
+        sl = entry - 1.35 * atrv
+        risk = abs(entry - sl)
+        tp1 = entry + 1.6 * risk
+        tp2 = entry + 2.6 * risk
+        tp3 = entry + 3.8 * risk
+
+    # Historical calibration is separate from current technical score.
+    bt = backtest_1h(
+        symbol,
+        fee_pct=fee_pct,
+        slippage_pct=slippage_pct,
+        horizon_bars=DEFAULT_HORIZON_BARS,
+        min_score=24,
+    )
+
+    if bt:
+        calibrated_conf = 100 * bt["calibrated_tp1"]
+        sample_note = f"بر اساس {bt['trades']} معامله تاریخی 1H"
+    else:
+        calibrated_conf = np.nan
+        sample_note = "داده تاریخی کافی برای کالیبراسیون موجود نیست"
+
+    # No fake directional price forecast.
+    # Instead, give historical outcome probabilities and expected return.
+    forecast = {
+        "4H": None,
+        "24H": None,
+        "72H": None,
+    }
+
+    return {
+        "symbol": symbol,
+        "frames": frames,
+        "analyses": analyses,
+        "score": float(score),
+        "position": position,
+        "decision": "معامله" if position in ("لانگ", "شورت") else "صبر",
+        "entry": entry,
+        "sl": float(sl),
+        "tp1": float(tp1),
+        "tp2": float(tp2),
+        "tp3": float(tp3),
+        "risk_pct": float(abs(entry - sl) / entry * 100),
+        "supports": supports,
+        "resistances": resistances,
+        "backtest": bt,
+        "calibrated_confidence": calibrated_conf,
+        "confidence_note": sample_note,
+        "forecast": forecast,
+    }
+
+
+# ============================================================
+# UI
 # ============================================================
 st.markdown("""
 <style>
-.block-container{padding-top:1rem;padding-bottom:2rem;max-width:1050px}
-.app-head{background:linear-gradient(135deg,#111318,#24272d);color:white;border-radius:24px;padding:20px 22px;margin-bottom:14px;box-shadow:0 8px 24px rgba(0,0,0,.12)}
-.app-brand{font-size:26px;font-weight:900;line-height:1.2}.app-sub{font-size:12px;color:#cfd2d7;margin-top:6px}
-.menu-wrap{background:#fff;border:1px solid #ececec;border-radius:20px;padding:8px;margin-bottom:14px;box-shadow:0 3px 14px rgba(0,0,0,.05)}
-.menu-wrap [role="radiogroup"]{gap:6px;flex-wrap:wrap}.menu-wrap label{border-radius:14px!important;padding:8px 12px!important}
-.section-card{background:#fff;border:1px solid #ececec;border-radius:20px;padding:16px;margin-bottom:14px;box-shadow:0 3px 14px rgba(0,0,0,.045)}
-.section-title{font-size:17px;font-weight:850;margin-bottom:4px}.section-sub{font-size:12px;color:#777;margin-bottom:12px}
-.stat-row{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}.stat{flex:1;min-width:120px;background:#f7f7f8;border-radius:14px;padding:10px 12px}
-.stat-k{font-size:11px;color:#777}.stat-v{font-size:17px;font-weight:850;margin-top:3px}
-.result-card{background:#fff;border:1px solid #e9e9e9;border-radius:22px;padding:17px;margin:14px 0;box-shadow:0 5px 18px rgba(0,0,0,.055)}
-.result-head{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap}
-.coin-name{font-size:23px;font-weight:900}.decision{padding:7px 12px;border-radius:14px;font-size:13px;font-weight:850}
-.decision-buy{background:#e9f8ef;color:#138a45}.decision-sell{background:#fdecec;color:#c62828}.decision-wait{background:#fff7d9;color:#8a6900}
-.price-box{background:#f7f8fa;border-radius:17px;padding:13px;margin:12px 0}.price-label{font-size:11px;color:#777}
-.price-main{font-size:26px;font-weight:900;margin-top:3px}.level-grid{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:8px;margin-top:10px}
-.level{background:#fafafa;border:1px solid #ededed;border-radius:14px;padding:10px}.level.entry{border-top:4px solid #eab308}.level.sl{border-top:4px solid #dc2626}.level.tp{border-top:4px solid #16a34a}
-.level-k{font-size:10px;color:#777}.level-v{font-size:14px;font-weight:850;margin-top:4px;word-break:break-word}
-.reason-box{background:#f8f8f9;border-radius:15px;padding:11px 13px;font-size:12px;line-height:2;margin-top:11px}
-.tf-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin-top:10px}.tf{background:#f7f8fa;border-radius:14px;padding:10px}
-.tf-k{font-size:10px;color:#777}.tf-v{font-size:15px;font-weight:850;margin-top:3px}
-.footer-note{color:#777;font-size:11px;text-align:center;line-height:1.9;padding:12px}.tf-detail{border:1px solid #ededed;border-radius:16px;padding:12px;margin:8px 0;background:#fafafa}.tf-detail-title{font-size:15px;font-weight:900;margin-bottom:7px}.sr-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}.sr-box{background:#fff;border:1px solid #eee;border-radius:12px;padding:9px}.sr-k{font-size:10px;color:#777}.sr-v{font-size:12px;font-weight:800;margin-top:4px;line-height:1.8}
-@media(max-width:700px){.block-container{padding-left:.65rem;padding-right:.65rem}.app-brand{font-size:22px}.level-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.level:last-child{grid-column:span 2}.tf-grid{grid-template-columns:1fr}.coin-name{font-size:20px}}
+.block-container{padding-top:1rem;padding-bottom:2rem;max-width:1100px}
+.head{background:linear-gradient(135deg,#111318,#292d33);color:#fff;border-radius:22px;padding:20px;margin-bottom:14px}
+.brand{font-size:25px;font-weight:900}.sub{font-size:12px;color:#cfd2d7;margin-top:6px}
+.card{background:#fff;border:1px solid #e8e8e8;border-radius:20px;padding:16px;margin:12px 0;box-shadow:0 3px 14px rgba(0,0,0,.04)}
+.grid{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:8px}
+.box{background:#f7f7f8;border-radius:13px;padding:10px}.k{font-size:10px;color:#777}.v{font-size:16px;font-weight:850;margin-top:4px}
+.buy{color:#087f3e}.sell{color:#b42318}.wait{color:#806000}
+.note{font-size:11px;color:#777;line-height:1.8}
+@media(max-width:700px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
 </style>
-""", unsafe_allow_html=True)
-
-st.markdown("""
-<div class="app-head">
-  <div class="app-brand">₿ تحلیل‌گر حرفه‌ای رمزارز</div>
-  <div class="app-sub">بازار USDT صرافی تبدیل • تأیید با Binance و Wallex • تکنیکال + شرایط بازار • بدون اجرای سفارش</div>
+<div class="head">
+<div class="brand">₿ تحلیل‌گر حرفه‌ای رمزارز — نسخه قابل‌آزمون</div>
+<div class="sub">سیگنال بر اساس کندل بسته‌شده • ورود روی کندل بعدی در بک‌تست • کارمزد و اسلیپیج • کالیبراسیون تاریخی • بدون پیش‌بینی ساختگی</div>
 </div>
 """, unsafe_allow_html=True)
 
-universe=get_tabdeal_universe()
+with st.sidebar:
+    st.header("تنظیمات تست")
+    mode = st.selectbox("نوع بازار", ["SPOT", "FUTURES"])
+    fee_pct = st.number_input("کارمزد هر سمت (%)", 0.0, 1.0, DEFAULT_FEE_PCT, 0.01)
+    slip_pct = st.number_input("اسلیپیج هر سمت (%)", 0.0, 1.0, DEFAULT_SLIPPAGE_PCT, 0.01)
+    horizon = st.number_input("افق بک‌تست (تعداد کندل 1H)", 4, 120, DEFAULT_HORIZON_BARS, 1)
+    st.caption("در SPOT فقط لانگ فعال است. برای شورت باید واقعاً روی بازار Futures/Margin معامله شود.")
 
-# ============================================================
-# FULL CRYPTO LIST — added without changing the existing analysis flow
-# ============================================================
-with st.expander(f"فهرست کامل تمام رمز ارزهای USDT — {len(universe):,} بازار", expanded=False):
-    if universe:
-        st.caption("برای جلوگیری از اجرای تحلیل سنگین هنگام باز شدن صفحه، نوع معامله و اطمینان مدل با اسکن سریع چندتایم‌فریمی محاسبه می‌شود.")
-        if st.button("محاسبه نوع معامله و اطمینان برای کل جدول", key="scan_all_table", use_container_width=True):
-            table_scan = {}
-            progress = st.progress(0)
-            with st.spinner(f"در حال بررسی {len(universe):,} بازار..."):
-                with ThreadPoolExecutor(max_workers=8) as ex:
-                    jobs = {ex.submit(quick_scan, sym): sym for sym in universe}
-                    done = 0
-                    for job in as_completed(jobs):
-                        done += 1
-                        progress.progress(done / max(len(jobs), 1))
-                        try:
-                            rr = job.result()
-                            if rr:
-                                conf = float(np.clip(50 + abs(rr["score"]) * 0.42 + (5 if rr.get("coverage", 0) >= 4 else 0), 50, 96))
-                                table_scan[rr["symbol"]] = {
-                                    "نوع معامله": rr["position"],
-                                    "اطمینان مدل": f"{conf:.0f}%"
-                                }
-                        except Exception:
-                            pass
-            progress.empty()
-            st.session_state["all_coins_table_scan"] = table_scan
+universe = get_universe()
 
-        table_scan = st.session_state.get("all_coins_table_scan", {})
-        all_coins = pd.DataFrame({
-            "ردیف": range(1, len(universe) + 1),
-            "رمزارز": [sym.replace("USDT", "/USDT") for sym in universe],
-            "نوع معامله": [table_scan.get(sym, {}).get("نوع معامله", "—") for sym in universe],
-            "درصد اطمینان": [table_scan.get(sym, {}).get("اطمینان مدل", "—") for sym in universe],
-        })
-        st.dataframe(
-            all_coins,
-            use_container_width=True,
-            hide_index=True,
-            height=520,
-        )
-        st.caption("«درصد اطمینان» شاخص اطمینان مدل است و احتمال قطعی موفقیت یا تضمین سود نیست.")
-    else:
-        st.warning("فهرست بازارهای USDT دریافت نشد.")
-if "watch" not in st.session_state: st.session_state.watch=[]
+st.markdown('<div class="card"><b>انتخاب بازار</b><div class="note">حداکثر ۵ ارز. تحلیل چندتایم‌فریمی انجام می‌شود، اما اطمینان فقط زمانی نمایش داده می‌شود که نتیجه تاریخی کافی داشته باشیم.</div></div>', unsafe_allow_html=True)
 
-st.markdown('<div class="menu-wrap">', unsafe_allow_html=True)
-menu=st.radio("منوی اصلی",["بازارها","تحلیل انتخابی","⭐ نشانه‌گذاری","اسکن کل بازار","راهنما"],horizontal=True,label_visibility="collapsed",key="main_menu")
-st.markdown('</div>', unsafe_allow_html=True)
+search = st.text_input("جستجو", placeholder="BTC / ETH / SOL ...")
+filtered = [s for s in universe if search.upper() in s] if search else universe
+selected = st.multiselect(
+    "ارزها",
+    filtered,
+    max_selections=5,
+    format_func=lambda x: x.replace("USDT", "/USDT"),
+)
 
-if menu=="راهنما":
-    st.markdown("""
-    <div class="section-card">
-      <div class="section-title">راهنمای برنامه</div>
-      <div class="section-sub">منو و کارت‌های تحلیل از هم جدا شده‌اند تا روی موبایل مرتب‌تر دیده شوند.</div>
-      <b>بازارها:</b> انتخاب تا ۵ ارز از بازار USDT تبدیل.<br>
-      <b>تحلیل انتخابی:</b> نمایش کارت تحلیل ارزهای انتخاب‌شده.<br>
-      <b>⭐ نشانه‌گذاری:</b> نگهداری ارزهای موردنظر برای دسترسی سریع.<br>
-      <b>کارت تحلیل:</b> ورود، حد ضرر، تارگت‌ها، نوع پوزیشن، اطمینان مدل و دلایل اصلی.
-    </div>
-    """,unsafe_allow_html=True)
-    st.markdown('<div class="footer-note">درصد اطمینان، شاخص اطمینان مدل است و تضمین سود یا موفقیت معامله نیست.</div>',unsafe_allow_html=True)
-    st.stop()
+if selected:
+    results = []
+    with st.spinner("در حال تحلیل چندتایم‌فریمی و کالیبراسیون تاریخی..."):
+        with ThreadPoolExecutor(max_workers=min(5, len(selected))) as ex:
+            jobs = {
+                ex.submit(
+                    analyze_symbol,
+                    s, mode, fee_pct, slip_pct
+                ): s for s in selected
+            }
+            for job in as_completed(jobs):
+                try:
+                    r = job.result()
+                    if r:
+                        results.append(r)
+                except Exception:
+                    pass
 
-if menu=="اسکن کل بازار":
-    st.markdown("""
-    <div class="section-card">
-      <div class="section-title">اسکن کل بازار USDT</div>
-      <div class="section-sub">تمام بازارهای USDT موجود در فهرست تبدیل بررسی می‌شوند. ابتدا 15m، 1H، 4H و 1D غربال می‌شوند و سپس گزینه‌های برتر تحلیل کامل چندتایم‌فریمی می‌گیرند.</div>
-    </div>
-    """,unsafe_allow_html=True)
-    if not universe:
-        st.error("فهرست بازارهای USDT دریافت نشد.")
-        st.stop()
-    scan_n = st.slider("تعداد نتایج نهایی اسکن", min_value=5, max_value=20, value=10, step=5)
-    if st.button("شروع اسکن کل بازار", type="primary", use_container_width=True):
-        scan_results=[]
-        progress=st.progress(0)
-        with st.spinner(f"در حال غربال {len(universe):,} بازار USDT..."):
-            with ThreadPoolExecutor(max_workers=8) as ex:
-                jobs={ex.submit(quick_scan,s):s for s in universe}
-                done=0
-                for job in as_completed(jobs):
-                    done += 1
-                    progress.progress(done/max(len(jobs),1))
-                    try:
-                        r=job.result()
-                        if r and abs(r['score'])>=10:
-                            scan_results.append(r)
-                    except Exception:
-                        pass
-        progress.empty()
-        scan_results=sorted(scan_results,key=lambda x:abs(x['score']),reverse=True)[:max(scan_n*2,20)]
-        if not scan_results:
-            st.warning("در این نوبت گزینه قابل‌اتکایی برای ادامه تحلیل پیدا نشد.")
-            st.stop()
-        st.markdown(f"<div class='section-card'><div class='section-title'>گزینه‌های مناسب برای بررسی</div><div class='section-sub'>از بین {len(universe):,} بازار، {len(scan_results)} گزینه برای مرحله تحلیل انتخاب شدند.</div></div>",unsafe_allow_html=True)
-        full=[]
-        with st.spinner("در حال تحلیل کامل گزینه‌های برتر با تمام تایم‌فریم‌ها..."):
-            with ThreadPoolExecutor(max_workers=5) as ex:
-                jobs={ex.submit(aggregate,r['symbol']):r['symbol'] for r in scan_results[:min(len(scan_results),scan_n*2)]}
-                for job in as_completed(jobs):
-                    try:
-                        r=job.result()
-                        if r and r['decision']=='معامله کن': full.append(r)
-                    except Exception:
-                        pass
-        full=sorted(full,key=lambda x:abs(x['score']),reverse=True)[:scan_n]
-        if not full:
-            st.info("پس از تحلیل کامل، موردی با شرایط فعلی برای معامله تشخیص داده نشد.")
+    for r in sorted(results, key=lambda x: x["score"], reverse=True):
+        cls = "buy" if r["position"] == "لانگ" else ("sell" if r["position"] == "شورت" else "wait")
+        bt = r["backtest"]
+
+        if np.isfinite(r["calibrated_confidence"]):
+            conf_txt = f'{r["calibrated_confidence"]:.1f}%'
         else:
-            st.markdown("<div class='section-card'><div class='section-title'>رمزارزهای مناسب معامله</div><div class='section-sub'>این فهرست رتبه‌بندی یا تضمین سود نیست؛ فقط خروجی فعلی مدل برای بررسی دستی است.</div></div>",unsafe_allow_html=True)
-            for i,r in enumerate(full,1):
-                cls='decision-buy' if r['position']=='لانگ' else 'decision-sell'
-                icon='🟢' if r['position']=='لانگ' else '🔴'
-                st.markdown(f"<div class='result-card'><div class='result-head'><div class='coin-name'>{i}. {icon} {r['symbol'].replace('USDT','/USDT')}</div><div class='decision {cls}'>{r['position']}</div></div><div class='price-box'><div class='price-label'>قیمت مرجع</div><div class='price-main'>{money(r['price'])}</div><div class='muted'>امتیاز مدل: <b>{r['score']:.0f}</b> • اطمینان: <b>{r['confidence']:.0f}%</b> • ریسک تا حد ضرر: <b>{r['risk_pct']:.2f}%</b></div></div><div class='level-grid'><div class='level entry'><div class='level-k'>ورود</div><div class='level-v'>{money(r['entry'])}</div></div><div class='level sl'><div class='level-k'>حد ضرر</div><div class='level-v'>{money(r['sl'])}</div></div><div class='level tp'><div class='level-k'>Target 1</div><div class='level-v'>{money(r['t1'])}</div></div><div class='level tp'><div class='level-k'>Target 2</div><div class='level-v'>{money(r['t2'])}</div></div><div class='level tp'><div class='level-k'>Target 3</div><div class='level-v'>{money(r['t3'])}</div></div></div></div>",unsafe_allow_html=True)
-        st.stop()
+            conf_txt = "نامشخص"
 
-st.markdown('<div class="section-card">',unsafe_allow_html=True)
-st.markdown('<div class="section-title">بازار و انتخاب ارز</div>',unsafe_allow_html=True)
-st.markdown('<div class="section-sub">از میان تمام بازارهای USDT تبدیل جستجو کن و حداکثر ۵ ارز را همزمان انتخاب کن.</div>',unsafe_allow_html=True)
+        if bt:
+            bt_txt = (
+                f'Win Rate: {bt["win_rate"]*100:.1f}% • '
+                f'TP1: {bt["tp1_rate"]*100:.1f}% • '
+                f'TP2: {bt["tp2_rate"]*100:.1f}% • '
+                f'PF: {bt["profit_factor"]:.2f} • '
+                f'DD: {bt["max_drawdown"]*100:.1f}% • '
+                f'Expectancy: {bt["expectancy"]*100:.2f}%'
+            )
+        else:
+            bt_txt = "داده کافی برای بک‌تست موجود نیست."
 
-search=st.text_input("جستجو",placeholder="مثلاً BTC، ETH، SOL یا BTCUSDT",label_visibility="collapsed",key="coin_search")
-filtered=[s for s in universe if search.upper() in s] if search else universe
-if menu=="⭐ نشانه‌گذاری": filtered=[s for s in filtered if s in st.session_state.watch]
-if menu=="تحلیل انتخابی" and st.session_state.watch: filtered=[s for s in filtered if s in st.session_state.watch]
+        st.markdown(f"""
+        <div class="card">
+          <h3>{r["symbol"].replace("USDT","/USDT")} —
+            <span class="{cls}">{r["position"]}</span></h3>
 
-default_selected=[x for x in st.session_state.watch if x in filtered][:5]
-selected=st.multiselect("انتخاب حداکثر ۵ ارز",options=filtered,default=default_selected,max_selections=5,format_func=lambda x:x.replace("USDT","/USDT"),key="selected_coins")
-st.session_state.watch=list(dict.fromkeys(selected))
+          <div class="grid">
+            <div class="box"><div class="k">امتیاز فعلی</div><div class="v">{r["score"]:.1f}</div></div>
+            <div class="box"><div class="k">اطمینان کالیبره‌شده TP1</div><div class="v">{conf_txt}</div></div>
+            <div class="box"><div class="k">ورود</div><div class="v">{money(r["entry"])}</div></div>
+            <div class="box"><div class="k">حد ضرر</div><div class="v">{money(r["sl"])}</div></div>
+            <div class="box"><div class="k">ریسک</div><div class="v">{r["risk_pct"]:.2f}%</div></div>
+            <div class="box"><div class="k">TP1</div><div class="v">{money(r["tp1"])}</div></div>
+            <div class="box"><div class="k">TP2</div><div class="v">{money(r["tp2"])}</div></div>
+            <div class="box"><div class="k">TP3</div><div class="v">{money(r["tp3"])}</div></div>
+            <div class="box"><div class="k">تصمیم</div><div class="v">{r["decision"]}</div></div>
+            <div class="box"><div class="k">کالیبراسیون</div><div class="v">{r["confidence_note"]}</div></div>
+          </div>
 
-st.markdown(f"""
-<div class="stat-row">
-  <div class="stat"><div class="stat-k">بازارهای USDT</div><div class="stat-v">{len(universe):,}</div></div>
-  <div class="stat"><div class="stat-k">انتخاب‌شده</div><div class="stat-v">{len(selected)}/5</div></div>
-  <div class="stat"><div class="stat-k">نشانه‌گذاری</div><div class="stat-v">⭐ {len(st.session_state.watch)}</div></div>
-</div>
-""",unsafe_allow_html=True)
-st.markdown('</div>',unsafe_allow_html=True)
+          <p class="note"><b>بک‌تست:</b> {bt_txt}</p>
+          <p class="note"><b>نکته:</b> این درصد احتمال رسیدن تاریخی به TP1 در نمونه بک‌تست است، نه تضمین موفقیت معامله فعلی.</p>
+        </div>
+        """, unsafe_allow_html=True)
 
-if not selected:
-    st.markdown('<div class="section-card"><div class="section-title">برای شروع یک یا چند ارز انتخاب کن</div><div class="section-sub">پس از انتخاب، کارت تحلیل هر ارز جداگانه نمایش داده می‌شود.</div></div>',unsafe_allow_html=True)
-    st.stop()
+        with st.expander(f'جزئیات تایم‌فریم‌ها — {r["symbol"].replace("USDT","/USDT")}'):
+            rows = []
+            for tf in TIMEFRAMES:
+                a = r["analyses"].get(tf)
+                if a:
+                    rows.append({
+                        "تایم‌فریم": tf,
+                        "نوع": "لانگ" if a["score"] >= 24 else ("شورت" if a["score"] <= -24 else "صبر"),
+                        "امتیاز": round(a["score"], 1),
+                        "RSI": round(a["rsi"], 1),
+                        "Momentum %": round(a["momentum"], 2),
+                        "ADX": round(a["adx"], 1),
+                    })
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
-results=[]
-with st.spinner("در حال دریافت داده و اجرای تحلیل چندمنبعی..."):
-    with ThreadPoolExecutor(max_workers=5) as ex:
-        jobs={ex.submit(aggregate,s):s for s in selected}
-        for job in as_completed(jobs):
-            try:
-                r=job.result()
-                if r: results.append(r)
-            except Exception: pass
+            st.write("دلایل تایم‌فریم‌های اصلی:")
+            for tf in ("1H", "4H", "1D"):
+                a = r["analyses"].get(tf)
+                if a:
+                    st.write(f"**{tf}:** " + "؛ ".join(a["reasons"][:6]))
 
-if not results:
-    st.error("برای ارزهای انتخاب‌شده داده کافی دریافت نشد. چند لحظه بعد دوباره امتحان کن.")
-    st.stop()
+            if bt:
+                st.write("توزیع نتایج بک‌تست")
+                counts = bt["trades_df"]["result"].value_counts().rename_axis("نتیجه").reset_index(name="تعداد")
+                st.dataframe(counts, use_container_width=True, hide_index=True)
 
-st.markdown(f'<div class="section-card"><div class="section-title">نتیجه تحلیل</div><div class="section-sub">{len(results)} کارت تحلیل آماده شد؛ هر کارت مستقل از کارت‌های دیگر است.</div></div>',unsafe_allow_html=True)
+    st.markdown(
+        '<div class="card note"><b>تغییر مهم:</b> دیگر «اطمینان ۹۰٪» از روی امتیاز ساخته نمی‌شود. '
+        'اگر نمونه تاریخی کافی نباشد، برنامه صراحتاً «نامشخص» نشان می‌دهد.</div>',
+        unsafe_allow_html=True
+    )
+else:
+    st.info("یک یا چند ارز انتخاب کن.")
 
-for r in sorted(results,key=lambda x:x["score"],reverse=True):
-    if r["position"]=="لانگ":
-        decision_cls="decision-buy"; decision_icon="🟢"
-    elif r["position"]=="شورت":
-        decision_cls="decision-sell"; decision_icon="🔴"
-    else:
-        decision_cls="decision-wait"; decision_icon="🟡"
-
-    reason="؛ ".join(reason_text for tf in ["15m","1H","4H","1D"] if tf in r["analyses"] for reason_text in r["analyses"][tf]["reasons"][:3])
-    src=" | ".join(f"{k}: {money(v)}" for k,v in r["sources"].items()) or "-"
-
-    st.markdown(f"""
-    <div class="result-card">
-      <div class="result-head">
-        <div class="coin-name">{decision_icon} {r["symbol"].replace("USDT","/USDT")}</div>
-        <div class="decision {decision_cls}">{r["decision"]}</div>
-      </div>
-      <div class="price-box">
-        <div class="price-label">قیمت مرجع چندمنبعی</div>
-        <div class="price-main">{money(r["price"])}</div>
-        <div class="muted">نوع پوزیشن: <b>{r["position"]}</b> &nbsp; • &nbsp; امتیاز مدل: <b>{r["score"]:.0f}/100</b> &nbsp; • &nbsp; اطمینان تحلیل: <b>{r["confidence"]:.0f}%</b></div>
-      </div>
-      <div class="level-grid">
-        <div class="level entry"><div class="level-k">ورود</div><div class="level-v">{money(r["entry"])}</div></div>
-        <div class="level sl"><div class="level-k">حد ضرر</div><div class="level-v">{money(r["sl"])}</div></div>
-        <div class="level tp"><div class="level-k">Target 1</div><div class="level-v">{money(r["t1"])}</div></div>
-        <div class="level tp"><div class="level-k">Target 2</div><div class="level-v">{money(r["t2"])}</div></div>
-        <div class="level tp"><div class="level-k">Target 3</div><div class="level-v">{money(r["t3"])}</div></div>
-      </div>
-      <div class="tf-grid">
-        <div class="tf"><div class="tf-k">پیش‌بینی 4H</div><div class="tf-v">{r["forecast_pct"]["4H"]:+.1f}% → {money(r["forecast"]["4H"])}</div></div>
-        <div class="tf"><div class="tf-k">پیش‌بینی 24H</div><div class="tf-v">{r["forecast_pct"]["24H"]:+.1f}% → {money(r["forecast"]["24H"])}</div></div>
-        <div class="tf"><div class="tf-k">پیش‌بینی 72H</div><div class="tf-v">{r["forecast_pct"]["72H"]:+.1f}% → {money(r["forecast"]["72H"])}</div></div>
-      </div>
-      <div class="reason-box"><b>دلایل کلیدی:</b> {reason or "-"}<br><b>ریسک تا حد ضرر:</b> {r["risk_pct"]:.2f}%<br><span class="muted">منابع قیمت: {src}</span></div>
-    </div>
-    """,unsafe_allow_html=True)
-
-    with st.expander(f"تایم‌فریم‌ها و اندیکاتورها — {r['symbol'].replace('USDT','/USDT')}"):
-        st.markdown('**تمام تایم‌فریم‌های درخواستی**')
-        rows=[]
-        for tf in TIMEFRAMES:
-            a=r["analyses"].get(tf)
-            if a:
-                rows.append({"تایم‌فریم":tf,"نوع معامله":tf_position(a["score"]),"امتیاز":round(a["score"],1),"RSI":round(a["rsi"],1),"MACD":round(a["macd"],6),"Momentum %":round(a["momentum"],2),"ADX":round(a["adx"],1)})
-            else:
-                rows.append({"تایم‌فریم":tf,"نوع معامله":"داده نیست","امتیاز":"داده نیست","RSI":"-","MACD":"-","Momentum %":"-","ADX":"-"})
-        st.dataframe(pd.DataFrame(rows),use_container_width=True,hide_index=True)
-
-        st.markdown('**حمایت و مقاومت به تفکیک تایم‌فریم**')
-        for tf in TIMEFRAMES:
-            a=r["analyses"].get(tf)
-            sr=r["sr_by_tf"].get(tf,{"supports":[],"resistances":[]})
-            if not a and not sr["supports"] and not sr["resistances"]:
-                continue
-            supports_txt=", ".join(money(x) for x in sr["supports"]) or "-"
-            resistances_txt=", ".join(money(x) for x in sr["resistances"]) or "-"
-            st.markdown(f'''<div class="tf-detail"><div class="tf-detail-title">{tf}</div><div class="sr-grid"><div class="sr-box"><div class="sr-k">حمایت‌ها</div><div class="sr-v">{supports_txt}</div></div><div class="sr-box"><div class="sr-k">مقاومت‌ها</div><div class="sr-v">{resistances_txt}</div></div></div></div>''',unsafe_allow_html=True)
-        st.caption("اندیکاتورها: ایچیموکو، MACD، RSI، Momentum، ATR، ADX و پرایس‌اکشن. حمایت/مقاومت بر اساس ساختار سقف و کف‌های اخیر هر تایم‌فریم محاسبه می‌شود.")
-
-st.markdown('<div class="footer-note">هشدار: این برنامه ابزار تحقیق و تحلیل است. «اطمینان تحلیل» احتمال سود قطعی نیست. پیش‌بینی بازار قطعی نیست و قبل از معامله باید نقدشوندگی، کارمزد، اخبار و ریسک شخصی بررسی شود.</div>',unsafe_allow_html=True)
+st.markdown(
+    '<div class="note" style="text-align:center;margin-top:18px">'
+    'این ابزار تحقیقاتی است و تضمین سود نمی‌دهد. بک‌تست گذشته تضمین آینده نیست. '
+    'قبل از معامله واقعی، اجرای Paper Trading و سپس Forward Test توصیه می‌شود.'
+    '</div>',
+    unsafe_allow_html=True
+)

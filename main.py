@@ -34,6 +34,15 @@ TABDEAL_API_SECRET = os.getenv("TABDEAL_API_SECRET", "").strip()
 TABDEAL_ONLY = True
 TRADE_LIMIT = 1000
 PRIVATE_READ_ONLY = True
+REQUEST_TIMEOUT = 15
+CANDLE_LIMIT = 700
+MIN_BARS = 220
+
+SESSION = requests.Session()
+SESSION.headers.update({
+    "User-Agent": "TabdealCryptoSignalEngine/1.0",
+    "Accept": "application/json",
+})
 
 
 # ============================================================

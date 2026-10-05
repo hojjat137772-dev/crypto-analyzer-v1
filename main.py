@@ -13,7 +13,7 @@ from decimal import Decimal, ROUND_DOWN
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ============================================================
-# Crypto Analyzer Pro — RENDER AUTO-TRADER V2
+# Crypto Analyzer Pro — RENDER AUTO-TRADER V3
 # ============================================================
 # Architecture:
 # 1) Fast scan of the complete Tabdeal USDT market.
@@ -44,6 +44,7 @@ st.set_page_config(
 
 TABDEAL = "https://api1.tabdeal.org"
 BINANCE_DATA = "https://data-api.binance.vision"
+WALLEX = "https://api.wallex.ir"
 
 TIMEFRAMES = {
     "5m": "5m", "15m": "15m", "30m": "30m",
@@ -61,12 +62,17 @@ DEFAULT_TRADE_USDT = 10.0
 DEFAULT_MAX_POSITIONS = 1
 
 MIN_HISTORY = 100
-BACKTEST_BARS = 180
-OOS_MIN_TRADES = 25
-MIN_PROBABILITY = 58.0
-MIN_SCORE = 68.0
-MIN_RISK_REWARD = 1.20
-MAX_ATR_PCT = 15.0
+BACKTEST_BARS = 240
+OOS_MIN_TRADES = 30
+MIN_PROBABILITY = 62.0
+MIN_SCORE = 72.0
+MIN_RISK_REWARD = 1.50
+MAX_ATR_PCT = 12.0
+MIN_MTF_AGREEMENT = 75.0
+MIN_VOLUME_RATIO = 1.05
+MAX_CROSS_SOURCE_DEVIATION = 1.25
+RISK_PER_TRADE_PCT = 0.75
+MAX_DAILY_LOSS_PCT = 3.0
 
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "CryptoAnalyzerPro-Autonomous/1.0"})
@@ -265,42 +271,115 @@ def tabdeal_symbol(symbol):
 def rows_to_df(rows):
     if not isinstance(rows, list) or len(rows) < 40:
         return pd.DataFrame()
-
     try:
         df = pd.DataFrame(rows).iloc[:, :6]
         df.columns = ["time", "open", "high", "low", "close", "volume"]
-
         t = pd.to_numeric(df["time"], errors="coerce")
         unit = "us" if t.dropna().median() > 1e14 else "ms"
         df["time"] = pd.to_datetime(t, unit=unit, utc=True)
-
         for c in ["open", "high", "low", "close", "volume"]:
             df[c] = pd.to_numeric(df[c], errors="coerce")
-
-        return (
-            df.dropna()
-            .drop_duplicates("time")
-            .sort_values("time")
-            .reset_index(drop=True)
-        )
+        return df.dropna().drop_duplicates("time").sort_values("time").reset_index(drop=True)
     except Exception:
         return pd.DataFrame()
 
 
+def wallex_interval(interval):
+    m = {"5m": 1, "15m": 1, "30m": 1, "1h": 60, "2h": 60,
+         "4h": 60, "6h": 360, "12h": 720, "1d": "1D", "3d": "1D", "1w": "1D"}
+    return m.get(interval)
+
+
+def resample_ohlcv(df, minutes):
+    if df.empty:
+        return df
+    x=df.copy().set_index("time")
+    rule=f"{minutes}min"
+    out=x.resample(rule, label="left", closed="left").agg({
+        "open":"first","high":"max","low":"min","close":"last","volume":"sum"
+    }).dropna().reset_index()
+    return out
+
+
+def get_wallex_klines(symbol, interval, limit=700):
+    ws = normalize_symbol(symbol)
+    # Wallex documents BTCUSDT-style symbols and UDF OHLCV history.
+    base_minutes = wallex_interval(interval)
+    if base_minutes is None:
+        return pd.DataFrame()
+    if base_minutes == "1D":
+        resolution = "1D"
+        step_min = 1440
+    else:
+        resolution = str(base_minutes)
+        step_min = int(base_minutes)
+    # Fetch enough history for indicators; for 1-minute fallback this covers
+    # the required 5/15/30m bars and is then locally aggregated.
+    multiplier = 5 if resolution == "1" else 1
+    bars_needed = min(max(int(limit) * multiplier + 80, 500), 10000)
+    now = int(time.time())
+    frm = now - bars_needed * step_min * 60
+    data = public_json(WALLEX + "/v1/udf/history", {
+        "symbol": ws, "resolution": resolution, "from": frm, "to": now
+    }, timeout=15)
+    if not isinstance(data, dict) or data.get("s") != "ok":
+        return pd.DataFrame()
+    try:
+        rows=[]
+        for i,t in enumerate(data.get("t", [])):
+            rows.append([t, data["o"][i], data["h"][i], data["l"][i], data["c"][i], data["v"][i]])
+        df=rows_to_df(rows)
+        if df.empty: return df
+        if interval in ("5m","15m","30m"):
+            df=resample_ohlcv(df, {"5m":5,"15m":15,"30m":30}[interval])
+        elif interval in ("2h","3d","1w"):
+            mins={"2h":120,"3d":4320,"1w":10080}[interval]
+            df=resample_ohlcv(df, mins)
+        return df.tail(limit).reset_index(drop=True)
+    except Exception:
+        return pd.DataFrame()
+
+
+def get_binance_klines(symbol, interval, limit=700):
+    data = public_json(BINANCE_DATA + "/api/v3/klines", {
+        "symbol": normalize_symbol(symbol), "interval": interval,
+        "limit": min(int(limit), 1000),
+    }, timeout=15)
+    return rows_to_df(data)
+
+
+@st.cache_data(ttl=25, show_spinner=False)
+def get_klines_with_source(symbol, interval, limit=500):
+    # Local Iranian source first, global liquid source second.
+    w = get_wallex_klines(symbol, interval, limit)
+    if len(w) >= MIN_HISTORY:
+        return w, "Wallex"
+    b = get_binance_klines(symbol, interval, limit)
+    if len(b) >= MIN_HISTORY:
+        return b, "Binance"
+    return pd.DataFrame(), "NONE"
+
+
 @st.cache_data(ttl=25, show_spinner=False)
 def get_klines(symbol, interval, limit=500):
-    # Analysis data is pulled from Binance public market data because it
-    # provides stable historical OHLCV. Orders are always sent to Tabdeal.
-    data = public_json(
-        BINANCE_DATA + "/api/v3/klines",
-        {
-            "symbol": normalize_symbol(symbol),
-            "interval": interval,
-            "limit": min(int(limit), 1000),
-        },
-        timeout=15,
-    )
-    return rows_to_df(data)
+    df, _ = get_klines_with_source(symbol, interval, limit)
+    return df
+
+
+def source_price_consensus(symbol):
+    vals={}
+    try:
+        w=get_wallex_klines(symbol,"1h",80)
+        if len(w): vals["Wallex"]=float(w["close"].iloc[-1])
+    except Exception: pass
+    try:
+        b=get_binance_klines(symbol,"1h",80)
+        if len(b): vals["Binance"]=float(b["close"].iloc[-1])
+    except Exception: pass
+    if len(vals)<2:
+        return vals, 0.0, True
+    arr=list(vals.values()); dev=abs(arr[0]-arr[1])/((arr[0]+arr[1])/2)*100
+    return vals, float(dev), bool(dev <= MAX_CROSS_SOURCE_DEVIATION)
 
 
 # ----------------------------- INDICATORS ----------------------
@@ -545,6 +624,8 @@ def tf_snapshot(df):
     reasons.extend(pa_reasons)
 
     atr_pct = (last["atr"] / last["close"]) * 100
+    volume_ratio = float(last["volume"] / last["vol_ma20"]) if last["vol_ma20"] > 0 else 0.0
+    ema20_slope = float((last["ema20"] / x["ema20"].iloc[-6] - 1) * 100)
 
     # Short-term return and momentum.
     ret5 = (last["close"] / x["close"].iloc[-6] - 1) * 100
@@ -556,6 +637,10 @@ def tf_snapshot(df):
         "atr": float(last["atr"]),
         "atr_pct": float(atr_pct),
         "rsi": float(last["rsi"]),
+        "macd_hist": float(last["macd_hist"]),
+        "volume_ratio": volume_ratio,
+        "ema20_slope": ema20_slope,
+        "price_action_score": float(pa),
         "adx": float(last["adx"]),
         "ret5": float(ret5),
         "ret20": float(ret20),
@@ -596,6 +681,8 @@ def fast_scan_one(symbol):
             "fast_score": float(clamp(score, 0, 100)),
             "trend_agreement": float(trend_agreement),
             "atr_pct": float(atr_pct),
+            "volume_ratio": float(np.mean([v.get("volume_ratio",0) for v in snaps.values()])),
+            "price_action": float(np.mean([v.get("price_action_score",50) for v in snaps.values()])),
             "1H": snaps.get("1H", {}).get("score", np.nan),
             "4H": snaps.get("4H", {}).get("score", np.nan),
             "1D": snaps.get("1D", {}).get("score", np.nan),
@@ -640,17 +727,20 @@ def historical_probability(df):
     """
 
     if len(df) < BACKTEST_BARS + 80:
-        return np.nan, 0, np.nan, np.nan
+        return np.nan, 0, np.nan, np.nan, np.nan
 
     x = add_indicators(df).iloc[:-1].copy()
     if len(x) < BACKTEST_BARS + 60:
-        return np.nan, 0, np.nan, np.nan
+        return np.nan, 0, np.nan, np.nan, np.nan
 
     start = max(50, len(x) - BACKTEST_BARS)
     wins = 0
     losses = 0
     gross_win = 0.0
     gross_loss = 0.0
+    equity = 0.0
+    peak = 0.0
+    max_dd = 0.0
 
     for i in range(start, len(x) - 2):
         cur = x.iloc[i]
@@ -659,7 +749,8 @@ def historical_probability(df):
         bullish = (
             cur["close"] > cur["ema20"] > cur["ema50"]
             and cur["macd"] > cur["macd_signal"]
-            and 48 <= cur["rsi"] <= 76
+            and 50 <= cur["rsi"] <= 72
+            and cur["volume"] >= cur["vol_ma20"]
         )
 
         if not bullish:
@@ -693,13 +784,17 @@ def historical_probability(df):
         if outcome == "win":
             wins += 1
             gross_win += 1.5
+            equity += 1.5
         elif outcome == "loss":
             losses += 1
             gross_loss += 1.0
+            equity -= 1.0
+        peak = max(peak, equity)
+        max_dd = max(max_dd, peak - equity)
 
     trades = wins + losses
     if trades == 0:
-        return np.nan, 0, np.nan, np.nan
+        return np.nan, 0, np.nan, np.nan, np.nan
 
     raw_prob = wins / trades * 100
     pf = gross_win / gross_loss if gross_loss > 0 else np.inf
@@ -707,7 +802,7 @@ def historical_probability(df):
     # Bayesian smoothing prevents tiny samples from showing extreme numbers.
     calibrated = (wins + 10) / (trades + 20) * 100
 
-    return float(calibrated), int(trades), float(pf), float(raw_prob)
+    return float(calibrated), int(trades), float(pf), float(raw_prob), float(max_dd)
 
 
 # ----------------------------- LEVELS --------------------------
@@ -801,26 +896,34 @@ def deep_analyze(symbol):
     base_snap = tf_rows.get("4H") or tf_rows.get("1H")
     base_df = base_snap["data"]
 
-    probability, trades, pf, raw_prob = historical_probability(base_df)
+    probability, trades, pf, raw_prob, max_dd = historical_probability(base_df)
 
-    plan = build_trade_plan(
-        base_df,
-        probability,
-        trend_score,
-    )
+    plan = build_trade_plan(base_df, probability, trend_score)
     if not plan:
         return None
 
-    # Hard confirmation.
+    # Independent local-source price confirmation.
+    source_prices, source_deviation, source_ok = source_price_consensus(symbol)
+    volume_ok = base_snap.get("volume_ratio", 0.0) >= MIN_VOLUME_RATIO
+    pa_ok = base_snap.get("price_action_score", 0.0) >= 58
+    momentum_ok = 50 <= base_snap.get("rsi", 50) <= 72 and base_snap.get("macd_hist", -1) > 0
+    trend_alignment = all(tf_rows.get(k, {"score":0})["score"] >= 58 for k in ("1H","4H")) and tf_rows.get("1D", {"score":0})["score"] >= 55
+
     confirmed = (
         plan["score"] >= MIN_SCORE
-        and agreement >= 65
+        and agreement >= MIN_MTF_AGREEMENT
+        and trend_alignment
         and trades >= OOS_MIN_TRADES
         and np.isfinite(probability)
         and probability >= MIN_PROBABILITY
-        and pf > 1.0
+        and pf >= 1.20
         and plan["rr1"] >= MIN_RISK_REWARD
         and base_snap["atr_pct"] <= MAX_ATR_PCT
+        and volume_ok
+        and pa_ok
+        and momentum_ok
+        and source_ok
+        and max_dd <= 12.0
     )
 
     decision = "معامله" if confirmed else "صبر"
@@ -850,7 +953,14 @@ def deep_analyze(symbol):
         "raw_probability": float(raw_prob) if np.isfinite(raw_prob) else np.nan,
         "oos_trades": int(trades),
         "profit_factor": float(pf) if np.isfinite(pf) else np.inf,
+        "max_dd_r": float(max_dd) if np.isfinite(max_dd) else np.nan,
         "agreement": float(agreement),
+        "volume_ratio": float(base_snap.get("volume_ratio",0)),
+        "price_action_score": float(base_snap.get("price_action_score",0)),
+        "trend_alignment": bool(trend_alignment),
+        "source_deviation": float(source_deviation),
+        "source_ok": bool(source_ok),
+        "source_prices": source_prices,
         "outlook_pct": float(plan["outlook_pct"]),
         "entry": plan["entry"],
         "sl": plan["sl"],
@@ -1187,6 +1297,15 @@ def place_oco_sell(symbol, quantity, tp, sl, api_key, api_secret):
     )
 
 
+def calculate_trade_amount(balance_usdt, requested_usdt, entry, sl):
+    risk_budget = max(0.0, balance_usdt * RISK_PER_TRADE_PCT / 100.0)
+    risk_per_unit = max(0.0, float(entry) - float(sl))
+    risk_based = (risk_budget / risk_per_unit) * float(entry) if risk_per_unit > 0 else 0.0
+    if risk_based <= 0:
+        return min(float(requested_usdt), float(balance_usdt))
+    return min(float(requested_usdt), risk_based, float(balance_usdt))
+
+
 def execute_trade(plan, trade_usdt, max_positions):
     """
     Full real-trading sequence:
@@ -1227,6 +1346,9 @@ def execute_trade(plan, trade_usdt, max_positions):
         }
 
     usdt_free = get_spot_balance(api_key, api_secret, "USDT")
+    trade_usdt = calculate_trade_amount(usdt_free, float(trade_usdt), plan["entry"], plan["sl"])
+    if trade_usdt <= 0:
+        return {"ok": False, "message": "حجم معامله بر اساس مدیریت ریسک صفر شد."}
     if usdt_free < float(trade_usdt):
         return {
             "ok": False,
@@ -1331,6 +1453,25 @@ def execute_trade(plan, trade_usdt, max_positions):
     }
 
 
+# ----------------------------- DECISION EXPLANATION ------------
+
+def rejection_reasons(r):
+    reasons=[]
+    checks=[
+        (r.get("probability",0) >= MIN_PROBABILITY,"احتمال OOS پایین"),
+        (r.get("score",0) >= MIN_SCORE,"امتیاز نهایی پایین"),
+        (r.get("agreement",0) >= MIN_MTF_AGREEMENT,"هم‌جهتی MTF ناکافی"),
+        (r.get("oos_trades",0) >= OOS_MIN_TRADES,"نمونه OOS کم"),
+        (r.get("profit_factor",0) >= 1.20,"Profit Factor ضعیف"),
+        (r.get("rr1",0) >= MIN_RISK_REWARD,"RR پایین"),
+        (r.get("volume_ratio",0) >= MIN_VOLUME_RATIO,"حجم تأییدکننده نیست"),
+        (r.get("price_action_score",0) >= 58,"Price Action ضعیف"),
+        (r.get("trend_alignment",False),"روند 1H/4H/1D همسو نیست"),
+        (r.get("source_ok",False),"اختلاف منابع زیاد است"),
+        (r.get("max_dd_r",99) <= 12,"Drawdown بک‌تست زیاد است"),
+    ]
+    return [msg for ok,msg in checks if not ok]
+
 # ----------------------------- UI HELPERS ---------------------
 
 def scan_table(rows):
@@ -1351,6 +1492,9 @@ def scan_table(rows):
             "TP2": fmt_num(r["tp2"]),
             "RR": round(r["rr1"], 2),
             "تأیید MTF": f"{r['agreement']:.0f}%",
+            "حجم": f"{r.get('volume_ratio',0):.2f}x",
+            "PA": round(r.get('price_action_score',0),1),
+            "اختلاف منابع": f"{r.get('source_deviation',0):.2f}%",
             "OOS": r["oos_trades"],
             "PF": round(r["profit_factor"], 2) if np.isfinite(r["profit_factor"]) else 99.0,
             "تصمیم": r["decision"],
@@ -1365,9 +1509,9 @@ def scan_table(rows):
 
 # ----------------------------- MAIN ---------------------------
 
-st.title("Crypto Analyzer Pro — Render Auto-Trader V2")
+st.title("Crypto Analyzer Pro — Render Auto-Trader V3")
 st.caption(
-    "نسخه V2: سفارش واقعی فقط وقتی فعال است که TABDEAL_LIVE_TRADING=true باشد "
+    "نسخه V3: سفارش واقعی فقط وقتی فعال است که TABDEAL_LIVE_TRADING=true باشد "
     "و موتور معامله در رابط کاربری نیز روشن باشد."
 )
 
@@ -1541,6 +1685,9 @@ if auto_scan:
             c3.metric("TP1", fmt_num(best["tp1"]))
             c4.metric("TP2", fmt_num(best["tp2"]))
             c5.metric("RR", f"{best['rr1']:.2f}")
+            tab_price = tabdeal_last_price(best["symbol"])
+            if tab_price:
+                st.caption(f"قیمت لحظه‌ای اجرای معامله از تبدیل: {fmt_num(tab_price)}")
 
             st.write(
                 f"چشم‌انداز سناریویی تا TP1: +{best['outlook_pct']:.2f}% | "
@@ -1575,6 +1722,7 @@ if auto_scan:
                             "time": time.strftime("%Y-%m-%d %H:%M:%S"),
                             "message": result["message"],
                             "executed_qty": result.get("executed_qty", ""),
+                            "trade_usdt": trade_usdt,
                         })
                         st.success(result["message"])
                     else:
@@ -1596,6 +1744,11 @@ if auto_scan:
 
         else:
             st.warning("در این اسکن هیچ ارز شرایط کامل ورود را نداشت.")
+            if ranked:
+                near = ranked[0]
+                why = rejection_reasons(near)
+                if why:
+                    st.caption(f"نزدیک‌ترین کاندیدا: {near['symbol']} — " + " | ".join(why))
 
     else:
         st.warning("هیچ کاندیدای قابل تحلیل عمیق پیدا نشد.")

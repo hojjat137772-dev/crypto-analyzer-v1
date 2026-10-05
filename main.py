@@ -37,6 +37,22 @@ PRIVATE_READ_ONLY = True
 REQUEST_TIMEOUT = 15
 CANDLE_LIMIT = 700
 MIN_BARS = 220
+MIN_OOS_TRADES = 30
+MIN_PF = 1.05
+MIN_EXPECTANCY = 0.0
+MIN_TP1_RATE = 0.50
+OOS_RATIO = 0.40
+ATR_SL = 1.5
+RR1 = 1.25
+RR2 = 2.0
+RR3 = 3.0
+MAX_HOLD_BARS = 48
+DEFAULT_SCAN_TF = "1H"
+TIMEFRAMES = {
+    "5m": "5m", "15m": "15m", "30m": "30m", "1H": "1h",
+    "2H": "2h", "4H": "4h", "6H": "6h", "12H": "12h",
+    "1D": "1d", "3D": "3d", "1W": "1w",
+}
 
 SESSION = requests.Session()
 SESSION.headers.update({
@@ -211,8 +227,16 @@ def normalize_markets(raw):
         base = str(x.get("baseAsset", "")).upper()
         quote = str(x.get("quoteAsset", "")).upper()
 
-        if not symbol or not base or not quote:
-            # best-effort extraction for unusual payloads
+        if not symbol:
+            continue
+        if not base or not quote:
+            compact = symbol.replace("_", "")
+            for q in ("USDT", "IRT", "USDC", "BTC", "ETH"):
+                if compact.endswith(q) and len(compact) > len(q):
+                    base = compact[:-len(q)]
+                    quote = q
+                    break
+        if not base or not quote:
             continue
 
         rows.append({

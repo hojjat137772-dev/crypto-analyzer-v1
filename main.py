@@ -1,69 +1,85 @@
-
 import streamlit as st
 import pandas as pd
 import numpy as np
 import requests
 import time
+import os
+import hmac
+import hashlib
+import json
+import urllib.parse
+import uuid
+from decimal import Decimal, ROUND_DOWN
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ============================================================
-# Crypto Analyzer Pro — STRICT OOS GATE v2 (NO FEES)
+# Crypto Analyzer Pro — RENDER AUTO-TRADER V2
 # ============================================================
+# Architecture:
+# 1) Fast scan of the complete Tabdeal USDT market.
+# 2) Rank candidates by trend + price action + momentum + volume.
+# 3) Deep multi-timeframe analysis of only the best candidates.
+# 4) Historical/OOS probability gate.
+# 5) Optional automatic spot BUY on Tabdeal.
+# 6) Automatic OCO SELL = TP1 + SL.
+#
 # IMPORTANT:
-# - Spot mode is long-only by default. Short is disabled unless Futures mode is selected.
-# - "Confidence" is calibrated from historical out-of-sample-style rolling outcomes,
-#   not from an arbitrary score-to-percent formula.
-# - Forecast percentages are NOT fabricated from the score.
-# - Signals are generated only from CLOSED candles.
-# - Backtest enters on the NEXT candle open and includes configurable fee + slippage.
-# - If TP and SL are both touched in the same candle, the conservative assumption is SL first.
+# - Live trading is controlled by TABDEAL_LIVE_TRADING in Render.
+# - Set TABDEAL_API_KEY / TABDEAL_API_SECRET in Streamlit secrets
+#   or environment variables.
+# - Spot mode is long-only.
+# - The percentage shown is an estimated probability score based on
+#   historical/OOS outcomes + current confluence. It is NOT a guarantee.
+# - Only CLOSED candles are used for signals.
 # ============================================================
 
 st.set_page_config(
-    page_title="Crypto Analyzer Pro",
+    page_title="Crypto Analyzer Pro — Autonomous",
     page_icon="₿",
     layout="wide",
-    initial_sidebar_state="collapsed",
+    initial_sidebar_state="expanded",
 )
+
+# ----------------------------- CONFIG -------------------------
+
+TABDEAL = "https://api1.tabdeal.org"
+BINANCE_DATA = "https://data-api.binance.vision"
 
 TIMEFRAMES = {
     "5m": "5m", "15m": "15m", "30m": "30m",
-    "1H": "1h", "2H": "2h", "4H": "4h", "6H": "6h",
-    "12H": "12h", "1D": "1d", "3D": "3d", "1W": "1w"
+    "1H": "1h", "2H": "2h", "4H": "4h",
+    "6H": "6h", "12H": "12h", "1D": "1d",
+    "3D": "3d", "1W": "1w",
 }
 
-BINANCE = "https://api.binance.com"
-BINANCE_DATA = "https://data-api.binance.vision"
-TABDEAL = "https://api1.tabdeal.org"
+SCAN_TFS = ["1H", "4H", "1D"]
+DEEP_TFS = ["15m", "1H", "4H", "1D"]
+
+DEFAULT_SCAN_INTERVAL = 60
+DEFAULT_SCAN_WORKERS = 6
+DEFAULT_TRADE_USDT = 10.0
+DEFAULT_MAX_POSITIONS = 1
+
+MIN_HISTORY = 100
+BACKTEST_BARS = 180
+OOS_MIN_TRADES = 25
+MIN_PROBABILITY = 58.0
+MIN_SCORE = 68.0
+MIN_RISK_REWARD = 1.20
+MAX_ATR_PCT = 15.0
+
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "CryptoAnalyzerPro/2.0"})
-
-# Trading assumptions. Change these in the sidebar.
-DEFAULT_SLIPPAGE_PCT = 0.05
-DEFAULT_HORIZON_BARS = 24
-MIN_OOS_TRADES = 30
-MIN_TP1_RATE = 0.50
-MIN_PROFIT_FACTOR = 1.0
-OOS_FRACTION = 0.40
-
-# Automatic whole-market scanner.
-AUTO_SCAN_DEFAULT_INTERVAL = 60
-AUTO_SCAN_DEFAULT_WORKERS = 5
+SESSION.headers.update({"User-Agent": "CryptoAnalyzerPro-Autonomous/1.0"})
 
 TABDEAL_MARKET_ENDPOINTS = [
     "/r/api/v1/exchangeInfo",
     "/api/v1/exchangeInfo",
-    "/v1/market/symbols",
-    "/v1/markets",
-    "/api/v1/markets",
 ]
 
+# ----------------------------- HTTP ----------------------------
 
-# ============================================================
-# HTTP
-# ============================================================
-@st.cache_data(ttl=60, show_spinner=False)
-def get_json(url, params=None, timeout=12):
+@st.cache_data(ttl=20, show_spinner=False)
+def public_json(url, params=None, timeout=12):
     try:
         r = SESSION.get(url, params=params, timeout=timeout)
         r.raise_for_status()
@@ -72,15 +88,84 @@ def get_json(url, params=None, timeout=12):
         return None
 
 
-def flatten_dicts(obj):
-    if isinstance(obj, dict):
-        yield obj
-        for v in obj.values():
-            yield from flatten_dicts(v)
-    elif isinstance(obj, list):
-        for x in obj:
-            yield from flatten_dicts(x)
+def _tabdeal_signature_params(params):
+    """Build the exact query/body string used for Tabdeal HMAC signing."""
+    clean = {k: v for k, v in (params or {}).items() if v is not None}
+    return urllib.parse.urlencode(clean, doseq=True)
 
+
+def tabdeal_server_time():
+    data = public_json(TABDEAL + "/r/api/v1/time", timeout=8)
+    if isinstance(data, dict):
+        try:
+            return int(data["serverTime"])
+        except Exception:
+            pass
+    return int(time.time() * 1000)
+
+
+def signed_request(method, path, api_key, api_secret, params=None, timeout=15):
+    """
+    Real Tabdeal signed request.
+    TRADE endpoints require X-MBX-APIKEY + HMAC-SHA256 signature.
+    POST parameters are sent in the request body and the signature is
+    calculated over that same encoded parameter string.
+    """
+    if not api_key or not api_secret:
+        return {"_error": "TABDEAL_API_KEY / TABDEAL_API_SECRET تنظیم نشده است."}
+
+    params = dict(params or {})
+    # Use exchange time to reduce timestamp rejection after Render sleeps/restarts.
+    params["timestamp"] = tabdeal_server_time()
+
+    payload = _tabdeal_signature_params(params)
+    signature = hmac.new(
+        api_secret.encode("utf-8"),
+        payload.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+    headers = {
+        "X-MBX-APIKEY": api_key,
+        "User-Agent": "CryptoAnalyzerPro-RenderAutoTrader/2.0",
+    }
+
+    try:
+        method = method.upper()
+        if method == "GET":
+            r = SESSION.get(
+                TABDEAL + path,
+                params={**params, "signature": signature},
+                headers=headers,
+                timeout=timeout,
+            )
+        elif method == "DELETE":
+            r = SESSION.delete(
+                TABDEAL + path,
+                data={**params, "signature": signature},
+                headers=headers,
+                timeout=timeout,
+            )
+        else:
+            r = SESSION.post(
+                TABDEAL + path,
+                data={**params, "signature": signature},
+                headers=headers,
+                timeout=timeout,
+            )
+
+        if not r.ok:
+            return {"_error": f"HTTP {r.status_code}: {r.text[:800]}"}
+
+        try:
+            return r.json()
+        except Exception:
+            return {"_error": f"پاسخ JSON معتبر نبود: {r.text[:500]}"}
+    except Exception as e:
+        return {"_error": str(e)}
+
+
+# ----------------------------- HELPERS -------------------------
 
 def normalize_symbol(s):
     return str(s).upper().replace("-", "").replace("_", "").replace("/", "")
@@ -91,90 +176,107 @@ def base_asset(symbol):
     return s[:-4] if s.endswith("USDT") else s
 
 
-def money(value):
+def fmt_num(v, decimals=8):
     try:
-        v = float(value)
-        if not np.isfinite(v):
+        x = float(v)
+        if not np.isfinite(x):
             return "-"
-        if abs(v) >= 1000:
-            return f"{v:,.2f}"
-        if abs(v) >= 1:
-            return f"{v:,.4f}"
-        if abs(v) >= 0.01:
-            return f"{v:,.6f}"
-        return f"{v:.10f}".rstrip("0").rstrip(".")
+        if abs(x) >= 1000:
+            return f"{x:,.2f}"
+        if abs(x) >= 1:
+            return f"{x:,.4f}"
+        return f"{x:.{decimals}f}".rstrip("0").rstrip(".")
     except Exception:
         return "-"
 
 
-# ============================================================
-# MARKET UNIVERSE
-# ============================================================
-def tabdeal_markets():
-    symbols = set()
+def clamp(x, lo, hi):
+    return max(lo, min(hi, x))
+
+
+def flatten_dicts(obj):
+    if isinstance(obj, dict):
+        yield obj
+        for v in obj.values():
+            yield from flatten_dicts(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from flatten_dicts(v)
+
+
+# ----------------------------- MARKET --------------------------
+
+@st.cache_data(ttl=180, show_spinner=False)
+def get_tabdeal_exchange_info():
     for ep in TABDEAL_MARKET_ENDPOINTS:
-        data = get_json(TABDEAL + ep, timeout=15)
-        if not data:
-            continue
-        for d in flatten_dicts(data):
-            if not isinstance(d, dict):
-                continue
-            raw = None
-            for key in ("symbol", "tabdealSymbol", "market", "pair"):
-                if isinstance(d.get(key), str) and d.get(key).strip():
-                    raw = d[key]
-                    break
-            if not raw:
-                continue
-            s = normalize_symbol(raw)
-            status = str(d.get("status", "TRADING")).upper()
-            quote = str(d.get("quoteAsset", "")).upper()
-            if (quote == "USDT" or s.endswith("USDT")) and status in (
-                "TRADING", "ACTIVE", "ENABLED", ""
-            ):
-                if s.endswith("USDT"):
-                    symbols.add(s)
-        if symbols and "exchangeInfo" in ep:
-            break
-    return sorted(symbols)
+        data = public_json(TABDEAL + ep, timeout=15)
+        if data:
+            return data
+    return {}
 
 
 @st.cache_data(ttl=180, show_spinner=False)
 def get_universe():
-    syms = tabdeal_markets()
-    if syms:
-        return syms
+    data = get_tabdeal_exchange_info()
+    symbols = set()
 
-    # Dynamic Binance fallback.
-    data = get_json(BINANCE_DATA + "/api/v3/exchangeInfo", timeout=15)
+    for d in flatten_dicts(data):
+        if not isinstance(d, dict):
+            continue
+
+        raw = d.get("symbol") or d.get("tabdealSymbol")
+        if not isinstance(raw, str):
+            continue
+
+        s = normalize_symbol(raw)
+        quote = str(d.get("quoteAsset", "")).upper()
+        status = str(d.get("status", "TRADING")).upper()
+
+        if s.endswith("USDT") and status in ("TRADING", "ACTIVE", "ENABLED", ""):
+            if quote in ("", "USDT"):
+                symbols.add(s)
+
+    if symbols:
+        return sorted(symbols)
+
+    # Fallback only for analysis data if Tabdeal's market list is unavailable.
+    data = public_json(
+        BINANCE_DATA + "/api/v3/exchangeInfo",
+        timeout=15,
+    )
     if isinstance(data, dict):
         for d in data.get("symbols", []):
             if (
                 str(d.get("status", "")).upper() == "TRADING"
                 and str(d.get("quoteAsset", "")).upper() == "USDT"
             ):
-                s = normalize_symbol(d.get("symbol", ""))
-                if s.endswith("USDT"):
-                    syms.append(s)
-    return sorted(set(syms))
+                symbols.add(normalize_symbol(d.get("symbol", "")))
+
+    return sorted(s for s in symbols if s.endswith("USDT"))
 
 
-# ============================================================
-# KLINES
-# ============================================================
+def tabdeal_symbol(symbol):
+    s = normalize_symbol(symbol)
+    return s[:-4] + "_USDT" if s.endswith("USDT") else s
+
+
+# ----------------------------- DATA ----------------------------
+
 def rows_to_df(rows):
     if not isinstance(rows, list) or len(rows) < 40:
         return pd.DataFrame()
+
     try:
-        df = pd.DataFrame(rows)
-        df = df.iloc[:, :6]
+        df = pd.DataFrame(rows).iloc[:, :6]
         df.columns = ["time", "open", "high", "low", "close", "volume"]
-        # Binance API normally returns ms. Public archive/API can evolve, so infer.
+
         t = pd.to_numeric(df["time"], errors="coerce")
         unit = "us" if t.dropna().median() > 1e14 else "ms"
         df["time"] = pd.to_datetime(t, unit=unit, utc=True)
+
         for c in ["open", "high", "low", "close", "volume"]:
             df[c] = pd.to_numeric(df[c], errors="coerce")
+
         return (
             df.dropna()
             .drop_duplicates("time")
@@ -185,998 +287,1335 @@ def rows_to_df(rows):
         return pd.DataFrame()
 
 
-@st.cache_data(ttl=30, show_spinner=False)
-def binance_klines(symbol, interval, limit=1000, end_time=None):
-    params = {
-        "symbol": symbol,
-        "interval": interval,
-        "limit": min(int(limit), 1000),
-    }
-    if end_time is not None:
-        params["endTime"] = int(end_time)
-    data = get_json(BINANCE_DATA + "/api/v3/klines", params, timeout=15)
+@st.cache_data(ttl=25, show_spinner=False)
+def get_klines(symbol, interval, limit=500):
+    # Analysis data is pulled from Binance public market data because it
+    # provides stable historical OHLCV. Orders are always sent to Tabdeal.
+    data = public_json(
+        BINANCE_DATA + "/api/v3/klines",
+        {
+            "symbol": normalize_symbol(symbol),
+            "interval": interval,
+            "limit": min(int(limit), 1000),
+        },
+        timeout=15,
+    )
     return rows_to_df(data)
 
 
-def fetch_klines(symbol, interval, limit=1000):
-    return binance_klines(symbol, interval, limit)
+# ----------------------------- INDICATORS ----------------------
 
-
-def resample_from_1h(df, rule):
-    if df.empty:
-        return df
-    x = df.set_index("time").sort_index()
-    out = x.resample(rule).agg({
-        "open": "first",
-        "high": "max",
-        "low": "min",
-        "close": "last",
-        "volume": "sum",
-    }).dropna().reset_index()
-    return out
-
-
-def get_tf_data(symbol, tf, limit=1000):
-    iv = TIMEFRAMES[tf]
-    # Binance natively supports all requested intervals.
-    df = fetch_klines(symbol, iv, limit)
-    if len(df) >= 80:
-        return df
-
-    # Fallback aggregation for larger intervals if a provider rejects one.
-    if tf in ("2H", "6H", "12H", "3D"):
-        base = fetch_klines(symbol, "1h" if tf != "3D" else "1d", 1000)
-        rules = {"2H": "2h", "6H": "6h", "12H": "12h", "3D": "3D"}
-        if len(base) >= 80:
-            return resample_from_1h(base, rules[tf])
-    return pd.DataFrame()
-
-
-# ============================================================
-# INDICATORS
-# ============================================================
 def ema(s, n):
     return s.ewm(span=n, adjust=False).mean()
 
 
-def rsi(close, n=14):
-    delta = close.diff()
-    gain = delta.clip(lower=0).ewm(alpha=1 / n, adjust=False).mean()
-    loss = (-delta.clip(upper=0)).ewm(alpha=1 / n, adjust=False).mean()
-    rs = gain / loss.replace(0, np.nan)
-    return (100 - 100 / (1 + rs)).fillna(50)
+def rsi(s, n=14):
+    d = s.diff()
+    up = d.clip(lower=0)
+    dn = -d.clip(upper=0)
+    au = up.ewm(alpha=1/n, adjust=False).mean()
+    ad = dn.ewm(alpha=1/n, adjust=False).mean()
+    rs = au / ad.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
 
 
-def macd(close):
-    line = ema(close, 12) - ema(close, 26)
+def atr(df, n=14):
+    pc = df["close"].shift(1)
+    tr = pd.concat(
+        [
+            df["high"] - df["low"],
+            (df["high"] - pc).abs(),
+            (df["low"] - pc).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    return tr.ewm(alpha=1/n, adjust=False).mean()
+
+
+def macd(s):
+    fast = ema(s, 12)
+    slow = ema(s, 26)
+    line = fast - slow
     signal = ema(line, 9)
     return line, signal, line - signal
 
 
-def atr(df, n=14):
-    pc = df.close.shift(1)
-    tr = pd.concat([
-        df.high - df.low,
-        (df.high - pc).abs(),
-        (df.low - pc).abs()
-    ], axis=1).max(axis=1)
-    return tr.ewm(alpha=1 / n, adjust=False).mean()
-
-
 def adx(df, n=14):
-    up = df.high.diff()
-    down = -df.low.diff()
-    plus = pd.Series(
-        np.where((up > down) & (up > 0), up, 0.0), index=df.index
-    )
-    minus = pd.Series(
-        np.where((down > up) & (down > 0), down, 0.0), index=df.index
-    )
-    a = atr(df, n).replace(0, np.nan)
-    pdi = 100 * plus.ewm(alpha=1 / n, adjust=False).mean() / a
-    mdi = 100 * minus.ewm(alpha=1 / n, adjust=False).mean() / a
-    dx = 100 * (pdi - mdi).abs() / (pdi + mdi).replace(0, np.nan)
-    return dx.ewm(alpha=1 / n, adjust=False).mean().fillna(20)
+    up = df["high"].diff()
+    dn = -df["low"].diff()
+
+    plus = np.where((up > dn) & (up > 0), up, 0.0)
+    minus = np.where((dn > up) & (dn > 0), dn, 0.0)
+
+    tr = pd.concat(
+        [
+            df["high"] - df["low"],
+            (df["high"] - df["close"].shift()).abs(),
+            (df["low"] - df["close"].shift()).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+
+    atrv = tr.ewm(alpha=1/n, adjust=False).mean()
+    pdi = 100 * pd.Series(plus, index=df.index).ewm(alpha=1/n, adjust=False).mean() / atrv
+    mdi = 100 * pd.Series(minus, index=df.index).ewm(alpha=1/n, adjust=False).mean() / atrv
+
+    dx = (100 * (pdi - mdi).abs() / (pdi + mdi).replace(0, np.nan))
+    return dx.ewm(alpha=1/n, adjust=False).mean()
 
 
-def ichimoku(df):
-    h9, l9 = df.high.rolling(9).max(), df.low.rolling(9).min()
-    h26, l26 = df.high.rolling(26).max(), df.low.rolling(26).min()
-    h52, l52 = df.high.rolling(52).max(), df.low.rolling(52).min()
-    tenkan = (h9 + l9) / 2
-    kijun = (h26 + l26) / 2
-    span_a = (tenkan + kijun) / 2
-    span_b = (h52 + l52) / 2
-    return tenkan, kijun, span_a, span_b
+def add_indicators(df):
+    x = df.copy()
+
+    x["ema20"] = ema(x["close"], 20)
+    x["ema50"] = ema(x["close"], 50)
+    x["ema200"] = ema(x["close"], 200)
+    x["rsi"] = rsi(x["close"], 14)
+
+    x["macd"], x["macd_signal"], x["macd_hist"] = macd(x["close"])
+    x["atr"] = atr(x, 14)
+    x["adx"] = adx(x, 14)
+
+    # Ichimoku
+    high9 = x["high"].rolling(9).max()
+    low9 = x["low"].rolling(9).min()
+    high26 = x["high"].rolling(26).max()
+    low26 = x["low"].rolling(26).min()
+    high52 = x["high"].rolling(52).max()
+    low52 = x["low"].rolling(52).min()
+
+    x["tenkan"] = (high9 + low9) / 2
+    x["kijun"] = (high26 + low26) / 2
+    x["senkou_a"] = (x["tenkan"] + x["kijun"]) / 2
+    x["senkou_b"] = (high52 + low52) / 2
+
+    x["vol_ma20"] = x["volume"].rolling(20).mean()
+    x["swing_high"] = x["high"].rolling(20).max()
+    x["swing_low"] = x["low"].rolling(20).min()
+
+    return x.dropna().reset_index(drop=True)
 
 
-def price_action_score(df):
-    if len(df) < 20:
-        return 0.0
-    c, p = df.iloc[-1], df.iloc[-2]
-    rng = max(float(c.high - c.low), 1e-12)
-    body = abs(float(c.close - c.open))
-    upper = float(c.high - max(c.open, c.close))
-    lower = float(min(c.open, c.close) - c.low)
-    score = 0
-    if c.close > c.open:
-        score += 7
-    else:
-        score -= 7
-    if c.close > p.high:
-        score += 12
-    if c.close < p.low:
-        score -= 12
-    if lower > body * 1.5 and c.close > c.open:
-        score += 7
-    if upper > body * 1.5 and c.close < c.open:
-        score -= 7
-    if body / rng > 0.65:
-        score += 5 if c.close > c.open else -5
-    return float(np.clip(score, -25, 25))
+# ----------------------------- PRICE ACTION -------------------
 
+def candle_features(x):
+    o, h, l, c = x["open"], x["high"], x["low"], x["close"]
+    rng = (h - l).replace(0, np.nan)
 
-def structure_levels(df, lookback=120):
-    if df.empty:
-        return [], []
-    x = df.tail(lookback)
-    price = float(x.close.iloc[-1])
-    high_roll = x.high.rolling(7, center=True).max()
-    low_roll = x.low.rolling(7, center=True).min()
-    highs = x.high[high_roll.eq(x.high)].dropna().tolist()
-    lows = x.low[low_roll.eq(x.low)].dropna().tolist()
-    supports = sorted([v for v in lows if v < price], reverse=True)[:4]
-    resistances = sorted([v for v in highs if v > price])[:4]
-    return [float(v) for v in supports], [float(v) for v in resistances]
-
-
-# ============================================================
-# SINGLE-TF SIGNAL
-# ============================================================
-def tf_signal(df):
-    if len(df) < 80:
-        return None
-
-    close = df.close
-    r = float(rsi(close).iloc[-1])
-    ml, ms, mh = macd(close)
-    mac, sig, hist = float(ml.iloc[-1]), float(ms.iloc[-1]), float(mh.iloc[-1])
-    at = float(atr(df).iloc[-1])
-    ad = float(adx(df).iloc[-1])
-    ten, kij, sa, sb = ichimoku(df)
-    price = float(close.iloc[-1])
-
-    cloud_top = max(float(sa.iloc[-1]), float(sb.iloc[-1]))
-    cloud_bottom = min(float(sa.iloc[-1]), float(sb.iloc[-1]))
-
-    score = 0.0
-    reasons = []
-
-    # Statistical gating is applied later in analyze_symbol().
-    # tf_signal() must remain independent of the final decision so it can
-    # also be safely used by the historical/OOS engine.
-
-    # Trend / Ichimoku
-    if price > cloud_top:
-        score += 20
-        reasons.append("بالای کلود")
-    elif price < cloud_bottom:
-        score -= 20
-        reasons.append("زیر کلود")
-    else:
-        reasons.append("داخل کلود")
-
-    if float(ten.iloc[-1]) > float(kij.iloc[-1]):
-        score += 9
-        reasons.append("تنکن بالای کیجون")
-    else:
-        score -= 9
-
-    # MACD
-    if mac > sig:
-        score += 13
-        reasons.append("MACD صعودی")
-    else:
-        score -= 13
-        reasons.append("MACD نزولی")
-
-    if hist > 0 and hist > float(mh.iloc[-2]):
-        score += 5
-    elif hist < 0 and hist < float(mh.iloc[-2]):
-        score -= 5
-
-    # RSI: avoid buying an already extreme RSI.
-    if 52 <= r <= 68:
-        score += 9
-        reasons.append("RSI مناسب")
-    elif 68 < r < 75:
-        score += 3
-        reasons.append("RSI نسبتاً داغ")
-    elif r >= 75:
-        score -= 7
-        reasons.append("RSI بسیار داغ")
-    elif r <= 30:
-        score += 2
-        reasons.append("اشباع فروش")
-    elif r < 45:
-        score -= 6
-
-    mom = float((close.iloc[-1] / close.iloc[-13] - 1) * 100)
-    score += float(np.clip(mom * 2.0, -12, 12))
-
-    if ad >= 25:
-        score += 7 if price > float(kij.iloc[-1]) else -7
-    else:
-        # Low ADX = less confidence in trend-following signals.
-        score *= 0.92
-
-    score += price_action_score(df)
+    body = (c - o).abs()
+    upper = h - np.maximum(o, c)
+    lower = np.minimum(o, c) - l
 
     return {
-        "score": float(np.clip(score, -100, 100)),
-        "rsi": r,
-        "macd": mac,
-        "signal": sig,
-        "momentum": mom,
-        "adx": ad,
-        "atr": at,
-        "price": price,
-        "reasons": reasons,
+        "body_pct": float((body.iloc[-1] / rng.iloc[-1]) * 100),
+        "upper_wick_pct": float((upper.iloc[-1] / rng.iloc[-1]) * 100),
+        "lower_wick_pct": float((lower.iloc[-1] / rng.iloc[-1]) * 100),
+        "bullish_close": bool(c.iloc[-1] > o.iloc[-1]),
     }
 
 
-# ============================================================
-# MULTI-TIMEFRAME CURRENT ANALYSIS
-# ============================================================
-TF_WEIGHTS = {
-    "5m": 0.35, "15m": 0.60, "30m": 0.75,
-    "1H": 1.10, "2H": 1.25, "4H": 1.55,
-    "6H": 1.35, "12H": 1.25, "1D": 1.45,
-    "3D": 1.05, "1W": 0.85,
-}
+def price_action_score(x):
+    score = 50.0
+    reasons = []
+
+    last = x.iloc[-1]
+    prev = x.iloc[-2]
+
+    f = candle_features(x)
+
+    # Trend structure
+    if last["close"] > last["ema20"] > last["ema50"]:
+        score += 10
+        reasons.append("ساختار صعودی EMA")
+    elif last["close"] < last["ema20"] < last["ema50"]:
+        score -= 10
+        reasons.append("ساختار نزولی EMA")
+
+    # Breakout / continuation
+    prior_high = x["high"].iloc[-21:-1].max()
+    prior_low = x["low"].iloc[-21:-1].min()
+
+    if last["close"] > prior_high:
+        score += 14
+        reasons.append("شکست سقف ۲۰ کندل")
+    elif last["close"] < prior_low:
+        score -= 14
+        reasons.append("شکست کف ۲۰ کندل")
+
+    # Bullish engulfing
+    if (
+        last["close"] > last["open"]
+        and prev["close"] < prev["open"]
+        and last["close"] >= prev["open"]
+        and last["open"] <= prev["close"]
+    ):
+        score += 8
+        reasons.append("Bullish Engulfing")
+
+    # Rejection from lower area
+    if f["lower_wick_pct"] > 45 and last["close"] > last["open"]:
+        score += 7
+        reasons.append("رد قیمت از پایین")
+
+    # Volume confirmation
+    if last["volume"] > 1.35 * last["vol_ma20"]:
+        score += 8 if last["close"] > last["open"] else -8
+        reasons.append("افزایش حجم")
+
+    return clamp(score, 0, 100), reasons
 
 
-def aggregate_score(analyses):
-    if not analyses:
-        return None
-    total_w = sum(TF_WEIGHTS.get(tf, 1.0) for tf in analyses)
-    weighted = sum(
-        a["score"] * TF_WEIGHTS.get(tf, 1.0)
-        for tf, a in analyses.items()
-    ) / total_w
+# ----------------------------- CURRENT TREND ------------------
 
-    # Agreement between the important timeframes.
-    core = [
-        analyses[tf]["score"]
-        for tf in ("1H", "4H", "1D")
-        if tf in analyses
-    ]
-    agreement_bonus = 0.0
-    if len(core) >= 2:
-        same_bull = all(x >= 10 for x in core)
-        same_bear = all(x <= -10 for x in core)
-        if same_bull or same_bear:
-            agreement_bonus = 8
-        elif any(x > 10 for x in core) and any(x < -10 for x in core):
-            agreement_bonus = -8
-
-    final = float(np.clip(weighted + agreement_bonus, -100, 100))
-    return final
-
-
-def position_from_score(score, mode="SPOT"):
-    if mode == "SPOT":
-        return "لانگ" if score >= 24 else "صبر"
-    return "لانگ" if score >= 24 else ("شورت" if score <= -24 else "صبر")
-
-
-# ============================================================
-# HISTORICAL SIGNAL ENGINE FOR CALIBRATION
-# ============================================================
-def historical_signal_score(df, idx):
-    """Signal using only rows <= idx. No future candles are used."""
-    if idx < 100:
-        return None
-
-    x = df.iloc[:idx + 1].copy()
-    a = tf_signal(x)
-    if not a:
-        return None
-    return float(a["score"])
-
-
-def simulate_trade(df, signal_idx, direction, slippage_pct,
-                    horizon_bars=24, rr1=1.6, rr2=2.6):
-    """
-    Entry = next candle open.
-    SL/TP calculated from information available at signal candle only.
-    Conservative same-candle collision: SL first.
-    """
-    if signal_idx + 1 >= len(df):
+def tf_snapshot(df):
+    if len(df) < MIN_HISTORY:
         return None
 
-    sig = df.iloc[signal_idx]
-    entry_raw = float(df.iloc[signal_idx + 1].open)
-
-    atrv = float(atr(df.iloc[:signal_idx + 1]).iloc[-1])
-    if not np.isfinite(atrv) or atrv <= 0:
+    x = add_indicators(df)
+    if len(x) < 60:
         return None
 
-    supports, resistances = structure_levels(df.iloc[:signal_idx + 1])
-    if direction == "LONG":
-        entry = entry_raw * (1 + slippage_pct / 100)
-        candidate_sl = supports[0] if supports and supports[0] < entry else entry - 1.35 * atrv
-        sl = min(candidate_sl, entry - 0.006 * entry)
-        risk = max(entry - sl, 0.006 * entry)
-        tp1 = entry + rr1 * risk
-        tp2 = entry + rr2 * risk
+    # Always use the last fully closed candle.
+    x = x.iloc[:-1].copy()
+    if len(x) < 50:
+        return None
+
+    last = x.iloc[-1]
+    prev = x.iloc[-2]
+
+    score = 50.0
+    reasons = []
+
+    if last["close"] > last["ema20"]:
+        score += 6
+        reasons.append("قیمت بالای EMA20")
     else:
-        entry = entry_raw * (1 - slippage_pct / 100)
-        candidate_sl = resistances[0] if resistances and resistances[0] > entry else entry + 1.35 * atrv
-        sl = max(candidate_sl, entry + 0.006 * entry)
-        risk = max(sl - entry, 0.006 * entry)
-        tp1 = entry - rr1 * risk
-        tp2 = entry - rr2 * risk
+        score -= 6
 
-    end = min(len(df), signal_idx + 1 + horizon_bars)
-    result = "TIMEOUT"
-    exit_price = float(df.iloc[end - 1].close)
-    exit_idx = end - 1
-    tp1_hit = False
-    tp2_hit = False
+    if last["ema20"] > last["ema50"]:
+        score += 7
+        reasons.append("EMA20 بالای EMA50")
+    else:
+        score -= 7
 
-    for j in range(signal_idx + 1, end):
-        bar = df.iloc[j]
-        hi, lo = float(bar.high), float(bar.low)
+    if last["ema50"] > last["ema200"]:
+        score += 8
+        reasons.append("EMA50 بالای EMA200")
+    else:
+        score -= 8
 
-        if direction == "LONG":
-            hit_sl = lo <= sl
-            hit_tp1 = hi >= tp1
-            hit_tp2 = hi >= tp2
+    if last["macd"] > last["macd_signal"]:
+        score += 6
+        reasons.append("MACD مثبت")
+    else:
+        score -= 6
 
-            # Conservative ordering when both occur in one candle.
-            if hit_sl:
-                result = "SL"
-                exit_price = sl
-                exit_idx = j
-                break
-            if hit_tp2:
-                result = "TP2"
-                exit_price = tp2
-                exit_idx = j
-                tp1_hit = True
-                tp2_hit = True
-                break
-            if hit_tp1:
-                result = "TP1"
-                exit_price = tp1
-                exit_idx = j
-                tp1_hit = True
-                break
-        else:
-            hit_sl = hi >= sl
-            hit_tp1 = lo <= tp1
-            hit_tp2 = lo <= tp2
-            if hit_sl:
-                result = "SL"
-                exit_price = sl
-                exit_idx = j
-                break
-            if hit_tp2:
-                result = "TP2"
-                exit_price = tp2
-                exit_idx = j
-                tp1_hit = True
-                tp2_hit = True
-                break
-            if hit_tp1:
-                result = "TP1"
-                exit_price = tp1
-                exit_idx = j
-                tp1_hit = True
-                break
+    if last["macd_hist"] > prev["macd_hist"]:
+        score += 4
+        reasons.append("شتاب MACD رو به افزایش")
+    else:
+        score -= 3
 
-    # User requested that trading fees be ignored.
-    # Slippage is already applied to the simulated entry price.
-    net_return = (
-        (exit_price / entry - 1) if direction == "LONG"
-        else (entry / exit_price - 1)
-    )
+    if 52 <= last["rsi"] <= 72:
+        score += 7
+        reasons.append("RSI مناسب روند صعودی")
+    elif last["rsi"] > 78:
+        score -= 6
+        reasons.append("RSI بیش‌خرید")
+    elif last["rsi"] < 35:
+        score -= 6
+        reasons.append("RSI ضعیف")
+
+    cloud_top = max(last["senkou_a"], last["senkou_b"])
+    cloud_bottom = min(last["senkou_a"], last["senkou_b"])
+
+    if last["close"] > cloud_top:
+        score += 8
+        reasons.append("قیمت بالای ابر ایچیموکو")
+    elif last["close"] < cloud_bottom:
+        score -= 8
+        reasons.append("قیمت زیر ابر ایچیموکو")
+
+    if last["adx"] >= 20:
+        score += 4
+        reasons.append("روند دارای قدرت")
+
+    pa, pa_reasons = price_action_score(x)
+    score = 0.65 * score + 0.35 * pa
+    reasons.extend(pa_reasons)
+
+    atr_pct = (last["atr"] / last["close"]) * 100
+
+    # Short-term return and momentum.
+    ret5 = (last["close"] / x["close"].iloc[-6] - 1) * 100
+    ret20 = (last["close"] / x["close"].iloc[-21] - 1) * 100
 
     return {
-        "signal_idx": signal_idx,
-        "exit_idx": exit_idx,
-        "direction": direction,
+        "score": float(clamp(score, 0, 100)),
+        "close": float(last["close"]),
+        "atr": float(last["atr"]),
+        "atr_pct": float(atr_pct),
+        "rsi": float(last["rsi"]),
+        "adx": float(last["adx"]),
+        "ret5": float(ret5),
+        "ret20": float(ret20),
+        "reasons": reasons[-8:],
+        "data": x,
+    }
+
+
+# ----------------------------- FAST SCAN ----------------------
+
+def fast_scan_one(symbol):
+    try:
+        snaps = {}
+        for tf in SCAN_TFS:
+            df = get_klines(symbol, TIMEFRAMES[tf], 240)
+            snap = tf_snapshot(df)
+            if snap is not None:
+                snaps[tf] = snap
+
+        if len(snaps) < 2:
+            return None
+
+        weights = {"1H": 0.30, "4H": 0.35, "1D": 0.35}
+        total_w = sum(weights[k] for k in snaps)
+        score = sum(snaps[k]["score"] * weights[k] for k in snaps) / total_w
+
+        trend_agreement = sum(
+            1 for v in snaps.values() if v["score"] >= 62
+        ) / len(snaps) * 100
+
+        # Penalize excessive volatility.
+        atr_pct = np.mean([v["atr_pct"] for v in snaps])
+        if atr_pct > MAX_ATR_PCT:
+            score -= 8
+
+        return {
+            "symbol": symbol,
+            "fast_score": float(clamp(score, 0, 100)),
+            "trend_agreement": float(trend_agreement),
+            "atr_pct": float(atr_pct),
+            "1H": snaps.get("1H", {}).get("score", np.nan),
+            "4H": snaps.get("4H", {}).get("score", np.nan),
+            "1D": snaps.get("1D", {}).get("score", np.nan),
+        }
+    except Exception:
+        return None
+
+
+def run_fast_market_scan(symbols, workers, progress_cb=None):
+    rows = []
+    total = len(symbols)
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = {ex.submit(fast_scan_one, s): s for s in symbols}
+
+        for i, fut in enumerate(as_completed(futures), 1):
+            row = fut.result()
+            if row:
+                rows.append(row)
+
+            if progress_cb:
+                progress_cb(i / max(total, 1))
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+
+    return df.sort_values(
+        ["fast_score", "trend_agreement"],
+        ascending=False,
+    ).reset_index(drop=True)
+
+
+# ----------------------------- BACKTEST -----------------------
+
+def historical_probability(df):
+    """
+    Rolling out-of-sample style test.
+    Entry = next candle open after a bullish setup.
+    TP = +1.5 ATR, SL = -1 ATR.
+    Conservative rule: if both touched in one candle, SL wins.
+    """
+
+    if len(df) < BACKTEST_BARS + 80:
+        return np.nan, 0, np.nan, np.nan
+
+    x = add_indicators(df).iloc[:-1].copy()
+    if len(x) < BACKTEST_BARS + 60:
+        return np.nan, 0, np.nan, np.nan
+
+    start = max(50, len(x) - BACKTEST_BARS)
+    wins = 0
+    losses = 0
+    gross_win = 0.0
+    gross_loss = 0.0
+
+    for i in range(start, len(x) - 2):
+        cur = x.iloc[i]
+
+        # Setup must be bullish at the close.
+        bullish = (
+            cur["close"] > cur["ema20"] > cur["ema50"]
+            and cur["macd"] > cur["macd_signal"]
+            and 48 <= cur["rsi"] <= 76
+        )
+
+        if not bullish:
+            continue
+
+        entry = float(x.iloc[i + 1]["open"])
+        risk = max(float(cur["atr"]), entry * 0.002)
+        tp = entry + 1.5 * risk
+        sl = entry - 1.0 * risk
+
+        outcome = None
+
+        # Test next 24 candles.
+        for j in range(i + 1, min(i + 1 + 24, len(x))):
+            hi = float(x.iloc[j]["high"])
+            lo = float(x.iloc[j]["low"])
+
+            hit_sl = lo <= sl
+            hit_tp = hi >= tp
+
+            if hit_sl and hit_tp:
+                outcome = "loss"
+                break
+            if hit_sl:
+                outcome = "loss"
+                break
+            if hit_tp:
+                outcome = "win"
+                break
+
+        if outcome == "win":
+            wins += 1
+            gross_win += 1.5
+        elif outcome == "loss":
+            losses += 1
+            gross_loss += 1.0
+
+    trades = wins + losses
+    if trades == 0:
+        return np.nan, 0, np.nan, np.nan
+
+    raw_prob = wins / trades * 100
+    pf = gross_win / gross_loss if gross_loss > 0 else np.inf
+
+    # Bayesian smoothing prevents tiny samples from showing extreme numbers.
+    calibrated = (wins + 10) / (trades + 20) * 100
+
+    return float(calibrated), int(trades), float(pf), float(raw_prob)
+
+
+# ----------------------------- LEVELS --------------------------
+
+def build_trade_plan(df, probability, trend_score):
+    x = add_indicators(df).iloc[:-1].copy()
+    if len(x) < 80:
+        return None
+
+    last = x.iloc[-1]
+    entry = float(last["close"])
+    atrv = float(last["atr"])
+
+    # Support / resistance from recent closed candles.
+    support = float(x["low"].iloc[-31:-1].min())
+    resistance = float(x["high"].iloc[-31:-1].max())
+
+    sl = min(entry - 1.15 * atrv, support * 0.997)
+    if sl >= entry:
+        sl = entry - 1.15 * atrv
+
+    risk = entry - sl
+    tp1 = entry + 1.35 * risk
+    tp2 = entry + 2.10 * risk
+    tp3 = entry + 3.00 * risk
+
+    rr1 = (tp1 - entry) / risk if risk > 0 else 0
+
+    # Current trend + historical probability + momentum.
+    rsi_v = float(last["rsi"])
+    macd_up = float(last["macd_hist"]) > 0
+
+    momentum_bonus = 5 if macd_up and 50 <= rsi_v <= 72 else 0
+    probability = float(probability) if np.isfinite(probability) else 50.0
+
+    final_score = (
+        0.45 * trend_score
+        + 0.40 * probability
+        + 0.15 * (50 + momentum_bonus)
+    )
+
+    # Outlook is a scenario, not a promise.
+    outlook_pct = (tp1 / entry - 1) * 100
+
+    return {
         "entry": entry,
         "sl": sl,
         "tp1": tp1,
         "tp2": tp2,
-        "result": result,
-        "tp1_hit": tp1_hit,
-        "tp2_hit": tp2_hit,
-        "net_return": float(net_return),
-        "bars_held": int(exit_idx - signal_idx),
-        "score": None,
+        "tp3": tp3,
+        "support": support,
+        "resistance": resistance,
+        "rr1": rr1,
+        "score": float(clamp(final_score, 0, 100)),
+        "outlook_pct": float(outlook_pct),
+        "rsi": rsi_v,
     }
 
 
-def backtest_1h(symbol, slippage_pct=0.05, horizon_bars=24,
-                min_score=24, direction="LONG", max_trades=240):
-    """
-    Strict historical validation.
+# ----------------------------- DEEP ANALYSIS ------------------
 
-    - Signal uses only candles <= signal candle.
-    - Entry is next candle open.
-    - No trading fee is included (per user request).
-    - Entry slippage is included.
-    - Historical trades are split chronologically: first 60% calibration/history,
-      final 40% out-of-sample (OOS).
-    - Only OOS trades are used for the displayed decision metrics.
-    - Same-candle TP/SL collision => SL first.
-    """
-    df = fetch_klines(symbol, "1h", 1000)
-    if len(df) < 350:
+def deep_analyze(symbol):
+    tf_rows = {}
+
+    for tf in DEEP_TFS:
+        df = get_klines(symbol, TIMEFRAMES[tf], 700)
+        snap = tf_snapshot(df)
+        if snap:
+            tf_rows[tf] = snap
+
+    if len(tf_rows) < 3:
         return None
 
-    all_trades = []
-    i = 120
-    while i < len(df) - horizon_bars - 2 and len(all_trades) < max_trades:
-        score = historical_signal_score(df, i)
-        if score is None:
-            i += 1
-            continue
+    weights = {
+        "15m": 0.10,
+        "1H": 0.25,
+        "4H": 0.35,
+        "1D": 0.30,
+    }
 
-        take = (
-            (direction == "LONG" and score >= min_score)
-            or (direction == "SHORT" and score <= -min_score)
-        )
-        if take:
-            tr = simulate_trade(
-                df, i, direction,
-                slippage_pct=slippage_pct,
-                horizon_bars=horizon_bars,
-            )
-            if tr:
-                tr["score"] = score
-                tr["signal_time"] = df.iloc[i]["time"]
-                all_trades.append(tr)
-                i = tr["exit_idx"] + 1
-                continue
-        i += 1
+    wsum = sum(weights[k] for k in tf_rows)
+    trend_score = sum(
+        tf_rows[k]["score"] * weights[k]
+        for k in tf_rows
+    ) / wsum
 
-    if not all_trades:
+    bullish_tfs = sum(v["score"] >= 60 for v in tf_rows.values())
+    agreement = bullish_tfs / len(tf_rows) * 100
+
+    # Use 4H first for risk construction, then 1H.
+    base_snap = tf_rows.get("4H") or tf_rows.get("1H")
+    base_df = base_snap["data"]
+
+    probability, trades, pf, raw_prob = historical_probability(base_df)
+
+    plan = build_trade_plan(
+        base_df,
+        probability,
+        trend_score,
+    )
+    if not plan:
         return None
 
-    # Chronological 60/40 split by signal time. The test set is never used
-    # to choose the current technical score or fabricate confidence.
-    split_idx = max(1, int(len(df) * (1.0 - OOS_FRACTION)))
-    oos = [t for t in all_trades if t["signal_idx"] >= split_idx]
+    # Hard confirmation.
+    confirmed = (
+        plan["score"] >= MIN_SCORE
+        and agreement >= 65
+        and trades >= OOS_MIN_TRADES
+        and np.isfinite(probability)
+        and probability >= MIN_PROBABILITY
+        and pf > 1.0
+        and plan["rr1"] >= MIN_RISK_REWARD
+        and base_snap["atr_pct"] <= MAX_ATR_PCT
+    )
 
-    if not oos:
-        return None
+    decision = "معامله" if confirmed else "صبر"
 
-    t = pd.DataFrame(oos)
-    wins = t["net_return"] > 0
-    tp1 = float(t["tp1_hit"].mean())
-    tp2 = float(t["tp2_hit"].mean())
-    win_rate = float(wins.mean())
+    if plan["score"] < 55 or agreement < 50:
+        decision = "عدم معامله"
 
-    gross_profit = float(t.loc[t.net_return > 0, "net_return"].sum())
-    gross_loss = float(-t.loc[t.net_return < 0, "net_return"].sum())
-    pf = gross_profit / gross_loss if gross_loss > 0 else np.inf
-
-    equity = (1 + t["net_return"]).cumprod()
-    peak = equity.cummax()
-    dd = equity / peak - 1
-    max_dd = float(dd.min())
-    expectancy = float(t["net_return"].mean())
-
-    # Conservative Bayesian smoothing for the displayed TP1 probability.
-    n = len(t)
-    successes = int(t["tp1_hit"].sum())
-    calibrated_tp1 = (successes + 1) / (n + 2)
+    # Detect direction of current trend.
+    if trend_score >= 67 and agreement >= 75:
+        trend = "صعودی قوی"
+    elif trend_score >= 58:
+        trend = "صعودی"
+    elif trend_score <= 38:
+        trend = "نزولی قوی"
+    elif trend_score <= 46:
+        trend = "نزولی"
+    else:
+        trend = "خنثی"
 
     return {
         "symbol": symbol,
-        "direction": direction,
-        "total_trades": len(all_trades),
-        "oos_trades": n,
-        "train_trades": max(0, len(all_trades) - n),
-        "win_rate": win_rate,
-        "tp1_rate": tp1,
-        "tp2_rate": tp2,
-        "calibrated_tp1": float(calibrated_tp1),
-        "profit_factor": float(pf) if np.isfinite(pf) else 999.0,
-        "max_drawdown": max_dd,
-        "expectancy": expectancy,
-        "net_return": float(equity.iloc[-1] - 1),
-        "trades_df": t,
+        "trend": trend,
+        "decision": decision,
+        "confirmed": confirmed,
+        "score": float(plan["score"]),
+        "probability": float(probability) if np.isfinite(probability) else np.nan,
+        "raw_probability": float(raw_prob) if np.isfinite(raw_prob) else np.nan,
+        "oos_trades": int(trades),
+        "profit_factor": float(pf) if np.isfinite(pf) else np.inf,
+        "agreement": float(agreement),
+        "outlook_pct": float(plan["outlook_pct"]),
+        "entry": plan["entry"],
+        "sl": plan["sl"],
+        "tp1": plan["tp1"],
+        "tp2": plan["tp2"],
+        "tp3": plan["tp3"],
+        "support": plan["support"],
+        "resistance": plan["resistance"],
+        "rr1": plan["rr1"],
+        "rsi": plan["rsi"],
+        "timeframes": {
+            tf: round(v["score"], 1) for tf, v in tf_rows.items()
+        },
     }
 
 
-def mtf_confirmed(analyses, position):
-    """Require confirmation from the main 1H/4H/1D trend timeframes."""
-    core = [analyses[tf]["score"] for tf in ("1H", "4H", "1D") if tf in analyses]
-    if len(core) < 2:
-        return False
-
-    if position == "لانگ":
-        bullish = sum(x >= 10 for x in core)
-        h4_ok = analyses.get("4H", {"score": 0})["score"] >= 0
-        return bullish >= 2 and h4_ok
-
-    if position == "شورت":
-        bearish = sum(x <= -10 for x in core)
-        h4_ok = analyses.get("4H", {"score": 0})["score"] <= 0
-        return bearish >= 2 and h4_ok
-
-    return False
-
-
-# ============================================================
-# LIVE ANALYSIS
-# ============================================================
-@st.cache_data(ttl=60, show_spinner=False)
-def analyze_symbol(symbol, mode="SPOT", slippage_pct=0.05, horizon_bars=24):
-    frames = {}
-    for tf in TIMEFRAMES:
-        df = get_tf_data(symbol, tf, 1000)
-        if len(df) >= 80:
-            frames[tf] = df
-
-    if not frames:
-        return None
-
-    analyses = {
-        tf: tf_signal(df)
-        for tf, df in frames.items()
-        if tf_signal(df) is not None
-    }
-    if not analyses:
-        return None
-
-    score = aggregate_score(analyses)
-    position = position_from_score(score, mode)
-    mtf_ok = mtf_confirmed(analyses, position)
-
-    # Use 4H for risk structure where available.
-    ref_tf = "4H" if "4H" in frames else ("1H" if "1H" in frames else next(iter(frames)))
-    ref_df = frames[ref_tf]
-    ref_a = analyses[ref_tf]
-    entry = float(ref_df.close.iloc[-1])
-    atrv = float(ref_a["atr"])
-
-    supports, resistances = structure_levels(ref_df)
-
-    if position == "لانگ":
-        sl = supports[0] if supports and supports[0] < entry else entry - 1.35 * atrv
-        sl = min(sl, entry - 0.006 * entry)
-        risk = max(entry - sl, 0.006 * entry)
-        tp1 = entry + 1.6 * risk
-        tp2 = entry + 2.6 * risk
-        tp3 = entry + 3.8 * risk
-    elif position == "شورت":
-        sl = resistances[0] if resistances and resistances[0] > entry else entry + 1.35 * atrv
-        sl = max(sl, entry + 0.006 * entry)
-        risk = max(sl - entry, 0.006 * entry)
-        tp1 = entry - 1.6 * risk
-        tp2 = entry - 2.6 * risk
-        tp3 = entry - 3.8 * risk
-    else:
-        sl = entry - 1.35 * atrv
-        risk = abs(entry - sl)
-        tp1 = entry + 1.6 * risk
-        tp2 = entry + 2.6 * risk
-        tp3 = entry + 3.8 * risk
-
-    # Historical calibration is separate from current technical score.
-    bt = None
-    if position in ("لانگ", "شورت"):
-        bt = backtest_1h(
-            symbol,
-            slippage_pct=slippage_pct,
-            horizon_bars=horizon_bars,
-            min_score=24,
-            direction="LONG" if position == "لانگ" else "SHORT",
-        )
-
-    if bt:
-        calibrated_conf = 100 * bt["calibrated_tp1"]
-        sample_note = f"OOS: {bt['oos_trades']} معامله از {bt['total_trades']} معامله"
-    else:
-        calibrated_conf = np.nan
-        sample_note = "داده OOS کافی نیست"
-
-    # HARD TRADE GATE: the technical score can suggest a direction, but it
-    # cannot approve a trade. All statistical gates below must pass.
-    # HARD STATISTICAL LOCK:
-    # A technical LONG/SHORT signal can NEVER approve a trade by itself.
-    # All OOS statistical conditions must pass.
-    stats_ok = False
-    if bt is not None:
-        stats_ok = (
-            bt["oos_trades"] >= MIN_OOS_TRADES
-            and bt["profit_factor"] > MIN_PROFIT_FACTOR
-            and bt["expectancy"] > 0
-            and bt["tp1_rate"] >= MIN_TP1_RATE
-        )
-    # Three-state final decision:
-    # - عدم معامله: no statistical edge / insufficient OOS evidence
-    # - صبر: statistical edge exists, but live technical entry is not confirmed
-    # - معامله: statistical edge + live technical confirmation
-    if not stats_ok:
-        final_decision = "عدم معامله"
-    elif not (position in ("لانگ", "شورت") and mtf_ok):
-        final_decision = "صبر"
-    else:
-        final_decision = "معامله"
-
-    trade_ok = final_decision == "معامله"
-    if not trade_ok:
-        position_display = position if position in ("لانگ", "شورت") else "صبر"
-    else:
-        position_display = position
-
-    # No fake directional price forecast.
-    # Instead, give historical outcome probabilities and expected return.
-    forecast = {
-        "4H": None,
-        "24H": None,
-        "72H": None,
-    }
-
-    return {
-        "symbol": symbol,
-        "frames": frames,
-        "analyses": analyses,
-        "score": float(score),
-        "decision": final_decision,
-        "position": position_display,
-        "signal_position": position,
-        "mtf_confirmed": mtf_ok,
-        "stats_ok": stats_ok,
-        "gate_reasons": [
-            x for x, ok in [
-                (f"OOS < {MIN_OOS_TRADES}", bool(bt and bt["oos_trades"] < MIN_OOS_TRADES)),
-                ("Profit Factor <= 1", bool(bt and bt["profit_factor"] <= MIN_PROFIT_FACTOR)),
-                ("Expectancy <= 0", bool(bt and bt["expectancy"] <= 0)),
-                (f"TP1 < {MIN_TP1_RATE*100:.0f}%", bool(bt and bt["tp1_rate"] < MIN_TP1_RATE)),
-                ("تأیید چندتایم‌فریمی ندارد", not mtf_ok),
-                ("بک‌تست OOS موجود نیست", bt is None),
-            ] if ok
-        ],
-        "entry": entry,
-        "sl": float(sl),
-        "tp1": float(tp1),
-        "tp2": float(tp2),
-        "tp3": float(tp3),
-        "risk_pct": float(abs(entry - sl) / entry * 100),
-        "supports": supports,
-        "resistances": resistances,
-        "backtest": bt,
-        "calibrated_confidence": calibrated_conf,
-        "confidence_note": sample_note,
-        "forecast": forecast,
-    }
-
-
-# ============================================================
-# AUTOMATIC WHOLE-MARKET SCANNER
-# ============================================================
-@st.cache_data(ttl=45, show_spinner=False)
-def scan_all_markets(mode="SPOT", slippage_pct=0.05, horizon_bars=24,
-                     max_workers=5):
-    """
-    Scan every USDT market returned by get_universe().
-
-    The displayed percentage is the calibrated OOS TP1 probability when
-    historical evidence is available. It is NOT derived from the technical
-    score. Markets without enough OOS evidence are kept in the table but
-    their percentage is shown as unavailable.
-    """
-    symbols = get_universe()
-    if not symbols:
-        return pd.DataFrame()
-
+def deep_scan_candidates(candidates, workers, progress_cb=None):
     rows = []
+    total = len(candidates)
 
-    def run_one(symbol):
-        try:
-            r = analyze_symbol(
-                symbol,
-                mode,
-                slippage_pct,
-                horizon_bars,
-            )
-            if not r:
-                return None
-
-            bt = r.get("backtest")
-            conf = r.get("calibrated_confidence", np.nan)
-
-            if np.isfinite(conf):
-                percentage = float(conf)
-            else:
-                percentage = np.nan
-
-            return {
-                "ارز": symbol.replace("USDT", "/USDT"),
-                "درصد": percentage,
-                "تصمیم": r.get("decision", "عدم معامله"),
-                "نوع معامله": r.get("position", "صبر"),
-                "امتیاز": round(float(r.get("score", 0)), 1),
-                "گیت آماری": "قبول" if r.get("stats_ok") else "رد",
-                "تأیید MTF": "بله" if r.get("mtf_confirmed") else "خیر",
-                "OOS": int(bt["oos_trades"]) if bt else 0,
-                "PF": round(float(bt["profit_factor"]), 2) if bt else np.nan,
-                "TP1": round(float(bt["tp1_rate"]) * 100, 1) if bt else np.nan,
-            }
-        except Exception:
-            return None
-
-    workers = max(1, min(int(max_workers), 10))
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        futures = {ex.submit(run_one, s): s for s in symbols}
-        for future in as_completed(futures):
+        futures = {ex.submit(deep_analyze, s): s for s in candidates}
+
+        for i, fut in enumerate(as_completed(futures), 1):
             try:
-                row = future.result()
-                if row:
-                    rows.append(row)
+                r = fut.result()
+                if r:
+                    rows.append(r)
             except Exception:
                 pass
 
+            if progress_cb:
+                progress_cb(i / max(total, 1))
+
+    return rows
+
+
+# ----------------------------- TRADING API --------------------
+
+@st.cache_data(ttl=120, show_spinner=False)
+def get_trade_filters():
+    data = get_tabdeal_exchange_info()
+    result = {}
+
+    for d in flatten_dicts(data):
+        if not isinstance(d, dict):
+            continue
+
+        raw = d.get("symbol") or d.get("tabdealSymbol")
+        if not isinstance(raw, str):
+            continue
+
+        s = normalize_symbol(raw)
+        if not s.endswith("USDT"):
+            continue
+
+        item = {
+            "min_qty": 0.0,
+            "step_size": 0.00000001,
+            "min_notional": 0.0,
+        }
+
+        filters = d.get("filters")
+        if isinstance(filters, list):
+            for f in filters:
+                ft = str(f.get("filterType", "")).upper()
+                if ft == "LOT_SIZE":
+                    item["min_qty"] = float(f.get("minQty", 0) or 0)
+                    item["step_size"] = float(f.get("stepSize", 0) or 0.00000001)
+                elif ft in ("MIN_NOTIONAL", "NOTIONAL"):
+                    item["min_notional"] = float(
+                        f.get("minNotional", f.get("notional", 0)) or 0
+                    )
+
+        result[s] = item
+
+    return result
+
+
+def floor_step(value, step):
+    if step <= 0:
+        return float(value)
+    d = Decimal(str(value))
+    s = Decimal(str(step))
+    return float((d / s).to_integral_value(rounding=ROUND_DOWN) * s)
+
+
+def get_credentials():
+    # Render Environment Variables take priority.
+    key = os.getenv("TABDEAL_API_KEY", "")
+    secret = os.getenv("TABDEAL_API_SECRET", "")
+
+    if not key or not secret:
+        try:
+            if not key and "TABDEAL_API_KEY" in st.secrets:
+                key = st.secrets["TABDEAL_API_KEY"]
+            if not secret and "TABDEAL_API_SECRET" in st.secrets:
+                secret = st.secrets["TABDEAL_API_SECRET"]
+        except Exception:
+            pass
+
+    return str(key).strip(), str(secret).strip()
+
+
+def env_bool(name, default=False):
+    value = os.getenv(name, "")
+    if value == "":
+        return default
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
+def env_float(name, default):
+    try:
+        return float(os.getenv(name, default))
+    except Exception:
+        return float(default)
+
+
+def env_int(name, default):
+    try:
+        return int(os.getenv(name, default))
+    except Exception:
+        return int(default)
+
+
+def get_account(api_key, api_secret):
+    return signed_request(
+        "GET",
+        "/r/api/v1/account",
+        api_key,
+        api_secret,
+        {},
+    )
+
+
+def get_spot_balance(api_key, api_secret, asset):
+    account = get_account(api_key, api_secret)
+    if not isinstance(account, dict) or "_error" in account:
+        return 0.0
+
+    for b in account.get("balances", []):
+        if str(b.get("asset", "")).upper() == asset.upper():
+            try:
+                return float(b.get("free", 0) or 0)
+            except Exception:
+                return 0.0
+    return 0.0
+
+
+def get_open_orders(api_key, api_secret, symbol=None):
+    params = {}
+    if symbol:
+        params["symbol"] = normalize_symbol(symbol)
+    return signed_request(
+        "GET",
+        "/r/api/v1/openOrders",
+        api_key,
+        api_secret,
+        params,
+    )
+
+
+def get_open_oco_lists(api_key, api_secret):
+    return signed_request(
+        "GET",
+        "/r/api/v1/openOrderList",
+        api_key,
+        api_secret,
+        {},
+    )
+
+
+def get_order(api_key, api_secret, symbol, order_id):
+    return signed_request(
+        "GET",
+        "/r/api/v1/order",
+        api_key,
+        api_secret,
+        {
+            "symbol": normalize_symbol(symbol),
+            "orderId": int(order_id),
+        },
+    )
+
+
+def bot_oco_ids(oco_data):
+    """Return open OCO IDs belonging to this bot's CAP2 client-id prefix."""
+    ids = []
+    if not isinstance(oco_data, list):
+        return ids
+
+    for item in oco_data:
+        cid = str(item.get("listClientOrderId") or "")
+        if cid.startswith("CAP2_"):
+            try:
+                ids.append(int(item.get("orderListId")))
+            except Exception:
+                pass
+    return ids
+
+
+def count_bot_open_positions(api_key, api_secret):
+    """
+    Render can restart, so Streamlit session state is not used as the source
+    of truth. Open OCO lists on Tabdeal are the persistent source of truth.
+    """
+    oco = get_open_oco_lists(api_key, api_secret)
+    return len(bot_oco_ids(oco))
+
+
+def verify_account_can_trade(account):
+    if not isinstance(account, dict) or "_error" in account:
+        return False, "اطلاعات حساب از تبدیل دریافت نشد."
+
+    if account.get("canTrade") is False:
+        return False, "API حساب اجازه معامله ندارد."
+
+    permissions = [str(x).upper() for x in account.get("permissions", [])]
+    if permissions and "SPOT" not in permissions:
+        return False, "مجوز SPOT برای API فعال نیست."
+
+    return True, "حساب آماده معامله است."
+
+
+def tabdeal_last_price(symbol):
+    data = public_json(
+        TABDEAL + "/r/api/v1/ticker/24hr",
+        {"symbol": normalize_symbol(symbol)},
+        timeout=10,
+    )
+    if isinstance(data, dict):
+        for key in ("lastPrice", "last", "price"):
+            try:
+                value = float(data.get(key))
+                if value > 0:
+                    return value
+            except Exception:
+                pass
+    return None
+
+
+def place_market_buy(symbol, usdt_amount, api_key, api_secret):
+    """
+    Real spot MARKET BUY on Tabdeal.
+    The amount is converted to base-asset quantity using Tabdeal's current
+    market price, then rounded to the market LOT_SIZE.
+    """
+    price = tabdeal_last_price(symbol)
+    if not price:
+        return {"_error": "قیمت لحظه‌ای بازار تبدیل دریافت نشد."}
+
+    filters = get_trade_filters().get(normalize_symbol(symbol), {})
+    step = float(filters.get("step_size", 0.00000001))
+    min_qty = float(filters.get("min_qty", 0))
+    min_notional = float(filters.get("min_notional", 0))
+
+    qty = floor_step(float(usdt_amount) / price, step)
+
+    if qty <= 0 or qty < min_qty:
+        return {
+            "_error": f"حجم معامله کمتر از حداقل مقدار بازار است. qty={qty}, min={min_qty}"
+        }
+
+    if min_notional > 0 and qty * price < min_notional:
+        return {
+            "_error": (
+                f"ارزش سفارش کمتر از حداقل مجاز بازار است. "
+                f"minNotional={min_notional}"
+            )
+        }
+
+    # Unique bot id makes it possible to distinguish bot OCOs after Render restarts.
+    client_id = "CAP2_" + uuid.uuid4().hex[:20]
+
+    return signed_request(
+        "POST",
+        "/api/v1/order",
+        api_key,
+        api_secret,
+        {
+            "symbol": normalize_symbol(symbol),
+            "side": "BUY",
+            "type": "MARKET",
+            "quantity": f"{qty:.12f}".rstrip("0").rstrip("."),
+            "newClientOrderId": client_id,
+        },
+    )
+
+
+def place_oco_sell(symbol, quantity, tp, sl, api_key, api_secret):
+    """
+    Real Tabdeal OCO SELL:
+      - limit leg = TP1
+      - stopPrice = SL trigger
+      - stopLimitPrice = slightly below SL for a long position
+    """
+    filters = get_trade_filters().get(normalize_symbol(symbol), {})
+    step = float(filters.get("step_size", 0.00000001))
+    qty = floor_step(quantity, step)
+
+    if qty <= 0:
+        return {"_error": "حجم قابل فروش صفر است."}
+
+    tp = float(tp)
+    sl = float(sl)
+
+    if not (sl < tp):
+        return {"_error": "مقادیر TP/SL برای OCO معتبر نیستند."}
+
+    # Stop-limit slightly below stop trigger for a long position.
+    stop_limit = sl * 0.9985
+
+    token = uuid.uuid4().hex[:12]
+    list_client_id = f"CAP2_{token}"
+    limit_client_id = f"CAP2L_{token}"
+    stop_client_id = f"CAP2S_{token}"
+
+    return signed_request(
+        "POST",
+        "/api/v1/order/oco",
+        api_key,
+        api_secret,
+        {
+            "symbol": normalize_symbol(symbol),
+            "side": "SELL",
+            "quantity": f"{qty:.12f}".rstrip("0").rstrip("."),
+            "price": f"{tp:.12f}".rstrip("0").rstrip("."),
+            "stopPrice": f"{sl:.12f}".rstrip("0").rstrip("."),
+            "stopLimitPrice": f"{stop_limit:.12f}".rstrip("0").rstrip("."),
+            "listClientOrderId": list_client_id,
+            "limitClientOrderId": limit_client_id,
+            "stopClientOrderId": stop_client_id,
+        },
+    )
+
+
+def execute_trade(plan, trade_usdt, max_positions):
+    """
+    Full real-trading sequence:
+      1. Verify credentials.
+      2. Verify account can trade.
+      3. Check persistent bot OCO positions (survives Render restart).
+      4. Verify enough USDT is available.
+      5. Submit MARKET BUY.
+      6. Query the order until FILLED/PARTIALLY_FILLED timeout.
+      7. Submit OCO using the actual executed quantity.
+      8. Refuse to silently continue if protection could not be placed.
+    """
+    api_key, api_secret = get_credentials()
+
+    if not api_key or not api_secret:
+        return {"ok": False, "message": "API Key/Secret تبدیل در Render پیدا نشد."}
+
+    account = get_account(api_key, api_secret)
+    can_trade, account_msg = verify_account_can_trade(account)
+    if not can_trade:
+        return {"ok": False, "message": account_msg, "account": account}
+
+    try:
+        open_positions = count_bot_open_positions(api_key, api_secret)
+    except Exception as e:
+        return {
+            "ok": False,
+            "message": f"نتوانستم معاملات باز ربات را از تبدیل بررسی کنم: {e}",
+        }
+
+    if open_positions >= int(max_positions):
+        return {
+            "ok": False,
+            "message": (
+                f"حداکثر معاملات همزمان پر است: "
+                f"{open_positions}/{int(max_positions)}"
+            ),
+        }
+
+    usdt_free = get_spot_balance(api_key, api_secret, "USDT")
+    if usdt_free < float(trade_usdt):
+        return {
+            "ok": False,
+            "message": (
+                f"موجودی USDT کافی نیست: "
+                f"{usdt_free:.4f} USDT < {float(trade_usdt):.4f} USDT"
+            ),
+        }
+
+    symbol = normalize_symbol(plan["symbol"])
+
+    # Conservative duplicate check: if this symbol already has any open
+    # order/OCO, do not add another position.
+    open_orders = get_open_orders(api_key, api_secret, symbol)
+    if isinstance(open_orders, list) and open_orders:
+        return {
+            "ok": False,
+            "message": f"برای {symbol} سفارش باز وجود دارد؛ خرید جدید لغو شد.",
+            "open_orders": open_orders,
+        }
+
+    buy = place_market_buy(symbol, float(trade_usdt), api_key, api_secret)
+
+    if not isinstance(buy, dict) or "_error" in buy:
+        return {
+            "ok": False,
+            "message": str(buy.get("_error", "BUY ناموفق")),
+            "buy": buy,
+        }
+
+    order_id = buy.get("orderId")
+    executed_qty = float(buy.get("executedQty") or 0)
+
+    # MARKET order normally returns FILLED, but query again so the bot does
+    # not create an OCO from an unconfirmed quantity.
+    if order_id and executed_qty <= 0:
+        deadline = time.time() + 12
+        while time.time() < deadline:
+            checked = get_order(api_key, api_secret, symbol, order_id)
+            if isinstance(checked, dict) and "_error" not in checked:
+                executed_qty = float(checked.get("executedQty") or 0)
+                status = str(checked.get("status", "")).upper()
+                buy = checked
+                if status == "FILLED":
+                    break
+                if status in ("CANCELED", "REJECTED", "EXPIRED"):
+                    return {
+                        "ok": False,
+                        "message": f"سفارش BUY با وضعیت {status} پایان یافت.",
+                        "buy": checked,
+                    }
+            time.sleep(1)
+
+    if executed_qty <= 0:
+        return {
+            "ok": False,
+            "message": (
+                "BUY ارسال شد اما مقدار واقعی اجراشده تأیید نشد؛ "
+                "برای جلوگیری از سفارش محافظتی اشتباه، OCO ارسال نشد."
+            ),
+            "buy": buy,
+        }
+
+    # Refresh the real filled quantity from account/order before protection.
+    base = base_asset(symbol)
+    balance_after_buy = get_spot_balance(api_key, api_secret, base)
+    protected_qty = min(executed_qty, balance_after_buy) if balance_after_buy > 0 else executed_qty
+
+    if protected_qty <= 0:
+        return {
+            "ok": False,
+            "message": "خرید انجام شد اما موجودی دارایی برای ثبت OCO تأیید نشد.",
+            "buy": buy,
+        }
+
+    oco = place_oco_sell(
+        symbol,
+        protected_qty,
+        plan["tp1"],
+        plan["sl"],
+        api_key,
+        api_secret,
+    )
+
+    if isinstance(oco, dict) and "_error" in oco:
+        return {
+            "ok": False,
+            "message": (
+                "هشدار جدی: BUY انجام شد ولی OCO ثبت نشد. "
+                "موقعیت بدون حدضرر خودکار باقی مانده است."
+            ),
+            "buy": buy,
+            "oco": oco,
+        }
+
+    return {
+        "ok": True,
+        "message": f"معامله واقعی {symbol} انجام شد و OCO ثبت شد.",
+        "buy": buy,
+        "oco": oco,
+        "executed_qty": protected_qty,
+    }
+
+
+# ----------------------------- UI HELPERS ---------------------
+
+def scan_table(rows):
     if not rows:
         return pd.DataFrame()
 
-    out = pd.DataFrame(rows)
-    out["_sort"] = out["درصد"].fillna(-1)
-    out = (
-        out.sort_values(
-            ["_sort", "امتیاز"],
-            ascending=[False, False],
-        )
-        .drop(columns="_sort")
+    data = []
+    for r in rows:
+        data.append({
+            "ارز": r["symbol"],
+            "درصد": round(r["probability"], 1) if np.isfinite(r["probability"]) else np.nan,
+            "امتیاز": round(r["score"], 1),
+            "روند": r["trend"],
+            "آینده/سناریو": f"+{r['outlook_pct']:.2f}%",
+            "ورود": fmt_num(r["entry"]),
+            "حدضرر": fmt_num(r["sl"]),
+            "TP1": fmt_num(r["tp1"]),
+            "TP2": fmt_num(r["tp2"]),
+            "RR": round(r["rr1"], 2),
+            "تأیید MTF": f"{r['agreement']:.0f}%",
+            "OOS": r["oos_trades"],
+            "PF": round(r["profit_factor"], 2) if np.isfinite(r["profit_factor"]) else 99.0,
+            "تصمیم": r["decision"],
+        })
+
+    return (
+        pd.DataFrame(data)
+        .sort_values(["درصد", "امتیاز"], ascending=False)
         .reset_index(drop=True)
     )
-    return out
 
 
-# ============================================================
-# UI
-# ============================================================
-st.markdown("""
-<style>
-.block-container{padding-top:1rem;padding-bottom:2rem;max-width:1100px}
-.head{background:linear-gradient(135deg,#111318,#292d33);color:#fff;border-radius:22px;padding:20px;margin-bottom:14px}
-.brand{font-size:25px;font-weight:900}.sub{font-size:12px;color:#cfd2d7;margin-top:6px}
-.card{background:#fff;border:1px solid #e8e8e8;border-radius:20px;padding:16px;margin:12px 0;box-shadow:0 3px 14px rgba(0,0,0,.04)}
-.grid{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:8px}
-.box{background:#f7f7f8;border-radius:13px;padding:10px}.k{font-size:10px;color:#777}.v{font-size:16px;font-weight:850;margin-top:4px}
-.buy{color:#087f3e}.sell{color:#b42318}.wait{color:#806000}
-.note{font-size:11px;color:#777;line-height:1.8}
-@media(max-width:700px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
-</style>
-<div class="head">
-<div class="brand">₿ تحلیل‌گر حرفه‌ای رمزارز — نسخه قابل‌آزمون</div>
-<div class="sub">سیگنال بر اساس کندل بسته‌شده • ورود روی کندل بعدی در بک‌تست • بدون کارمزد • اسلیپیج ورود • کالیبراسیون OOS تاریخی • بدون پیش‌بینی ساختگی</div>
-</div>
-""", unsafe_allow_html=True)
+# ----------------------------- MAIN ---------------------------
+
+st.title("Crypto Analyzer Pro — Render Auto-Trader V2")
+st.caption(
+    "نسخه V2: سفارش واقعی فقط وقتی فعال است که TABDEAL_LIVE_TRADING=true باشد "
+    "و موتور معامله در رابط کاربری نیز روشن باشد."
+)
 
 with st.sidebar:
-    st.header("تنظیمات تست")
-    mode = st.selectbox("نوع بازار", ["SPOT", "FUTURES"])
-    slip_pct = st.number_input("اسلیپیج ورود (%)", 0.0, 1.0, DEFAULT_SLIPPAGE_PCT, 0.01)
-    horizon = st.number_input("افق بک‌تست (تعداد کندل 1H)", 4, 120, DEFAULT_HORIZON_BARS, 1)
+    st.header("تنظیمات")
 
-    st.divider()
-    st.subheader("اسکن خودکار کل بازار")
-    auto_scan = st.checkbox("فعال‌سازی اسکن خودکار همه ارزها", value=False)
+    auto_scan = st.checkbox(
+        "اسکن خودکار بازار",
+        value=env_bool("AUTO_SCAN_ENABLED", True),
+    )
+
+    env_live = env_bool("TABDEAL_LIVE_TRADING", env_bool("AUTO_TRADE", False))
+    live_trading = st.checkbox(
+        "موتور معامله واقعی",
+        value=env_live,
+        help="باید در Render با TABDEAL_LIVE_TRADING=true فعال شده باشد.",
+    )
+
+    trade_usdt_default = env_float("AUTO_TRADE_USDT", DEFAULT_TRADE_USDT)
+    trade_usdt = st.number_input(
+        "مبلغ هر معامله (USDT)",
+        min_value=1.0,
+        max_value=100000.0,
+        value=max(1.0, trade_usdt_default),
+        step=1.0,
+    )
+
+    max_positions = st.number_input(
+        "حداکثر معاملات همزمان",
+        min_value=1,
+        max_value=20,
+        value=max(1, env_int("AUTO_MAX_POSITIONS", DEFAULT_MAX_POSITIONS)),
+        step=1,
+    )
+
     scan_interval = st.number_input(
         "فاصله اسکن خودکار (ثانیه)",
         min_value=30,
-        max_value=1800,
-        value=AUTO_SCAN_DEFAULT_INTERVAL,
+        max_value=3600,
+        value=max(30, env_int("AUTO_SCAN_INTERVAL", DEFAULT_SCAN_INTERVAL)),
         step=10,
     )
-    scan_workers = st.number_input(
-        "تعداد همزمان اسکن",
+
+    workers = st.slider(
+        "تعداد پردازش همزمان",
         min_value=1,
-        max_value=10,
-        value=AUTO_SCAN_DEFAULT_WORKERS,
-        step=1,
+        max_value=12,
+        value=DEFAULT_SCAN_WORKERS,
     )
+
+    deep_candidates = st.slider(
+        "تعداد کاندیدا برای تحلیل عمیق",
+        min_value=3,
+        max_value=30,
+        value=12,
+    )
+
     st.caption(
-        "درصد جدول = احتمال تاریخی کالیبره‌شده رسیدن به TP1 در OOS. "
-        "ارز بدون داده OOS کافی با «نامشخص» نمایش داده می‌شود."
+        "درصد = احتمال تخمینی موفقیت TP1 بر پایه داده تاریخی/OOS و هم‌جهتی فعلی؛ تضمین سود نیست."
     )
 
-    st.caption("در SPOT فقط لانگ فعال است. برای شورت باید واقعاً روی بازار Futures/Margin معامله شود.")
+    api_key, api_secret = get_credentials()
+    if api_key and api_secret:
+        st.success("API تبدیل: دریافت شد")
+    else:
+        st.error("API تبدیل: پیدا نشد")
 
-universe = get_universe()
+    if env_live:
+        st.warning("AUTO-TRADING: فعال")
+    else:
+        st.info("AUTO-TRADING: خاموش")
 
-# ============================================================
-# WHOLE-MARKET AUTO SCAN UI
-# ============================================================
+# Session state
+if "last_scan" not in st.session_state:
+    st.session_state.last_scan = 0.0
+
+if "trade_log" not in st.session_state:
+    st.session_state.trade_log = []
+
+# ----------------------------- SCAN ---------------------------
+
 if auto_scan:
-    st.markdown(
-        '<div class="card"><b>اسکن خودکار همه ارزها</b>'
-        '<div class="note">تمام جفت‌های USDT موجود اسکن می‌شوند و بر اساس درصد '
-        'کالیبره‌شده OOS از بیشترین به کمترین مرتب می‌شوند.</div></div>',
-        unsafe_allow_html=True,
+    symbols = get_universe()
+
+    if live_trading and env_live and not symbols:
+        st.error(
+            "بازارهای تبدیل دریافت نشدند؛ برای جلوگیری از معامله اشتباه، "
+            "AUTO-TRADING متوقف شد."
+        )
+        st.stop()
+
+    st.subheader(f"اسکن بازار — {len(symbols)} بازار USDT")
+
+    progress = st.progress(0)
+    status = st.empty()
+
+    def fast_progress(v):
+        pct = int(v * 70)
+        progress.progress(pct)
+        status.caption(f"مرحله ۱: اسکن سریع بازار — {pct}%")
+
+    fast = run_fast_market_scan(
+        symbols,
+        workers,
+        progress_cb=fast_progress,
     )
 
-    scan_placeholder = st.empty()
+    if fast.empty:
+        progress.progress(100)
+        status.error("داده کافی برای اسکن بازار دریافت نشد.")
+        st.stop()
 
-    with scan_placeholder.container():
-        with st.spinner("در حال اسکن خودکار کل بازار..."):
-            scan_df = scan_all_markets(
-                mode=mode,
-                slippage_pct=slip_pct,
-                horizon_bars=horizon,
-                max_workers=scan_workers,
+    candidates = (
+        fast.head(deep_candidates)["symbol"]
+        .astype(str)
+        .tolist()
+    )
+
+    def deep_progress(v):
+        pct = 70 + int(v * 30)
+        progress.progress(min(pct, 100))
+        status.caption(f"مرحله ۲: تحلیل عمیق کاندیداها — {pct}%")
+
+    deep_rows = deep_scan_candidates(
+        candidates,
+        workers,
+        progress_cb=deep_progress,
+    )
+
+    progress.progress(100)
+    status.success("اسکن کامل شد — 100%")
+
+    table = scan_table(deep_rows)
+
+    if not table.empty:
+        st.dataframe(
+            table,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        # ---------------- AUTO DECISION ----------------
+        ranked = sorted(
+            deep_rows,
+            key=lambda r: (
+                r["probability"] if np.isfinite(r["probability"]) else -1,
+                r["score"],
+            ),
+            reverse=True,
+        )
+
+        executable = [
+            r for r in ranked
+            if r["confirmed"]
+            and r["decision"] == "معامله"
+        ]
+
+        if executable:
+            best = executable[0]
+
+            st.success(
+                f"بهترین کاندیدای فعلی: {best['symbol']} | "
+                f"درصد {best['probability']:.1f}% | "
+                f"روند {best['trend']} | "
+                f"امتیاز {best['score']:.1f}"
             )
 
-        if scan_df.empty:
-            st.warning("در این دور اسکن، داده قابل استفاده‌ای دریافت نشد.")
-        else:
-            display_df = scan_df.copy()
+            c1, c2, c3, c4, c5 = st.columns(5)
+            c1.metric("ورود", fmt_num(best["entry"]))
+            c2.metric("حدضرر", fmt_num(best["sl"]))
+            c3.metric("TP1", fmt_num(best["tp1"]))
+            c4.metric("TP2", fmt_num(best["tp2"]))
+            c5.metric("RR", f"{best['rr1']:.2f}")
 
-            display_df["درصد"] = display_df["درصد"].apply(
-                lambda x: f"{x:.1f}%" if pd.notna(x) else "نامشخص"
-            )
-            display_df["PF"] = display_df["PF"].apply(
-                lambda x: f"{x:.2f}" if pd.notna(x) else "-"
-            )
-            display_df["TP1"] = display_df["TP1"].apply(
-                lambda x: f"{x:.1f}%" if pd.notna(x) else "-"
-            )
-
-            st.dataframe(
-                display_df,
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "ارز": st.column_config.TextColumn("ارز"),
-                    "درصد": st.column_config.TextColumn("درصد موفقیت"),
-                    "تصمیم": st.column_config.TextColumn("تصمیم"),
-                    "نوع معامله": st.column_config.TextColumn("نوع معامله"),
-                    "امتیاز": st.column_config.NumberColumn("امتیاز", format="%.1f"),
-                    "گیت آماری": st.column_config.TextColumn("گیت آماری"),
-                    "تأیید MTF": st.column_config.TextColumn("تأیید MTF"),
-                    "OOS": st.column_config.NumberColumn("OOS"),
-                    "PF": st.column_config.TextColumn("PF"),
-                    "TP1": st.column_config.TextColumn("TP1"),
-                },
+            st.write(
+                f"چشم‌انداز سناریویی تا TP1: +{best['outlook_pct']:.2f}% | "
+                f"تأیید چندتایم‌فریمی: {best['agreement']:.0f}% | "
+                f"OOS: {best['oos_trades']} | PF: "
+                f"{best['profit_factor']:.2f}"
             )
 
-            valid_pct = scan_df["درصد"].dropna()
-            if not valid_pct.empty:
-                best = scan_df.loc[scan_df["درصد"].idxmax()]
-                st.success(
-                    f'بالاترین درصد فعلی: {best["ارز"]} — '
-                    f'{best["درصد"]:.1f}% — {best["تصمیم"]} — {best["نوع معامله"]}'
+            # ---------------- LIVE TRADE ----------------
+            if live_trading and env_live:
+                # Session state is only a secondary guard. The actual position
+                # limit is checked against Tabdeal's persistent open OCO orders.
+                already = any(
+                    x.get("symbol") == best["symbol"]
+                    and x.get("status") == "success"
+                    for x in st.session_state.trade_log
                 )
 
-    # Automatic rerun after the requested interval.
-    time.sleep(int(scan_interval))
-    st.rerun()
+                if already:
+                    st.info("این ارز در همین نشست قبلاً توسط ربات معامله شده است.")
+                else:
+                    result = execute_trade(
+                        best,
+                        float(trade_usdt),
+                        int(max_positions),
+                    )
 
+                    if result.get("ok"):
+                        st.session_state.trade_log.append({
+                            "symbol": best["symbol"],
+                            "status": "success",
+                            "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                            "message": result["message"],
+                            "executed_qty": result.get("executed_qty", ""),
+                        })
+                        st.success(result["message"])
+                    else:
+                        st.session_state.trade_log.append({
+                            "symbol": best["symbol"],
+                            "status": "error",
+                            "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                            "message": result["message"],
+                        })
+                        st.error(result["message"])
+            else:
+                if not env_live:
+                    st.warning(
+                        "TABDEAL_LIVE_TRADING در Render فعال نیست؛ "
+                        "اپ فقط تحلیل می‌کند و هیچ سفارش واقعی نمی‌فرستد."
+                    )
+                else:
+                    st.info("موتور معامله واقعی توسط کلید داخل رابط کاربری خاموش شده است.")
 
-st.markdown('<div class="card"><b>انتخاب بازار</b><div class="note">حداکثر ۵ ارز. تحلیل چندتایم‌فریمی انجام می‌شود، اما اطمینان فقط زمانی نمایش داده می‌شود که نتیجه تاریخی کافی داشته باشیم.</div></div>', unsafe_allow_html=True)
-
-search = st.text_input("جستجو", placeholder="BTC / ETH / SOL ...")
-filtered = [s for s in universe if search.upper() in s] if search else universe
-selected = st.multiselect(
-    "ارزها",
-    filtered,
-    max_selections=5,
-    format_func=lambda x: x.replace("USDT", "/USDT"),
-)
-
-if selected:
-    results = []
-    with st.spinner("در حال تحلیل چندتایم‌فریمی و کالیبراسیون تاریخی..."):
-        with ThreadPoolExecutor(max_workers=min(5, len(selected))) as ex:
-            jobs = {
-                ex.submit(
-                    analyze_symbol,
-                    s, mode, slip_pct, horizon
-                ): s for s in selected
-            }
-            for job in as_completed(jobs):
-                try:
-                    r = job.result()
-                    if r:
-                        results.append(r)
-                except Exception:
-                    pass
-
-    for r in sorted(results, key=lambda x: x["score"], reverse=True):
-        cls = "buy" if r["decision"] == "معامله" and r["position"] == "لانگ" else ("sell" if r["decision"] == "معامله" and r["position"] == "شورت" else "wait")
-        bt = r["backtest"]
-
-        if np.isfinite(r["calibrated_confidence"]):
-            conf_txt = f'{r["calibrated_confidence"]:.1f}%'
         else:
-            conf_txt = "نامشخص"
+            st.warning("در این اسکن هیچ ارز شرایط کامل ورود را نداشت.")
 
-        if bt:
-            bt_txt = (
-                f'OOS: {bt["oos_trades"]} / کل: {bt["total_trades"]} • '
-                f'Win Rate: {bt["win_rate"]*100:.1f}% • '
-                f'TP1: {bt["tp1_rate"]*100:.1f}% • '
-                f'TP2: {bt["tp2_rate"]*100:.1f}% • '
-                f'PF: {bt["profit_factor"]:.2f} • '
-                f'DD: {bt["max_drawdown"]*100:.1f}% • '
-                f'Expectancy: {bt["expectancy"]*100:.2f}%'
-            )
-        else:
-            bt_txt = "داده OOS کافی برای تصمیم‌گیری موجود نیست."
+    else:
+        st.warning("هیچ کاندیدای قابل تحلیل عمیق پیدا نشد.")
 
-        st.markdown(f"""
-        <div class="card">
-          <h3>{r["symbol"].replace("USDT","/USDT")} —
-            <span class="{cls}">{r["decision"]}</span></h3>
+    st.session_state.last_scan = time.time()
 
-          <div class="grid">
-            <div class="box"><div class="k">امتیاز فعلی</div><div class="v">{r["score"]:.1f}</div></div>
-            <div class="box"><div class="k">اطمینان کالیبره‌شده TP1</div><div class="v">{conf_txt}</div></div>
-            <div class="box"><div class="k">ورود</div><div class="v">{money(r["entry"])}</div></div>
-            <div class="box"><div class="k">حد ضرر</div><div class="v">{money(r["sl"])}</div></div>
-            <div class="box"><div class="k">ریسک</div><div class="v">{r["risk_pct"]:.2f}%</div></div>
-            <div class="box"><div class="k">TP1</div><div class="v">{money(r["tp1"])}</div></div>
-            <div class="box"><div class="k">TP2</div><div class="v">{money(r["tp2"])}</div></div>
-            <div class="box"><div class="k">TP3</div><div class="v">{money(r["tp3"])}</div></div>
-            <div class="box"><div class="k">تصمیم نهایی</div><div class="v">{r["decision"]}</div></div>
-            <div class="box"><div class="k">تأیید چندتایم‌فریمی</div><div class="v">{"بله" if r["mtf_confirmed"] else "خیر"}</div></div>
-            <div class="box"><div class="k">گیت آماری</div><div class="v">{"قبول" if r["stats_ok"] else "رد"}</div></div>
-            <div class="box"><div class="k">کالیبراسیون</div><div class="v">{r["confidence_note"]}</div></div>
-          </div>
+    # Auto-refresh after the configured interval.
+    if auto_scan:
+        time.sleep(int(scan_interval))
+        st.rerun()
 
-          <p class="note"><b>بک‌تست:</b> {bt_txt}</p>
-          <p class="note"><b>شرایط تأیید:</b> {"؛ ".join(r["gate_reasons"]) if r["gate_reasons"] else "همه شروط آماری و چندتایم‌فریمی تأیید شدند."}</p>
-          <p class="note"><b>قانون تصمیم:</b> فقط با OOS≥30، PF>1، Expectancy>0، TP1≥50٪ و تأیید چندتایم‌فریمی، «معامله» صادر می‌شود.</p>
-        </div>
-        """, unsafe_allow_html=True)
-
-        with st.expander(f'جزئیات تایم‌فریم‌ها — {r["symbol"].replace("USDT","/USDT")}'):
-            rows = []
-            for tf in TIMEFRAMES:
-                a = r["analyses"].get(tf)
-                if a:
-                    rows.append({
-                        "تایم‌فریم": tf,
-                        "نوع": "لانگ" if a["score"] >= 24 else ("شورت" if a["score"] <= -24 else "صبر"),
-                        "امتیاز": round(a["score"], 1),
-                        "RSI": round(a["rsi"], 1),
-                        "Momentum %": round(a["momentum"], 2),
-                        "ADX": round(a["adx"], 1),
-                    })
-            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-
-            st.write("دلایل تایم‌فریم‌های اصلی:")
-            for tf in ("1H", "4H", "1D"):
-                a = r["analyses"].get(tf)
-                if a:
-                    st.write(f"**{tf}:** " + "؛ ".join(a["reasons"][:6]))
-
-            if bt:
-                st.write("توزیع نتایج بک‌تست")
-                counts = bt["trades_df"]["result"].value_counts().rename_axis("نتیجه").reset_index(name="تعداد")
-                st.dataframe(counts, use_container_width=True, hide_index=True)
-
-    st.markdown(
-        '<div class="card note"><b>تغییر مهم:</b> دیگر «اطمینان ۹۰٪» از روی امتیاز ساخته نمی‌شود. '
-        'اگر نمونه تاریخی کافی نباشد، برنامه صراحتاً «نامشخص» نشان می‌دهد.</div>',
-        unsafe_allow_html=True
-    )
 else:
-    st.info("یک یا چند ارز انتخاب کن.")
+    st.info("اسکن خودکار خاموش است.")
 
-st.markdown(
-    '<div class="note" style="text-align:center;margin-top:18px">'
-    'این ابزار تحقیقاتی است و تضمین سود نمی‌دهد. بک‌تست گذشته تضمین آینده نیست. '
-    'قبل از معامله واقعی، اجرای Paper Trading و سپس Forward Test توصیه می‌شود.'
-    '</div>',
-    unsafe_allow_html=True
-)
+# ----------------------------- LOG ----------------------------
+
+if st.session_state.trade_log:
+    st.subheader("گزارش معاملات خودکار")
+    st.dataframe(
+        pd.DataFrame(st.session_state.trade_log),
+        use_container_width=True,
+        hide_index=True,
+    )

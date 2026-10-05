@@ -1,913 +1,982 @@
 
-import streamlit as st
-import pandas as pd
-import numpy as np
-import requests
+import os
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import math
+import hashlib
+import hmac
+from urllib.parse import urlencode
+
+import numpy as np
+import pandas as pd
+import requests
+import streamlit as st
+
 
 # ============================================================
-# Crypto Analyzer Pro — Robust / Backtestable Edition
-# ============================================================
-# IMPORTANT:
-# - Spot mode is long-only by default. Short is disabled unless Futures mode is selected.
-# - "Confidence" is calibrated from historical out-of-sample-style rolling outcomes,
-#   not from an arbitrary score-to-percent formula.
-# - Forecast percentages are NOT fabricated from the score.
-# - Signals are generated only from CLOSED candles.
-# - Backtest enters on the NEXT candle open and includes configurable fee + slippage.
-# - If TP and SL are both touched in the same candle, the conservative assumption is SL first.
+# CRYPTO SIGNAL ENGINE — FRESH BUILD
+# Tabdeal-first / Spot + Margin/Futures analysis / No auto trading
+# No trading fees are included in backtest calculations by design.
 # ============================================================
 
 st.set_page_config(
-    page_title="Crypto Analyzer Pro",
+    page_title="Tabdeal Crypto Signal Engine",
     page_icon="₿",
     layout="wide",
     initial_sidebar_state="collapsed",
 )
 
-TIMEFRAMES = {
-    "5m": "5m", "15m": "15m", "30m": "30m",
-    "1H": "1h", "2H": "2h", "4H": "4h", "6H": "6h",
-    "12H": "12h", "1D": "1d", "3D": "3d", "1W": "1w"
-}
-
-BINANCE = "https://api.binance.com"
-BINANCE_DATA = "https://data-api.binance.vision"
-TABDEAL = "https://api1.tabdeal.org"
-SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "CryptoAnalyzerPro/2.0"})
-
-# Trading assumptions. Change these in the sidebar.
-DEFAULT_FEE_PCT = 0.10
-DEFAULT_SLIPPAGE_PCT = 0.05
-DEFAULT_HORIZON_BARS = 24
-
-TABDEAL_MARKET_ENDPOINTS = [
-    "/r/api/v1/exchangeInfo",
-    "/api/v1/exchangeInfo",
-    "/v1/market/symbols",
-    "/v1/markets",
-    "/api/v1/markets",
-]
+# -----------------------------
+# Configuration
+# -----------------------------
+TABDEAL = os.getenv("TABDEAL_API_BASE", "https://api1.tabdeal.org").rstrip("/")
+TABDEAL_API_KEY = os.getenv("TABDEAL_API_KEY", "").strip()
+TABDEAL_API_SECRET = os.getenv("TABDEAL_API_SECRET", "").strip()
+TABDEAL_ONLY = True
+TRADE_LIMIT = 1000
+PRIVATE_READ_ONLY = True
 
 
 # ============================================================
-# HTTP
+# HTTP / API
 # ============================================================
-@st.cache_data(ttl=60, show_spinner=False)
-def get_json(url, params=None, timeout=12):
-    try:
-        r = SESSION.get(url, params=params, timeout=timeout)
-        r.raise_for_status()
-        return r.json()
-    except Exception:
-        return None
+def _get(url, params=None, timeout=REQUEST_TIMEOUT, signed=False):
+    params = dict(params or {})
+    headers = {}
+    if signed:
+        if not TABDEAL_API_KEY or not TABDEAL_API_SECRET:
+            raise RuntimeError("TABDEAL_API_KEY/TABDEAL_API_SECRET تنظیم نشده‌اند.")
+        params["timestamp"] = int(time.time() * 1000)
+        query = urlencode(params, doseq=True)
+        params["signature"] = hmac.new(TABDEAL_API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
+        headers["X-MBX-APIKEY"] = TABDEAL_API_KEY
+    r = SESSION.get(url, params=params, headers=headers, timeout=timeout)
+    r.raise_for_status()
+    return r.json()
 
-
-def flatten_dicts(obj):
-    if isinstance(obj, dict):
-        yield obj
-        for v in obj.values():
-            yield from flatten_dicts(v)
-    elif isinstance(obj, list):
-        for x in obj:
-            yield from flatten_dicts(x)
-
-
-def normalize_symbol(s):
-    return str(s).upper().replace("-", "").replace("_", "").replace("/", "")
-
-
-def base_asset(symbol):
-    s = normalize_symbol(symbol)
-    return s[:-4] if s.endswith("USDT") else s
-
-
-def money(value):
-    try:
-        v = float(value)
-        if not np.isfinite(v):
-            return "-"
-        if abs(v) >= 1000:
-            return f"{v:,.2f}"
-        if abs(v) >= 1:
-            return f"{v:,.4f}"
-        if abs(v) >= 0.01:
-            return f"{v:,.6f}"
-        return f"{v:.10f}".rstrip("0").rstrip(".")
-    except Exception:
-        return "-"
-
-
-# ============================================================
-# MARKET UNIVERSE
-# ============================================================
-def tabdeal_markets():
-    symbols = set()
-    for ep in TABDEAL_MARKET_ENDPOINTS:
-        data = get_json(TABDEAL + ep, timeout=15)
-        if not data:
-            continue
-        for d in flatten_dicts(data):
-            if not isinstance(d, dict):
-                continue
-            raw = None
-            for key in ("symbol", "tabdealSymbol", "market", "pair"):
-                if isinstance(d.get(key), str) and d.get(key).strip():
-                    raw = d[key]
-                    break
-            if not raw:
-                continue
-            s = normalize_symbol(raw)
-            status = str(d.get("status", "TRADING")).upper()
-            quote = str(d.get("quoteAsset", "")).upper()
-            if (quote == "USDT" or s.endswith("USDT")) and status in (
-                "TRADING", "ACTIVE", "ENABLED", ""
-            ):
-                if s.endswith("USDT"):
-                    symbols.add(s)
-        if symbols and "exchangeInfo" in ep:
-            break
-    return sorted(symbols)
-
-
-@st.cache_data(ttl=180, show_spinner=False)
-def get_universe():
-    syms = tabdeal_markets()
-    if syms:
-        return syms
-
-    # Dynamic Binance fallback.
-    data = get_json(BINANCE_DATA + "/api/v3/exchangeInfo", timeout=15)
-    if isinstance(data, dict):
-        for d in data.get("symbols", []):
-            if (
-                str(d.get("status", "")).upper() == "TRADING"
-                and str(d.get("quoteAsset", "")).upper() == "USDT"
-            ):
-                s = normalize_symbol(d.get("symbol", ""))
-                if s.endswith("USDT"):
-                    syms.append(s)
-    return sorted(set(syms))
-
-
-# ============================================================
-# KLINES
-# ============================================================
-def rows_to_df(rows):
-    if not isinstance(rows, list) or len(rows) < 40:
-        return pd.DataFrame()
-    try:
-        df = pd.DataFrame(rows)
-        df = df.iloc[:, :6]
-        df.columns = ["time", "open", "high", "low", "close", "volume"]
-        # Binance API normally returns ms. Public archive/API can evolve, so infer.
-        t = pd.to_numeric(df["time"], errors="coerce")
-        unit = "us" if t.dropna().median() > 1e14 else "ms"
-        df["time"] = pd.to_datetime(t, unit=unit, utc=True)
-        for c in ["open", "high", "low", "close", "volume"]:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-        return (
-            df.dropna()
-            .drop_duplicates("time")
-            .sort_values("time")
-            .reset_index(drop=True)
-        )
-    except Exception:
-        return pd.DataFrame()
-
+def tabdeal_private_get(path, params=None):
+    return _get(TABDEAL + path, params=params, signed=True)
 
 @st.cache_data(ttl=30, show_spinner=False)
-def binance_klines(symbol, interval, limit=1000, end_time=None):
-    params = {
-        "symbol": symbol,
-        "interval": interval,
-        "limit": min(int(limit), 1000),
-    }
-    if end_time is not None:
-        params["endTime"] = int(end_time)
-    data = get_json(BINANCE_DATA + "/api/v3/klines", params, timeout=15)
-    return rows_to_df(data)
+def get_account():
+    return tabdeal_private_get("/r/api/v1/account")
+
+@st.cache_data(ttl=30, show_spinner=False)
+def get_open_orders():
+    return tabdeal_private_get("/r/api/v1/openOrders")
+
+@st.cache_data(ttl=30, show_spinner=False)
+def get_funding_assets():
+    return tabdeal_private_get("/r/api/v1/asset/get-funding-asset")
 
 
-def fetch_klines(symbol, interval, limit=1000):
-    return binance_klines(symbol, interval, limit)
+@st.cache_data(ttl=300, show_spinner=False)
+def get_exchange_info():
+    """Return all Tabdeal spot markets. The API docs state that omitting
+    symbol filters returns all markets."""
+    urls = [
+        f"{TABDEAL}/r/api/v1/exchangeInfo",
+        f"{TABDEAL}/api/v1/exchangeInfo",
+    ]
+    last_error = None
+    for url in urls:
+        try:
+            data = _get(url)
+            if isinstance(data, dict):
+                for key in ("symbols", "data", "result", "markets"):
+                    if isinstance(data.get(key), list):
+                        return data[key]
+            if isinstance(data, list):
+                return data
+        except Exception as e:
+            last_error = e
+    raise RuntimeError(f"Tabdeal exchangeInfo failed: {last_error}")
 
 
-def resample_from_1h(df, rule):
+@st.cache_data(ttl=60, show_spinner=False)
+def get_depth(symbol, limit=20):
+    for key in ("symbol", "tabdealSymbol"):
+        params = {key: symbol, "limit": limit}
+        for path in ("/r/api/v1/depth", "/api/v1/depth"):
+            try:
+                d = _get(TABDEAL + path, params)
+                if isinstance(d, dict) and ("bids" in d or "asks" in d):
+                    return d
+            except Exception:
+                pass
+    return {"bids": [], "asks": []}
+
+
+@st.cache_data(ttl=20, show_spinner=False)
+def get_ticker(symbol):
+    for path in ("/r/api/v1/ticker/24hr", "/api/v1/ticker/24hr"):
+        try:
+            d = _get(TABDEAL + path, {"symbol": symbol})
+            if isinstance(d, dict):
+                return d
+        except Exception:
+            pass
+    return {}
+
+
+def _parse_klines(raw):
+    if not isinstance(raw, list) or not raw:
+        return pd.DataFrame()
+    # Binance-compatible candle shape:
+    # [open_time, open, high, low, close, volume, close_time, ...]
+    rows = []
+    for x in raw:
+        if isinstance(x, (list, tuple)) and len(x) >= 6:
+            rows.append(x[:6])
+        elif isinstance(x, dict):
+            # tolerate object-style responses
+            rows.append([
+                x.get("openTime", x.get("timestamp", x.get("time"))),
+                x.get("open"),
+                x.get("high"),
+                x.get("low"),
+                x.get("close"),
+                x.get("volume", x.get("vol")),
+            ])
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
+    for c in ["open", "high", "low", "close", "volume"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df["timestamp"] = pd.to_numeric(df["timestamp"], errors="coerce")
+    df = df.dropna(subset=["timestamp", "open", "high", "low", "close"]).copy()
     if df.empty:
         return df
-    x = df.set_index("time").sort_index()
-    out = x.resample(rule).agg({
-        "open": "first",
-        "high": "max",
-        "low": "min",
-        "close": "last",
-        "volume": "sum",
-    }).dropna().reset_index()
+    unit = "ms" if df["timestamp"].max() > 10_000_000_000 else "s"
+    df["time"] = pd.to_datetime(df["timestamp"], unit=unit, utc=True)
+    df = df.drop_duplicates("timestamp").sort_values("timestamp").reset_index(drop=True)
+    return df[["time", "open", "high", "low", "close", "volume"]]
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def get_tabdeal_trades(symbol, limit=TRADE_LIMIT):
+    for key in ("symbol", "tabdealSymbol"):
+        try:
+            return _get(TABDEAL + "/r/api/v1/trades", {key: symbol, "limit": min(int(limit), 1000)})
+        except Exception:
+            pass
+    return []
+
+def _interval_seconds(interval):
+    return {"5m":300,"15m":900,"30m":1800,"1h":3600,"2h":7200,"4h":14400,"6h":21600,"12h":43200,"1d":86400,"3d":259200,"1w":604800}[interval]
+
+def trades_to_ohlcv(trades, interval):
+    rows=[]
+    for t in trades if isinstance(trades,list) else []:
+        try:
+            price=float(t["price"]); qty=float(t["qty"]); ts=int(t.get("time",0))
+            if ts>10_000_000_000: ts//=1000
+            if price>0 and ts>0: rows.append((pd.to_datetime(ts,unit="s",utc=True),price,qty))
+        except Exception: pass
+    if len(rows)<30: return pd.DataFrame()
+    x=pd.DataFrame(rows,columns=["time","price","qty"]).sort_values("time")
+    sec=_interval_seconds(interval); epoch=x["time"].astype("int64")//10**9
+    x["bucket"]=pd.to_datetime((epoch//sec)*sec,unit="s",utc=True)
+    g=x.groupby("bucket",sort=True)
+    out=g["price"].agg(open="first",high="max",low="min",close="last").reset_index().rename(columns={"bucket":"time"})
+    out["volume"]=g["qty"].sum().values
+    return out[["time","open","high","low","close","volume"]].reset_index(drop=True)
+
+@st.cache_data(ttl=60, show_spinner=False)
+def get_klines(symbol, interval, limit=CANDLE_LIMIT):
+    df=trades_to_ohlcv(get_tabdeal_trades(symbol,TRADE_LIMIT),interval)
+    if len(df)>=50: return df.tail(min(limit,len(df))).reset_index(drop=True), "Tabdeal trades→OHLCV"
+    return pd.DataFrame(), "Tabdeal: داده کندلی کافی نیست"
+
+
+# ============================================================
+# Market normalization
+# ============================================================
+def normalize_markets(raw):
+    rows = []
+    for x in raw:
+        if not isinstance(x, dict):
+            continue
+        symbol = str(x.get("symbol", "")).replace("_", "").upper()
+        tabdeal_symbol = str(x.get("tabdealSymbol", x.get("symbol", ""))).upper()
+        status = str(x.get("status", "")).upper()
+        base = str(x.get("baseAsset", "")).upper()
+        quote = str(x.get("quoteAsset", "")).upper()
+
+        if not symbol or not base or not quote:
+            # best-effort extraction for unusual payloads
+            continue
+
+        rows.append({
+            "symbol": symbol,
+            "tabdealSymbol": tabdeal_symbol,
+            "base": base,
+            "quote": quote,
+            "status": status,
+            "spot": bool(x.get("isSpotTradingAllowed", True)),
+            "margin": bool(x.get("isMarginTradingAllowed", False)),
+            "permissions": ",".join(map(str, x.get("permissions", []))),
+            "raw": x,
+        })
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    df = df.drop_duplicates("symbol").reset_index(drop=True)
+    return df
+
+
+def market_type(m):
+    if m["margin"]:
+        return "Spot + Margin"
+    return "Spot"
+
+
+def fmt_price(v):
+    if v is None or not np.isfinite(v):
+        return "-"
+    av = abs(float(v))
+    if av >= 1000:
+        return f"{v:,.2f}"
+    if av >= 1:
+        return f"{v:,.4f}"
+    if av >= 0.01:
+        return f"{v:,.6f}"
+    return f"{v:,.10f}".rstrip("0").rstrip(".")
+
+
+# ============================================================
+# Indicators — causal only
+# ============================================================
+def ema(s, n):
+    return s.ewm(span=n, adjust=False, min_periods=n).mean()
+
+
+def rsi(s, n=14):
+    d = s.diff()
+    up = d.clip(lower=0)
+    dn = -d.clip(upper=0)
+    au = up.ewm(alpha=1/n, adjust=False, min_periods=n).mean()
+    ad = dn.ewm(alpha=1/n, adjust=False, min_periods=n).mean()
+    rs = au / ad.replace(0, np.nan)
+    out = 100 - (100 / (1 + rs))
     return out
 
 
-def get_tf_data(symbol, tf, limit=1000):
-    iv = TIMEFRAMES[tf]
-    # Binance natively supports all requested intervals.
-    df = fetch_klines(symbol, iv, limit)
-    if len(df) >= 80:
-        return df
-
-    # Fallback aggregation for larger intervals if a provider rejects one.
-    if tf in ("2H", "6H", "12H", "3D"):
-        base = fetch_klines(symbol, "1h" if tf != "3D" else "1d", 1000)
-        rules = {"2H": "2h", "6H": "6h", "12H": "12h", "3D": "3D"}
-        if len(base) >= 80:
-            return resample_from_1h(base, rules[tf])
-    return pd.DataFrame()
-
-
-# ============================================================
-# INDICATORS
-# ============================================================
-def ema(s, n):
-    return s.ewm(span=n, adjust=False).mean()
-
-
-def rsi(close, n=14):
-    delta = close.diff()
-    gain = delta.clip(lower=0).ewm(alpha=1 / n, adjust=False).mean()
-    loss = (-delta.clip(upper=0)).ewm(alpha=1 / n, adjust=False).mean()
-    rs = gain / loss.replace(0, np.nan)
-    return (100 - 100 / (1 + rs)).fillna(50)
-
-
-def macd(close):
-    line = ema(close, 12) - ema(close, 26)
-    signal = ema(line, 9)
-    return line, signal, line - signal
-
-
 def atr(df, n=14):
-    pc = df.close.shift(1)
+    prev = df["close"].shift(1)
     tr = pd.concat([
-        df.high - df.low,
-        (df.high - pc).abs(),
-        (df.low - pc).abs()
+        df["high"] - df["low"],
+        (df["high"] - prev).abs(),
+        (df["low"] - prev).abs()
     ], axis=1).max(axis=1)
-    return tr.ewm(alpha=1 / n, adjust=False).mean()
+    return tr.ewm(alpha=1/n, adjust=False, min_periods=n).mean()
 
 
 def adx(df, n=14):
-    up = df.high.diff()
-    down = -df.low.diff()
-    plus = pd.Series(
-        np.where((up > down) & (up > 0), up, 0.0), index=df.index
-    )
-    minus = pd.Series(
-        np.where((down > up) & (down > 0), down, 0.0), index=df.index
-    )
-    a = atr(df, n).replace(0, np.nan)
-    pdi = 100 * plus.ewm(alpha=1 / n, adjust=False).mean() / a
-    mdi = 100 * minus.ewm(alpha=1 / n, adjust=False).mean() / a
+    up = df["high"].diff()
+    dn = -df["low"].diff()
+    plus_dm = np.where((up > dn) & (up > 0), up, 0.0)
+    minus_dm = np.where((dn > up) & (dn > 0), dn, 0.0)
+
+    tr = pd.concat([
+        df["high"] - df["low"],
+        (df["high"] - df["close"].shift()).abs(),
+        (df["low"] - df["close"].shift()).abs()
+    ], axis=1).max(axis=1)
+    atrv = tr.ewm(alpha=1/n, adjust=False, min_periods=n).mean()
+
+    pdi = 100 * pd.Series(plus_dm, index=df.index).ewm(alpha=1/n, adjust=False, min_periods=n).mean() / atrv
+    mdi = 100 * pd.Series(minus_dm, index=df.index).ewm(alpha=1/n, adjust=False, min_periods=n).mean() / atrv
     dx = 100 * (pdi - mdi).abs() / (pdi + mdi).replace(0, np.nan)
-    return dx.ewm(alpha=1 / n, adjust=False).mean().fillna(20)
+    return dx.ewm(alpha=1/n, adjust=False, min_periods=n).mean(), pdi, mdi
+
+
+def macd(s):
+    fast = ema(s, 12)
+    slow = ema(s, 26)
+    line = fast - slow
+    signal = ema(line, 9)
+    hist = line - signal
+    return line, signal, hist
 
 
 def ichimoku(df):
-    h9, l9 = df.high.rolling(9).max(), df.low.rolling(9).min()
-    h26, l26 = df.high.rolling(26).max(), df.low.rolling(26).min()
-    h52, l52 = df.high.rolling(52).max(), df.low.rolling(52).min()
-    tenkan = (h9 + l9) / 2
-    kijun = (h26 + l26) / 2
+    high9 = df["high"].rolling(9, min_periods=9).max()
+    low9 = df["low"].rolling(9, min_periods=9).min()
+    tenkan = (high9 + low9) / 2
+
+    high26 = df["high"].rolling(26, min_periods=26).max()
+    low26 = df["low"].rolling(26, min_periods=26).min()
+    kijun = (high26 + low26) / 2
+
+    high52 = df["high"].rolling(52, min_periods=52).max()
+    low52 = df["low"].rolling(52, min_periods=52).min()
     span_a = (tenkan + kijun) / 2
-    span_b = (h52 + l52) / 2
+    span_b = (high52 + low52) / 2
     return tenkan, kijun, span_a, span_b
 
 
-def price_action_score(df):
-    if len(df) < 20:
-        return 0.0
-    c, p = df.iloc[-1], df.iloc[-2]
-    rng = max(float(c.high - c.low), 1e-12)
-    body = abs(float(c.close - c.open))
-    upper = float(c.high - max(c.open, c.close))
-    lower = float(min(c.open, c.close) - c.low)
-    score = 0
-    if c.close > c.open:
-        score += 7
-    else:
-        score -= 7
-    if c.close > p.high:
-        score += 12
-    if c.close < p.low:
-        score -= 12
-    if lower > body * 1.5 and c.close > c.open:
-        score += 7
-    if upper > body * 1.5 and c.close < c.open:
-        score -= 7
-    if body / rng > 0.65:
-        score += 5 if c.close > c.open else -5
-    return float(np.clip(score, -25, 25))
-
-
-def structure_levels(df, lookback=120):
-    if df.empty:
-        return [], []
-    x = df.tail(lookback)
-    price = float(x.close.iloc[-1])
-    high_roll = x.high.rolling(7, center=True).max()
-    low_roll = x.low.rolling(7, center=True).min()
-    highs = x.high[high_roll.eq(x.high)].dropna().tolist()
-    lows = x.low[low_roll.eq(x.low)].dropna().tolist()
-    supports = sorted([v for v in lows if v < price], reverse=True)[:4]
-    resistances = sorted([v for v in highs if v > price])[:4]
-    return [float(v) for v in supports], [float(v) for v in resistances]
+def add_indicators(df):
+    x = df.copy()
+    x["ema20"] = ema(x["close"], 20)
+    x["ema50"] = ema(x["close"], 50)
+    x["ema200"] = ema(x["close"], 200)
+    x["rsi"] = rsi(x["close"], 14)
+    x["atr"] = atr(x, 14)
+    x["adx"], x["plus_di"], x["minus_di"] = adx(x, 14)
+    x["macd"], x["macd_signal"], x["macd_hist"] = macd(x["close"])
+    x["tenkan"], x["kijun"], x["span_a"], x["span_b"] = ichimoku(x)
+    x["vol_ma20"] = x["volume"].rolling(20, min_periods=20).mean()
+    x["body"] = (x["close"] - x["open"]).abs()
+    x["range"] = (x["high"] - x["low"]).replace(0, np.nan)
+    x["body_ratio"] = x["body"] / x["range"]
+    # Causal support/resistance: shifted rolling extrema; no centered windows.
+    x["support"] = x["low"].shift(1).rolling(40, min_periods=20).min()
+    x["resistance"] = x["high"].shift(1).rolling(40, min_periods=20).max()
+    x["ret_5"] = x["close"].pct_change(5)
+    x["ret_20"] = x["close"].pct_change(20)
+    return x
 
 
 # ============================================================
-# SINGLE-TF SIGNAL
+# Signal scoring
 # ============================================================
-def tf_signal(df):
-    if len(df) < 80:
-        return None
+def candle_bias(row):
+    if row["close"] > row["open"] and row["body_ratio"] >= 0.55:
+        return 1
+    if row["close"] < row["open"] and row["body_ratio"] >= 0.55:
+        return -1
+    return 0
 
-    close = df.close
-    r = float(rsi(close).iloc[-1])
-    ml, ms, mh = macd(close)
-    mac, sig, hist = float(ml.iloc[-1]), float(ms.iloc[-1]), float(mh.iloc[-1])
-    at = float(atr(df).iloc[-1])
-    ad = float(adx(df).iloc[-1])
-    ten, kij, sa, sb = ichimoku(df)
-    price = float(close.iloc[-1])
 
-    cloud_top = max(float(sa.iloc[-1]), float(sb.iloc[-1]))
-    cloud_bottom = min(float(sa.iloc[-1]), float(sb.iloc[-1]))
+def score_row(row):
+    if not np.isfinite(row.get("close", np.nan)):
+        return 0, 0, 0, []
 
-    score = 0.0
-    reasons = []
+    long_score = 0
+    short_score = 0
+    reasons_long = []
+    reasons_short = []
 
-    # Trend / Ichimoku
-    if price > cloud_top:
-        score += 20
-        reasons.append("بالای کلود")
-    elif price < cloud_bottom:
-        score -= 20
-        reasons.append("زیر کلود")
-    else:
-        reasons.append("داخل کلود")
+    # Trend
+    if row["close"] > row["ema50"] > row["ema200"]:
+        long_score += 2
+        reasons_long.append("روند EMA صعودی")
+    if row["close"] < row["ema50"] < row["ema200"]:
+        short_score += 2
+        reasons_short.append("روند EMA نزولی")
 
-    if float(ten.iloc[-1]) > float(kij.iloc[-1]):
-        score += 9
-        reasons.append("تنکن بالای کیجون")
-    else:
-        score -= 9
+    # Momentum
+    if row["rsi"] >= 52 and row["rsi"] <= 72:
+        long_score += 1
+        reasons_long.append("RSI متمایل به صعود")
+    if row["rsi"] <= 48 and row["rsi"] >= 28:
+        short_score += 1
+        reasons_short.append("RSI متمایل به نزول")
 
     # MACD
-    if mac > sig:
-        score += 13
-        reasons.append("MACD صعودی")
+    if row["macd"] > row["macd_signal"] and row["macd_hist"] > 0:
+        long_score += 2
+        reasons_long.append("MACD مثبت")
+    if row["macd"] < row["macd_signal"] and row["macd_hist"] < 0:
+        short_score += 2
+        reasons_short.append("MACD منفی")
+
+    # ADX / directional movement
+    if row["adx"] >= 20 and row["plus_di"] > row["minus_di"]:
+        long_score += 1
+        reasons_long.append("قدرت روند صعودی")
+    if row["adx"] >= 20 and row["minus_di"] > row["plus_di"]:
+        short_score += 1
+        reasons_short.append("قدرت روند نزولی")
+
+    # Ichimoku
+    cloud_top = max(row["span_a"], row["span_b"])
+    cloud_bottom = min(row["span_a"], row["span_b"])
+    if row["close"] > cloud_top and row["tenkan"] >= row["kijun"]:
+        long_score += 2
+        reasons_long.append("بالای ابر ایچیموکو")
+    if row["close"] < cloud_bottom and row["tenkan"] <= row["kijun"]:
+        short_score += 2
+        reasons_short.append("پایین ابر ایچیموکو")
+
+    # Volume
+    if row["volume"] > row["vol_ma20"] * 1.15:
+        if row["close"] > row["open"]:
+            long_score += 1
+            reasons_long.append("حجم تأییدکننده خرید")
+        elif row["close"] < row["open"]:
+            short_score += 1
+            reasons_short.append("حجم تأییدکننده فروش")
+
+    # Price action
+    cb = candle_bias(row)
+    if cb > 0:
+        long_score += 1
+        reasons_long.append("کندل صعودی")
+    elif cb < 0:
+        short_score += 1
+        reasons_short.append("کندل نزولی")
+
+    # Avoid chasing extreme RSI
+    if row["rsi"] > 78:
+        long_score -= 2
+    if row["rsi"] < 22:
+        short_score -= 2
+
+    total = max(long_score, short_score)
+    if long_score >= short_score + 2 and long_score >= 6:
+        direction = 1
+    elif short_score >= long_score + 2 and short_score >= 6:
+        direction = -1
     else:
-        score -= 13
-        reasons.append("MACD نزولی")
+        direction = 0
 
-    if hist > 0 and hist > float(mh.iloc[-2]):
-        score += 5
-    elif hist < 0 and hist < float(mh.iloc[-2]):
-        score -= 5
+    return direction, long_score, short_score, (
+        reasons_long if direction == 1 else reasons_short if direction == -1 else []
+    )
 
-    # RSI: avoid buying an already extreme RSI.
-    if 52 <= r <= 68:
-        score += 9
-        reasons.append("RSI مناسب")
-    elif 68 < r < 75:
-        score += 3
-        reasons.append("RSI نسبتاً داغ")
-    elif r >= 75:
-        score -= 7
-        reasons.append("RSI بسیار داغ")
-    elif r <= 30:
-        score += 2
-        reasons.append("اشباع فروش")
-    elif r < 45:
-        score -= 6
 
-    mom = float((close.iloc[-1] / close.iloc[-13] - 1) * 100)
-    score += float(np.clip(mom * 2.0, -12, 12))
+def levels_for(row, direction):
+    price = float(row["close"])
+    a = float(row["atr"]) if np.isfinite(row["atr"]) else price * 0.01
+    risk = max(a * ATR_SL, price * 0.003)
 
-    if ad >= 25:
-        score += 7 if price > float(kij.iloc[-1]) else -7
+    if direction == 1:
+        sl = price - risk
+        tp1 = price + risk * RR1
+        tp2 = price + risk * RR2
+        tp3 = price + risk * RR3
+    elif direction == -1:
+        sl = price + risk
+        tp1 = price - risk * RR1
+        tp2 = price - risk * RR2
+        tp3 = price - risk * RR3
     else:
-        # Low ADX = less confidence in trend-following signals.
-        score *= 0.92
+        return price, np.nan, np.nan, np.nan, np.nan
 
-    score += price_action_score(df)
+    rr = abs(tp2 - price) / max(abs(price - sl), 1e-12)
+    return price, sl, tp1, tp2, tp3, rr
+
+
+# ============================================================
+# Backtest — signal on closed bar, entry on next bar open
+# ============================================================
+def simulate_trades(df, start_idx=0, end_idx=None):
+    if end_idx is None:
+        end_idx = len(df) - 1
+
+    trades = []
+    # Need next bar for execution.
+    for i in range(max(start_idx, 200), min(end_idx, len(df) - 2)):
+        row = df.iloc[i]
+        direction, ls, ss, reasons = score_row(row)
+        if direction == 0:
+            continue
+
+        # Entry occurs at next candle open, not current close.
+        entry_bar = df.iloc[i + 1]
+        entry = float(entry_bar["open"])
+
+        a = float(row["atr"]) if np.isfinite(row["atr"]) else entry * 0.01
+        risk = max(a * ATR_SL, entry * 0.003)
+
+        if direction == 1:
+            sl = entry - risk
+            tp1 = entry + risk * RR1
+            tp2 = entry + risk * RR2
+        else:
+            sl = entry + risk
+            tp1 = entry - risk * RR1
+            tp2 = entry - risk * RR2
+
+        tp1_hit = False
+        tp2_hit = False
+        outcome = "TIMEOUT"
+        exit_price = np.nan
+        exit_idx = min(i + 1 + MAX_HOLD_BARS, len(df) - 1)
+
+        for j in range(i + 1, exit_idx + 1):
+            bar = df.iloc[j]
+            hi, lo = float(bar["high"]), float(bar["low"])
+
+            if direction == 1:
+                # Conservative rule: if SL and TP are both touched in one bar,
+                # count SL first because intrabar order is unknown.
+                if lo <= sl:
+                    outcome = "SL"
+                    exit_price = sl
+                    exit_idx = j
+                    break
+                if hi >= tp2:
+                    tp2_hit = True
+                    tp1_hit = True
+                    outcome = "TP2"
+                    exit_price = tp2
+                    exit_idx = j
+                    break
+                if hi >= tp1:
+                    tp1_hit = True
+            else:
+                if hi >= sl:
+                    outcome = "SL"
+                    exit_price = sl
+                    exit_idx = j
+                    break
+                if lo <= tp2:
+                    tp2_hit = True
+                    tp1_hit = True
+                    outcome = "TP2"
+                    exit_price = tp2
+                    exit_idx = j
+                    break
+                if lo <= tp1:
+                    tp1_hit = True
+
+        if np.isnan(exit_price):
+            exit_price = float(df.iloc[exit_idx]["close"])
+            if direction == 1:
+                if exit_price > entry:
+                    outcome = "TIMEOUT_WIN"
+                else:
+                    outcome = "TIMEOUT_LOSS"
+            else:
+                if exit_price < entry:
+                    outcome = "TIMEOUT_WIN"
+                else:
+                    outcome = "TIMEOUT_LOSS"
+
+        ret = (exit_price - entry) / entry if direction == 1 else (entry - exit_price) / entry
+
+        trades.append({
+            "signal_idx": i,
+            "entry_idx": i + 1,
+            "exit_idx": exit_idx,
+            "direction": direction,
+            "entry": entry,
+            "sl": sl,
+            "tp1": tp1,
+            "tp2": tp2,
+            "tp1_hit": bool(tp1_hit),
+            "tp2_hit": bool(tp2_hit),
+            "outcome": outcome,
+            "return": ret,
+        })
+
+    return pd.DataFrame(trades)
+
+
+def stats_from_trades(trades):
+    if trades is None or trades.empty:
+        return {
+            "trades": 0, "wins": 0, "losses": 0, "win_rate": 0.0,
+            "tp1_rate": 0.0, "tp2_rate": 0.0, "profit_factor": 0.0,
+            "expectancy": 0.0, "max_dd": 0.0
+        }
+
+    r = trades["return"].astype(float)
+    wins = int((r > 0).sum())
+    losses = int((r <= 0).sum())
+    gross_win = float(r[r > 0].sum())
+    gross_loss = float(-r[r < 0].sum())
+    pf = gross_win / gross_loss if gross_loss > 0 else (999.0 if gross_win > 0 else 0.0)
+
+    equity = (1 + r).cumprod()
+    peak = equity.cummax()
+    dd = equity / peak - 1
+    max_dd = float(dd.min()) if len(dd) else 0.0
 
     return {
-        "score": float(np.clip(score, -100, 100)),
-        "rsi": r,
-        "macd": mac,
-        "signal": sig,
-        "momentum": mom,
-        "adx": ad,
-        "atr": at,
-        "price": price,
-        "reasons": reasons,
+        "trades": len(trades),
+        "wins": wins,
+        "losses": losses,
+        "win_rate": wins / len(trades),
+        "tp1_rate": float(trades["tp1_hit"].mean()),
+        "tp2_rate": float(trades["tp2_hit"].mean()),
+        "profit_factor": pf,
+        "expectancy": float(r.mean()),
+        "max_dd": max_dd,
+    }
+
+
+def walk_forward_backtest(df):
+    if len(df) < MIN_BARS + 80:
+        return None
+
+    cut = int(len(df) * (1 - OOS_RATIO))
+    train = simulate_trades(df, 0, cut - 1)
+    oos = simulate_trades(df, cut, len(df) - 1)
+    all_trades = simulate_trades(df, 0, len(df) - 1)
+
+    st_train = stats_from_trades(train)
+    st_oos = stats_from_trades(oos)
+    st_all = stats_from_trades(all_trades)
+
+    stats_ok = (
+        st_oos["trades"] >= MIN_OOS_TRADES
+        and st_oos["profit_factor"] > MIN_PF
+        and st_oos["expectancy"] > MIN_EXPECTANCY
+        and st_oos["tp1_rate"] >= MIN_TP1_RATE
+    )
+
+    return {
+        "train": st_train,
+        "oos": st_oos,
+        "all": st_all,
+        "stats_ok": stats_ok,
+        "oos_trades": st_oos["trades"],
     }
 
 
 # ============================================================
-# MULTI-TIMEFRAME CURRENT ANALYSIS
+# Multi-timeframe confirmation
 # ============================================================
-TF_WEIGHTS = {
-    "5m": 0.35, "15m": 0.60, "30m": 0.75,
-    "1H": 1.10, "2H": 1.25, "4H": 1.55,
-    "6H": 1.35, "12H": 1.25, "1D": 1.45,
-    "3D": 1.05, "1W": 0.85,
-}
-
-
-def aggregate_score(analyses):
-    if not analyses:
-        return None
-    total_w = sum(TF_WEIGHTS.get(tf, 1.0) for tf in analyses)
-    weighted = sum(
-        a["score"] * TF_WEIGHTS.get(tf, 1.0)
-        for tf, a in analyses.items()
-    ) / total_w
-
-    # Agreement between the important timeframes.
-    core = [
-        analyses[tf]["score"]
-        for tf in ("1H", "4H", "1D")
-        if tf in analyses
-    ]
-    agreement_bonus = 0.0
-    if len(core) >= 2:
-        same_bull = all(x >= 10 for x in core)
-        same_bear = all(x <= -10 for x in core)
-        if same_bull or same_bear:
-            agreement_bonus = 8
-        elif any(x > 10 for x in core) and any(x < -10 for x in core):
-            agreement_bonus = -8
-
-    final = float(np.clip(weighted + agreement_bonus, -100, 100))
-    return final
-
-
-def position_from_score(score, mode="SPOT"):
-    if mode == "SPOT":
-        return "لانگ" if score >= 24 else "صبر"
-    return "لانگ" if score >= 24 else ("شورت" if score <= -24 else "صبر")
-
-
-# ============================================================
-# HISTORICAL SIGNAL ENGINE FOR CALIBRATION
-# ============================================================
-def historical_signal_score(df, idx):
-    """Signal using only rows <= idx. No future candles are used."""
-    if idx < 100:
+@st.cache_data(ttl=120, show_spinner=False)
+def analyze_timeframe(symbol, interval):
+    df, source = get_klines(symbol, interval, CANDLE_LIMIT)
+    if df.empty or len(df) < MIN_BARS:
         return None
 
-    x = df.iloc[:idx + 1].copy()
-    a = tf_signal(x)
-    if not a:
-        return None
-    return float(a["score"])
-
-
-def simulate_trade(df, signal_idx, direction, fee_pct, slippage_pct,
-                    horizon_bars=24, rr1=1.6, rr2=2.6):
-    """
-    Entry = next candle open.
-    SL/TP calculated from information available at signal candle only.
-    Conservative same-candle collision: SL first.
-    """
-    if signal_idx + 1 >= len(df):
+    x = add_indicators(df).dropna().reset_index(drop=True)
+    if len(x) < 100:
         return None
 
-    sig = df.iloc[signal_idx]
-    entry_raw = float(df.iloc[signal_idx + 1].open)
+    row = x.iloc[-1]
+    direction, ls, ss, reasons = score_row(row)
+    price, sl, tp1, tp2, tp3, rr = levels_for(row, direction)
 
-    atrv = float(atr(df.iloc[:signal_idx + 1]).iloc[-1])
-    if not np.isfinite(atrv) or atrv <= 0:
-        return None
-
-    supports, resistances = structure_levels(df.iloc[:signal_idx + 1])
-    if direction == "LONG":
-        entry = entry_raw * (1 + slippage_pct / 100)
-        candidate_sl = supports[0] if supports and supports[0] < entry else entry - 1.35 * atrv
-        sl = min(candidate_sl, entry - 0.006 * entry)
-        risk = max(entry - sl, 0.006 * entry)
-        tp1 = entry + rr1 * risk
-        tp2 = entry + rr2 * risk
-    else:
-        entry = entry_raw * (1 - slippage_pct / 100)
-        candidate_sl = resistances[0] if resistances and resistances[0] > entry else entry + 1.35 * atrv
-        sl = max(candidate_sl, entry + 0.006 * entry)
-        risk = max(sl - entry, 0.006 * entry)
-        tp1 = entry - rr1 * risk
-        tp2 = entry - rr2 * risk
-
-    end = min(len(df), signal_idx + 1 + horizon_bars)
-    result = "TIMEOUT"
-    exit_price = float(df.iloc[end - 1].close)
-    exit_idx = end - 1
-    tp1_hit = False
-    tp2_hit = False
-
-    for j in range(signal_idx + 1, end):
-        bar = df.iloc[j]
-        hi, lo = float(bar.high), float(bar.low)
-
-        if direction == "LONG":
-            hit_sl = lo <= sl
-            hit_tp1 = hi >= tp1
-            hit_tp2 = hi >= tp2
-
-            # Conservative ordering when both occur in one candle.
-            if hit_sl:
-                result = "SL"
-                exit_price = sl
-                exit_idx = j
-                break
-            if hit_tp2:
-                result = "TP2"
-                exit_price = tp2
-                exit_idx = j
-                tp1_hit = True
-                tp2_hit = True
-                break
-            if hit_tp1:
-                result = "TP1"
-                exit_price = tp1
-                exit_idx = j
-                tp1_hit = True
-                break
-        else:
-            hit_sl = hi >= sl
-            hit_tp1 = lo <= tp1
-            hit_tp2 = lo <= tp2
-            if hit_sl:
-                result = "SL"
-                exit_price = sl
-                exit_idx = j
-                break
-            if hit_tp2:
-                result = "TP2"
-                exit_price = tp2
-                exit_idx = j
-                tp1_hit = True
-                tp2_hit = True
-                break
-            if hit_tp1:
-                result = "TP1"
-                exit_price = tp1
-                exit_idx = j
-                tp1_hit = True
-                break
-
-    # Approximate round-trip costs.
-    cost = 2 * (fee_pct + slippage_pct) / 100
-    gross_return = (
-        (exit_price / entry - 1) if direction == "LONG"
-        else (entry / exit_price - 1)
-    )
-    net_return = gross_return - cost
+    bt = walk_forward_backtest(x)
 
     return {
-        "signal_idx": signal_idx,
-        "exit_idx": exit_idx,
+        "symbol": symbol,
+        "interval": interval,
+        "source": source,
+        "df": x,
         "direction": direction,
-        "entry": entry,
+        "long_score": ls,
+        "short_score": ss,
+        "reasons": reasons,
+        "price": price,
         "sl": sl,
         "tp1": tp1,
         "tp2": tp2,
-        "result": result,
-        "tp1_hit": tp1_hit,
-        "tp2_hit": tp2_hit,
-        "net_return": float(net_return),
-        "bars_held": int(exit_idx - signal_idx),
-        "score": None,
+        "tp3": tp3,
+        "rr": rr,
+        "rsi": float(row["rsi"]),
+        "adx": float(row["adx"]),
+        "atr_pct": float(row["atr"] / row["close"] * 100),
+        "volume_ratio": float(row["volume"] / row["vol_ma20"]) if row["vol_ma20"] else np.nan,
+        "bt": bt,
     }
 
 
-def backtest_1h(symbol, fee_pct=0.10, slippage_pct=0.05,
-                horizon_bars=24, min_score=24, max_trades=180):
-    """
-    Rolling historical test on 1H data.
-    This deliberately tests the same core signal on unseen future candles.
-    """
-    df = fetch_klines(symbol, "1h", 1000)
-    if len(df) < 300:
-        return None
+def mtf_confirmation(results):
+    valid = [v for v in results.values() if v is not None]
+    dirs = [v["direction"] for v in valid if v["direction"] != 0]
+    if len(valid) < 3 or len(dirs) < 3:
+        return 0, False, "داده کافی نیست"
 
-    trades = []
-    # Step through history; skip ahead after a trade to reduce overlapping signals.
-    i = 120
-    while i < len(df) - horizon_bars - 2 and len(trades) < max_trades:
-        score = historical_signal_score(df, i)
-        if score is None:
-            i += 1
+    long_n = sum(d == 1 for d in dirs)
+    short_n = sum(d == -1 for d in dirs)
+
+    if long_n >= 3 and long_n / len(dirs) >= 0.60:
+        return 1, True, f"تأیید لانگ {long_n}/{len(dirs)}"
+    if short_n >= 3 and short_n / len(dirs) >= 0.60:
+        return -1, True, f"تأیید شورت {short_n}/{len(dirs)}"
+    return 0, False, "تأیید چندتایم‌فریمی ناقص"
+
+
+def final_decision(mtf_dir, mtf_ok, primary, bt):
+    if bt is None:
+        return "عدم معامله", False
+    oos = bt["oos"]
+    stats_ok = (
+        oos["trades"] >= MIN_OOS_TRADES
+        and oos["profit_factor"] > MIN_PF
+        and oos["expectancy"] > MIN_EXPECTANCY
+        and oos["tp1_rate"] >= MIN_TP1_RATE
+    )
+    if not stats_ok:
+        return "عدم معامله", False
+    if not mtf_ok:
+        return "صبر", False
+    if primary is None or primary["direction"] != mtf_dir:
+        return "صبر", False
+    return "معامله", True
+
+
+# ============================================================
+# Scan
+# ============================================================
+@st.cache_data(ttl=120, show_spinner=False)
+def scan_market(symbols, interval):
+    out = []
+    for symbol in symbols:
+        try:
+            a = analyze_timeframe(symbol, interval)
+            if a is None:
+                continue
+            bt = a["bt"]
+            oos = bt["oos"] if bt else None
+            out.append({
+                "ارز": symbol,
+                "جهت": "لانگ" if a["direction"] == 1 else "شورت" if a["direction"] == -1 else "خنثی",
+                "قیمت": a["price"],
+                "امتیاز": max(a["long_score"], a["short_score"]),
+                "RSI": a["rsi"],
+                "ADX": a["adx"],
+                "TP1": oos["tp1_rate"] if oos else np.nan,
+                "PF": oos["profit_factor"] if oos else np.nan,
+                "Expectancy": oos["expectancy"] if oos else np.nan,
+                "OOS": oos["trades"] if oos else 0,
+                "وضعیت آماری": "قبول" if bt and bt["stats_ok"] else "رد",
+                "_analysis": a,
+            })
+        except Exception:
             continue
 
-        # Calibration is for long-only Spot by default.
-        if score >= min_score:
-            tr = simulate_trade(
-                df, i, "LONG",
-                fee_pct, slippage_pct,
-                horizon_bars=horizon_bars
-            )
-            if tr:
-                tr["score"] = score
-                trades.append(tr)
-                # Avoid counting every consecutive candle as a separate position.
-                i = tr["exit_idx"] + 1
-                continue
-        i += 1
+    if not out:
+        return pd.DataFrame()
 
-    if not trades:
-        return None
-
-    t = pd.DataFrame(trades)
-    wins = t["net_return"] > 0
-    tp1 = t["tp1_hit"].mean()
-    tp2 = t["tp2_hit"].mean()
-    win_rate = wins.mean()
-
-    gross_profit = t.loc[t.net_return > 0, "net_return"].sum()
-    gross_loss = -t.loc[t.net_return < 0, "net_return"].sum()
-    pf = gross_profit / gross_loss if gross_loss > 0 else np.inf
-
-    equity = (1 + t["net_return"]).cumprod()
-    peak = equity.cummax()
-    dd = equity / peak - 1
-    max_dd = float(dd.min())
-
-    expectancy = float(t["net_return"].mean())
-
-    # Empirical confidence: smoothed TP1 probability.
-    # Beta(1,1) prior prevents 100% with tiny sample sizes.
-    n = len(t)
-    successes = int(t["tp1_hit"].sum())
-    calibrated_tp1 = (successes + 1) / (n + 2)
-
-    return {
-        "symbol": symbol,
-        "trades": n,
-        "win_rate": float(win_rate),
-        "tp1_rate": float(tp1),
-        "tp2_rate": float(tp2),
-        "calibrated_tp1": float(calibrated_tp1),
-        "profit_factor": float(pf) if np.isfinite(pf) else 999.0,
-        "max_drawdown": max_dd,
-        "expectancy": expectancy,
-        "net_return": float(equity.iloc[-1] - 1),
-        "trades_df": t,
-    }
-
-
-# ============================================================
-# LIVE ANALYSIS
-# ============================================================
-@st.cache_data(ttl=60, show_spinner=False)
-def analyze_symbol(symbol, mode="SPOT", fee_pct=0.10, slippage_pct=0.05):
-    frames = {}
-    for tf in TIMEFRAMES:
-        df = get_tf_data(symbol, tf, 1000)
-        if len(df) >= 80:
-            frames[tf] = df
-
-    if not frames:
-        return None
-
-    analyses = {
-        tf: tf_signal(df)
-        for tf, df in frames.items()
-        if tf_signal(df) is not None
-    }
-    if not analyses:
-        return None
-
-    score = aggregate_score(analyses)
-    position = position_from_score(score, mode)
-
-    # Use 4H for risk structure where available.
-    ref_tf = "4H" if "4H" in frames else ("1H" if "1H" in frames else next(iter(frames)))
-    ref_df = frames[ref_tf]
-    ref_a = analyses[ref_tf]
-    entry = float(ref_df.close.iloc[-1])
-    atrv = float(ref_a["atr"])
-
-    supports, resistances = structure_levels(ref_df)
-
-    if position == "لانگ":
-        sl = supports[0] if supports and supports[0] < entry else entry - 1.35 * atrv
-        sl = min(sl, entry - 0.006 * entry)
-        risk = max(entry - sl, 0.006 * entry)
-        tp1 = entry + 1.6 * risk
-        tp2 = entry + 2.6 * risk
-        tp3 = entry + 3.8 * risk
-    elif position == "شورت":
-        sl = resistances[0] if resistances and resistances[0] > entry else entry + 1.35 * atrv
-        sl = max(sl, entry + 0.006 * entry)
-        risk = max(sl - entry, 0.006 * entry)
-        tp1 = entry - 1.6 * risk
-        tp2 = entry - 2.6 * risk
-        tp3 = entry - 3.8 * risk
-    else:
-        sl = entry - 1.35 * atrv
-        risk = abs(entry - sl)
-        tp1 = entry + 1.6 * risk
-        tp2 = entry + 2.6 * risk
-        tp3 = entry + 3.8 * risk
-
-    # Historical calibration is separate from current technical score.
-    bt = backtest_1h(
-        symbol,
-        fee_pct=fee_pct,
-        slippage_pct=slippage_pct,
-        horizon_bars=DEFAULT_HORIZON_BARS,
-        min_score=24,
+    df = pd.DataFrame(out)
+    df["_rank"] = (
+        df["وضعیت آماری"].eq("قبول").astype(int) * 100
+        + df["PF"].fillna(0).clip(0, 5) * 10
+        + df["TP1"].fillna(0) * 20
+        + df["امتیاز"].fillna(0)
     )
-
-    if bt:
-        calibrated_conf = 100 * bt["calibrated_tp1"]
-        sample_note = f"بر اساس {bt['trades']} معامله تاریخی 1H"
-    else:
-        calibrated_conf = np.nan
-        sample_note = "داده تاریخی کافی برای کالیبراسیون موجود نیست"
-
-    # No fake directional price forecast.
-    # Instead, give historical outcome probabilities and expected return.
-    forecast = {
-        "4H": None,
-        "24H": None,
-        "72H": None,
-    }
-
-    return {
-        "symbol": symbol,
-        "frames": frames,
-        "analyses": analyses,
-        "score": float(score),
-        "position": position,
-        "decision": "معامله" if position in ("لانگ", "شورت") else "صبر",
-        "entry": entry,
-        "sl": float(sl),
-        "tp1": float(tp1),
-        "tp2": float(tp2),
-        "tp3": float(tp3),
-        "risk_pct": float(abs(entry - sl) / entry * 100),
-        "supports": supports,
-        "resistances": resistances,
-        "backtest": bt,
-        "calibrated_confidence": calibrated_conf,
-        "confidence_note": sample_note,
-        "forecast": forecast,
-    }
+    return df.sort_values("_rank", ascending=False).reset_index(drop=True)
 
 
 # ============================================================
 # UI
 # ============================================================
-st.markdown("""
-<style>
-.block-container{padding-top:1rem;padding-bottom:2rem;max-width:1100px}
-.head{background:linear-gradient(135deg,#111318,#292d33);color:#fff;border-radius:22px;padding:20px;margin-bottom:14px}
-.brand{font-size:25px;font-weight:900}.sub{font-size:12px;color:#cfd2d7;margin-top:6px}
-.card{background:#fff;border:1px solid #e8e8e8;border-radius:20px;padding:16px;margin:12px 0;box-shadow:0 3px 14px rgba(0,0,0,.04)}
-.grid{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:8px}
-.box{background:#f7f7f8;border-radius:13px;padding:10px}.k{font-size:10px;color:#777}.v{font-size:16px;font-weight:850;margin-top:4px}
-.buy{color:#087f3e}.sell{color:#b42318}.wait{color:#806000}
-.note{font-size:11px;color:#777;line-height:1.8}
-@media(max-width:700px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
-</style>
-<div class="head">
-<div class="brand">₿ تحلیل‌گر حرفه‌ای رمزارز — نسخه قابل‌آزمون</div>
-<div class="sub">سیگنال بر اساس کندل بسته‌شده • ورود روی کندل بعدی در بک‌تست • کارمزد و اسلیپیج • کالیبراسیون تاریخی • بدون پیش‌بینی ساختگی</div>
-</div>
-""", unsafe_allow_html=True)
+st.title("Tabdeal Crypto Signal Engine")
+st.caption(
+    "نسخه اختصاصی API تبدیل — فقط Tabdeal، تحلیل Spot + Margin/Futures، "
+    "بدون Auto Trading و بدون لحاظ کارمزد در بک‌تست."
+)
+
+try:
+    raw_markets = get_exchange_info()
+    markets = normalize_markets(raw_markets)
+except Exception as e:
+    st.error(f"دریافت بازارهای تبدیل ناموفق بود: {e}")
+    st.stop()
+
+if markets.empty:
+    st.error("هیچ بازار فعالی از تبدیل دریافت نشد.")
+    st.stop()
 
 with st.sidebar:
-    st.header("تنظیمات تست")
-    mode = st.selectbox("نوع بازار", ["SPOT", "FUTURES"])
-    fee_pct = st.number_input("کارمزد هر سمت (%)", 0.0, 1.0, DEFAULT_FEE_PCT, 0.01)
-    slip_pct = st.number_input("اسلیپیج هر سمت (%)", 0.0, 1.0, DEFAULT_SLIPPAGE_PCT, 0.01)
-    horizon = st.number_input("افق بک‌تست (تعداد کندل 1H)", 4, 120, DEFAULT_HORIZON_BARS, 1)
-    st.caption("در SPOT فقط لانگ فعال است. برای شورت باید واقعاً روی بازار Futures/Margin معامله شود.")
+    st.divider()
+    st.subheader("اتصال API تبدیل")
+    if TABDEAL_API_KEY and TABDEAL_API_SECRET:
+        try:
+            acct = get_account()
+            st.success("API حساب: متصل")
+            st.caption(f"Account: {acct.get('accountType','-')}")
+            st.caption(f"Can Trade: {acct.get('canTrade','-')}")
+        except Exception as e:
+            st.error(f"API حساب: {e}")
+    else:
+        st.warning("TABDEAL_API_KEY و TABDEAL_API_SECRET تنظیم نشده‌اند؛ فقط API عمومی فعال است.")
 
-universe = get_universe()
+active = markets[
+    markets["status"].isin(["TRADING", ""])
+].copy()
 
-st.markdown('<div class="card"><b>انتخاب بازار</b><div class="note">حداکثر ۵ ارز. تحلیل چندتایم‌فریمی انجام می‌شود، اما اطمینان فقط زمانی نمایش داده می‌شود که نتیجه تاریخی کافی داشته باشیم.</div></div>', unsafe_allow_html=True)
+# All markets are available; default focus is USDT for the main scanner,
+# while the user can switch to every quote asset.
+quote_options = ["همه"] + sorted(active["quote"].dropna().unique().tolist())
+base_options = sorted(active["base"].dropna().unique().tolist())
 
-search = st.text_input("جستجو", placeholder="BTC / ETH / SOL ...")
-filtered = [s for s in universe if search.upper() in s] if search else universe
-selected = st.multiselect(
-    "ارزها",
-    filtered,
-    max_selections=5,
-    format_func=lambda x: x.replace("USDT", "/USDT"),
-)
+with st.sidebar:
+    st.header("تنظیمات")
+    quote_filter = st.selectbox("Quote", quote_options, index=quote_options.index("USDT") if "USDT" in quote_options else 0)
+    scan_tf = st.selectbox("تایم‌فریم اسکن", list(TIMEFRAMES.keys()), index=list(TIMEFRAMES.keys()).index(DEFAULT_SCAN_TF))
+    detail_tfs = st.multiselect(
+        "تایم‌فریم‌های تحلیل دقیق",
+        list(TIMEFRAMES.keys()),
+        default=["15m", "1H", "4H", "1D"]
+    )
+    market_mode = st.selectbox("نوع بازار", ["همه", "Spot", "Margin/Futures"])
 
-if selected:
-    results = []
-    with st.spinner("در حال تحلیل چندتایم‌فریمی و کالیبراسیون تاریخی..."):
-        with ThreadPoolExecutor(max_workers=min(5, len(selected))) as ex:
-            jobs = {
-                ex.submit(
-                    analyze_symbol,
-                    s, mode, fee_pct, slip_pct
-                ): s for s in selected
-            }
-            for job in as_completed(jobs):
-                try:
-                    r = job.result()
-                    if r:
-                        results.append(r)
-                except Exception:
-                    pass
+    st.divider()
+    st.subheader("قوانین اعتبارسنجی")
+    st.write(f"OOS حداقل: {MIN_OOS_TRADES}")
+    st.write(f"Profit Factor > {MIN_PF}")
+    st.write("Expectancy > 0")
+    st.write(f"TP1 Rate ≥ {MIN_TP1_RATE:.0%}")
+    st.write("کارمزد: لحاظ نمی‌شود")
+    st.write("سیگنال فقط روی کندل بسته‌شده")
 
-    for r in sorted(results, key=lambda x: x["score"], reverse=True):
-        cls = "buy" if r["position"] == "لانگ" else ("sell" if r["position"] == "شورت" else "wait")
-        bt = r["backtest"]
+if quote_filter == "همه":
+    filtered = active.copy()
+else:
+    filtered = active[active["quote"] == quote_filter].copy()
 
-        if np.isfinite(r["calibrated_confidence"]):
-            conf_txt = f'{r["calibrated_confidence"]:.1f}%'
-        else:
-            conf_txt = "نامشخص"
+if market_mode == "Spot":
+    filtered = filtered[filtered["spot"]]
+elif market_mode == "Margin/Futures":
+    filtered = filtered[filtered["margin"]]
 
-        if bt:
-            bt_txt = (
-                f'Win Rate: {bt["win_rate"]*100:.1f}% • '
-                f'TP1: {bt["tp1_rate"]*100:.1f}% • '
-                f'TP2: {bt["tp2_rate"]*100:.1f}% • '
-                f'PF: {bt["profit_factor"]:.2f} • '
-                f'DD: {bt["max_drawdown"]*100:.1f}% • '
-                f'Expectancy: {bt["expectancy"]*100:.2f}%'
-            )
-        else:
-            bt_txt = "داده کافی برای بک‌تست موجود نیست."
+symbols = filtered["symbol"].tolist()
 
-        st.markdown(f"""
-        <div class="card">
-          <h3>{r["symbol"].replace("USDT","/USDT")} —
-            <span class="{cls}">{r["position"]}</span></h3>
+tab1, tab2, tab3 = st.tabs(["تحلیل ارز", "اسکن کل بازار", "اطلاعات سیستم"])
 
-          <div class="grid">
-            <div class="box"><div class="k">امتیاز فعلی</div><div class="v">{r["score"]:.1f}</div></div>
-            <div class="box"><div class="k">اطمینان کالیبره‌شده TP1</div><div class="v">{conf_txt}</div></div>
-            <div class="box"><div class="k">ورود</div><div class="v">{money(r["entry"])}</div></div>
-            <div class="box"><div class="k">حد ضرر</div><div class="v">{money(r["sl"])}</div></div>
-            <div class="box"><div class="k">ریسک</div><div class="v">{r["risk_pct"]:.2f}%</div></div>
-            <div class="box"><div class="k">TP1</div><div class="v">{money(r["tp1"])}</div></div>
-            <div class="box"><div class="k">TP2</div><div class="v">{money(r["tp2"])}</div></div>
-            <div class="box"><div class="k">TP3</div><div class="v">{money(r["tp3"])}</div></div>
-            <div class="box"><div class="k">تصمیم</div><div class="v">{r["decision"]}</div></div>
-            <div class="box"><div class="k">کالیبراسیون</div><div class="v">{r["confidence_note"]}</div></div>
-          </div>
+with tab1:
+    st.subheader("تحلیل دقیق")
+    if not symbols:
+        st.warning("بازاری با این فیلتر وجود ندارد.")
+    else:
+        default_symbol = symbols[0]
+        selected = st.selectbox("ارز", symbols, index=0)
 
-          <p class="note"><b>بک‌تست:</b> {bt_txt}</p>
-          <p class="note"><b>نکته:</b> این درصد احتمال رسیدن تاریخی به TP1 در نمونه بک‌تست است، نه تضمین موفقیت معامله فعلی.</p>
-        </div>
-        """, unsafe_allow_html=True)
+        if st.button("اجرای تحلیل", type="primary", use_container_width=True):
+            if not detail_tfs:
+                st.warning("حداقل یک تایم‌فریم انتخاب کنید.")
+            else:
+                details = {}
+                progress = st.progress(0)
+                for i, tf in enumerate(detail_tfs):
+                    details[tf] = analyze_timeframe(selected, TIMEFRAMES[tf])
+                    progress.progress((i + 1) / len(detail_tfs))
 
-        with st.expander(f'جزئیات تایم‌فریم‌ها — {r["symbol"].replace("USDT","/USDT")}'):
-            rows = []
-            for tf in TIMEFRAMES:
-                a = r["analyses"].get(tf)
-                if a:
+                mtf_dir, mtf_ok, mtf_msg = mtf_confirmation(details)
+                primary_tf = "1H" if "1H" in details else detail_tfs[0]
+                primary = details.get(primary_tf)
+                bt = primary["bt"] if primary else None
+                decision, trade_ok = final_decision(mtf_dir, mtf_ok, primary, bt)
+
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("تصمیم نهایی", decision)
+                c2.metric("تأیید MTF", "قبول" if mtf_ok else "رد")
+                if bt:
+                    c3.metric("OOS معاملات", bt["oos"]["trades"])
+                    c4.metric("Profit Factor", f'{bt["oos"]["profit_factor"]:.2f}')
+
+                if primary:
+                    direction = "لانگ" if primary["direction"] == 1 else "شورت" if primary["direction"] == -1 else "خنثی"
+                    st.markdown(f"### {selected} — {direction}")
+
+                    if primary["direction"] != 0:
+                        l1, l2, l3, l4, l5 = st.columns(5)
+                        l1.metric("ورود", fmt_price(primary["price"]))
+                        l2.metric("حد ضرر", fmt_price(primary["sl"]))
+                        l3.metric("TP1", fmt_price(primary["tp1"]))
+                        l4.metric("TP2", fmt_price(primary["tp2"]))
+                        l5.metric("TP3", fmt_price(primary["tp3"]))
+
+                    if bt:
+                        o = bt["oos"]
+                        t = bt["train"]
+                        st.write(
+                            f"**OOS:** {o['trades']} معامله | "
+                            f"Win Rate: {o['win_rate']:.1%} | "
+                            f"TP1: {o['tp1_rate']:.1%} | "
+                            f"TP2: {o['tp2_rate']:.1%} | "
+                            f"PF: {o['profit_factor']:.2f} | "
+                            f"Expectancy: {o['expectancy']:.2%} | "
+                            f"Max DD: {o['max_dd']:.2%}"
+                        )
+                        st.caption(
+                            f"Train: {t['trades']} معامله — "
+                            f"داده OOS برابر {OOS_RATIO:.0%} بخش پایانی تاریخچه است."
+                        )
+
+                    st.info(
+                        f"وضعیت چندتایم‌فریمی: {mtf_msg}. "
+                        f"منبع کندل تایم‌فریم اصلی: {primary['source']}."
+                    )
+                    st.write("دلایل سیگنال:", "، ".join(primary["reasons"]) if primary["reasons"] else "تأیید کافی وجود ندارد.")
+
+                rows = []
+                for tf, a in details.items():
+                    if a is None:
+                        rows.append({"تایم‌فریم": tf, "جهت": "داده ناکافی"})
+                        continue
                     rows.append({
                         "تایم‌فریم": tf,
-                        "نوع": "لانگ" if a["score"] >= 24 else ("شورت" if a["score"] <= -24 else "صبر"),
-                        "امتیاز": round(a["score"], 1),
+                        "جهت": "لانگ" if a["direction"] == 1 else "شورت" if a["direction"] == -1 else "خنثی",
                         "RSI": round(a["rsi"], 1),
-                        "Momentum %": round(a["momentum"], 2),
                         "ADX": round(a["adx"], 1),
+                        "امتیاز لانگ": a["long_score"],
+                        "امتیاز شورت": a["short_score"],
+                        "منبع": a["source"],
                     })
-            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
-            st.write("دلایل تایم‌فریم‌های اصلی:")
-            for tf in ("1H", "4H", "1D"):
-                a = r["analyses"].get(tf)
-                if a:
-                    st.write(f"**{tf}:** " + "؛ ".join(a["reasons"][:6]))
+with tab2:
+    st.subheader("اسکن کل بازار")
+    st.write(f"تعداد بازارهای قابل بررسی: **{len(symbols)}**")
+    if st.button("اسکن همه بازارها", type="primary", use_container_width=True):
+        with st.spinner("در حال دریافت داده و محاسبه سیگنال‌ها..."):
+            scan = scan_market(tuple(symbols), TIMEFRAMES[scan_tf])
 
-            if bt:
-                st.write("توزیع نتایج بک‌تست")
-                counts = bt["trades_df"]["result"].value_counts().rename_axis("نتیجه").reset_index(name="تعداد")
-                st.dataframe(counts, use_container_width=True, hide_index=True)
+        if scan.empty:
+            st.warning("نتیجه‌ای دریافت نشد. اتصال API یا محدودیت داده را بررسی کنید.")
+        else:
+            # Final status for the scanner uses statistical gate + primary signal.
+            display = scan.copy()
+            display["سیگنال"] = display.apply(
+                lambda r: (
+                    "معامله" if r["وضعیت آماری"] == "قبول" and r["جهت"] in ("لانگ", "شورت")
+                    else "عدم معامله"
+                ),
+                axis=1
+            )
+            display["TP1"] = display["TP1"].map(lambda x: f"{x:.1%}" if pd.notna(x) else "-")
+            display["Expectancy"] = display["Expectancy"].map(lambda x: f"{x:.2%}" if pd.notna(x) else "-")
+            display["PF"] = display["PF"].map(lambda x: f"{x:.2f}" if pd.notna(x) else "-")
+            display["قیمت"] = display["قیمت"].map(fmt_price)
 
-    st.markdown(
-        '<div class="card note"><b>تغییر مهم:</b> دیگر «اطمینان ۹۰٪» از روی امتیاز ساخته نمی‌شود. '
-        'اگر نمونه تاریخی کافی نباشد، برنامه صراحتاً «نامشخص» نشان می‌دهد.</div>',
-        unsafe_allow_html=True
+            cols = ["ارز", "قیمت", "جهت", "امتیاز", "RSI", "ADX", "TP1", "PF", "Expectancy", "OOS", "وضعیت آماری", "سیگنال"]
+            st.dataframe(display[cols], use_container_width=True, hide_index=True)
+
+            st.download_button(
+                "دانلود CSV نتایج",
+                data=display[cols].to_csv(index=False).encode("utf-8-sig"),
+                file_name="tabdeal_market_scan.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+
+with tab3:
+    st.subheader("منطق سیستم")
+    st.markdown("""
+- داده بازار ابتدا از **Tabdeal** دریافت می‌شود.
+- هیچ صرافی خارجی استفاده نمی‌شود؛ داده بازار فقط از Tabdeal دریافت می‌شود.
+- به‌دلیل نبود endpoint کندل تاریخی در مستندات عمومی فعلی، کندل‌ها از معاملات عمومی اخیر Tabdeal تجمیع می‌شوند و عمق OOS محدود است.
+- اندیکاتورها کاملاً **causal** هستند؛ از rolling centered یا اطلاعات آینده استفاده نمی‌شود.
+- سیگنال از **کندل بسته‌شده** ساخته می‌شود.
+- اجرای فرضی بک‌تست روی **Open کندل بعدی** انجام می‌شود.
+- اگر در یک کندل هم SL و هم TP لمس شوند، برای حالت محافظه‌کارانه **SL اول** در نظر گرفته می‌شود.
+- بخش پایانی تاریخچه به‌صورت **Out-of-Sample** جدا می‌شود.
+- «درصد موفقیت» از عملکرد تاریخی OOS می‌آید، نه از تبدیل امتیاز تکنیکال به درصد ساختگی.
+- برای «معامله» حداقل‌های آماری سخت‌گیرانه اعمال می‌شود.
+- کارمزد در بک‌تست **عمداً لحاظ نشده**؛ slippage کوچک به‌عنوان پارامتر مدل اجرای بک‌تست باقی مانده است.
+- این برنامه **هیچ سفارش واقعی ارسال نمی‌کند**.
+""")
+    if TABDEAL_API_KEY and TABDEAL_API_SECRET:
+        try:
+            acct=get_account()
+            balances=pd.DataFrame(acct.get("balances",[]))
+            if not balances.empty:
+                balances["free"]=pd.to_numeric(balances["free"],errors="coerce")
+                balances["freeze"]=pd.to_numeric(balances["freeze"],errors="coerce")
+                balances=balances[(balances["free"]>0)|(balances["freeze"]>0)]
+                st.markdown("### موجودی حساب تبدیل")
+                st.dataframe(balances,use_container_width=True,hide_index=True)
+        except Exception as e:
+            st.warning(f"خواندن موجودی حساب ممکن نشد: {e}")
+    st.write(f"تعداد کل بازارهای دریافتی: {len(markets)}")
+    st.write(f"بازارهای فعال پس از فیلتر: {len(active)}")
+    st.dataframe(
+        active[["symbol", "base", "quote", "status", "spot", "margin", "permissions"]]
+        .sort_values(["quote", "base"]),
+        use_container_width=True,
+        hide_index=True,
     )
-else:
-    st.info("یک یا چند ارز انتخاب کن.")
 
-st.markdown(
-    '<div class="note" style="text-align:center;margin-top:18px">'
-    'این ابزار تحقیقاتی است و تضمین سود نمی‌دهد. بک‌تست گذشته تضمین آینده نیست. '
-    'قبل از معامله واقعی، اجرای Paper Trading و سپس Forward Test توصیه می‌شود.'
-    '</div>',
-    unsafe_allow_html=True
-)
+st.caption("این نسخه فقط API تبدیل را می‌خواند و هیچ سفارش واقعی ارسال نمی‌کند.")
+st.caption("این نرم‌افزار ابزار تحلیل و سیگنال است و سود یا موفقیت معامله را تضمین نمی‌کند.")

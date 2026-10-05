@@ -1,4 +1,8 @@
 import streamlit as st
+try:
+    from streamlit_autorefresh import st_autorefresh
+except Exception:
+    st_autorefresh = None
 import pandas as pd
 import numpy as np
 import requests
@@ -13,7 +17,7 @@ from decimal import Decimal, ROUND_DOWN
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ============================================================
-# Crypto Analyzer Pro — RENDER AUTO-TRADER V3
+# Crypto Analyzer Pro — RENDER AUTO-TRADER V4 FAST
 # ============================================================
 # Architecture:
 # 1) Fast scan of the complete Tabdeal USDT market.
@@ -34,7 +38,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # ============================================================
 
 st.set_page_config(
-    page_title="Crypto Analyzer Pro — Autonomous",
+    page_title="Crypto Analyzer Pro — V4 Fast Auto-Trader",
     page_icon="₿",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -53,11 +57,12 @@ TIMEFRAMES = {
     "3D": "3d", "1W": "1w",
 }
 
-SCAN_TFS = ["1H", "4H", "1D"]
+SCAN_TFS = ["1H"]
+# Fast stage intentionally uses only 1H. Deep analysis still validates 15m/1H/4H/1D.
 DEEP_TFS = ["15m", "1H", "4H", "1D"]
 
 DEFAULT_SCAN_INTERVAL = 60
-DEFAULT_SCAN_WORKERS = 6
+DEFAULT_SCAN_WORKERS = 8
 DEFAULT_TRADE_USDT = 10.0
 DEFAULT_MAX_POSITIONS = 1
 
@@ -691,29 +696,34 @@ def fast_scan_one(symbol):
         return None
 
 
-def run_fast_market_scan(symbols, workers, progress_cb=None):
+@st.cache_data(ttl=45, show_spinner=False)
+def _run_fast_market_scan_cached(symbols_tuple, workers):
+    symbols = list(symbols_tuple)
     rows = []
-    total = len(symbols)
-
-    with ThreadPoolExecutor(max_workers=workers) as ex:
+    with ThreadPoolExecutor(max_workers=int(workers)) as ex:
         futures = {ex.submit(fast_scan_one, s): s for s in symbols}
-
-        for i, fut in enumerate(as_completed(futures), 1):
-            row = fut.result()
-            if row:
-                rows.append(row)
-
-            if progress_cb:
-                progress_cb(i / max(total, 1))
-
+        for fut in as_completed(futures):
+            try:
+                row = fut.result()
+                if row:
+                    rows.append(row)
+            except Exception:
+                pass
     df = pd.DataFrame(rows)
     if df.empty:
         return df
+    return df.sort_values(["fast_score", "trend_agreement"], ascending=False).reset_index(drop=True)
 
-    return df.sort_values(
-        ["fast_score", "trend_agreement"],
-        ascending=False,
-    ).reset_index(drop=True)
+
+def run_fast_market_scan(symbols, workers, progress_cb=None):
+    # Cached full-market result prevents every Streamlit rerun from refetching
+    # hundreds of candles. Progress is intentionally omitted on cache hits.
+    if progress_cb:
+        progress_cb(0.05)
+    df = _run_fast_market_scan_cached(tuple(sorted(symbols)), int(workers))
+    if progress_cb:
+        progress_cb(1.0)
+    return df
 
 
 # ----------------------------- BACKTEST -----------------------
@@ -977,24 +987,27 @@ def deep_analyze(symbol):
     }
 
 
-def deep_scan_candidates(candidates, workers, progress_cb=None):
+@st.cache_data(ttl=45, show_spinner=False)
+def _deep_scan_candidates_cached(candidates_tuple, workers):
     rows = []
-    total = len(candidates)
-
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        futures = {ex.submit(deep_analyze, s): s for s in candidates}
-
-        for i, fut in enumerate(as_completed(futures), 1):
+    with ThreadPoolExecutor(max_workers=int(workers)) as ex:
+        futures = {ex.submit(deep_analyze, s): s for s in candidates_tuple}
+        for fut in as_completed(futures):
             try:
                 r = fut.result()
                 if r:
                     rows.append(r)
             except Exception:
                 pass
+    return rows
 
-            if progress_cb:
-                progress_cb(i / max(total, 1))
 
+def deep_scan_candidates(candidates, workers, progress_cb=None):
+    if progress_cb:
+        progress_cb(0.05)
+    rows = _deep_scan_candidates_cached(tuple(candidates), int(workers))
+    if progress_cb:
+        progress_cb(1.0)
     return rows
 
 
@@ -1509,7 +1522,7 @@ def scan_table(rows):
 
 # ----------------------------- MAIN ---------------------------
 
-st.title("Crypto Analyzer Pro — Render Auto-Trader V3")
+st.title("Crypto Analyzer Pro — Render Auto-Trader V4 FAST")
 st.caption(
     "نسخه V3: سفارش واقعی فقط وقتی فعال است که TABDEAL_LIVE_TRADING=true باشد "
     "و موتور معامله در رابط کاربری نیز روشن باشد."
@@ -1565,8 +1578,8 @@ with st.sidebar:
     deep_candidates = st.slider(
         "تعداد کاندیدا برای تحلیل عمیق",
         min_value=3,
-        max_value=30,
-        value=12,
+        max_value=20,
+        value=8,
     )
 
     st.caption(
@@ -1592,6 +1605,9 @@ if "trade_log" not in st.session_state:
     st.session_state.trade_log = []
 
 # ----------------------------- SCAN ---------------------------
+
+if auto_scan and st_autorefresh is not None:
+    st_autorefresh(interval=max(30, int(scan_interval)) * 1000, key="auto_scan_refresh")
 
 if auto_scan:
     symbols = get_universe()
@@ -1755,10 +1771,9 @@ if auto_scan:
 
     st.session_state.last_scan = time.time()
 
-    # Auto-refresh after the configured interval.
-    if auto_scan:
-        time.sleep(int(scan_interval))
-        st.rerun()
+    # Non-blocking periodic refresh. Unlike time.sleep()+st.rerun(), this does
+    # not keep the Render worker blocked between scans. Cached scan results
+    # make subsequent refreshes much faster.
 
 else:
     st.info("اسکن خودکار خاموش است.")

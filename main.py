@@ -616,11 +616,277 @@ def account_status():
 
 
 # ============================================================
+# AUTO TRADING — SPOT ONLY / EXPLICITLY ENABLED
+# ============================================================
+# Real orders are OFF by default. The user must explicitly enable
+# Auto Trading in the UI. The engine uses the same final decision
+# gate shown above and never trades when the decision is not "معامله".
+
+AUTO_DEFAULT_USDT = float(os.getenv("AUTO_TRADE_USDT", "10"))
+AUTO_MIN_USDT = float(os.getenv("AUTO_TRADE_MIN_USDT", "5"))
+AUTO_COOLDOWN = int(os.getenv("AUTO_TRADE_COOLDOWN_SEC", "900"))
+RECV_WINDOW = int(os.getenv("TABDEAL_RECV_WINDOW", "5000"))
+
+
+def signed_request(method, path, params=None):
+    params = dict(params or {})
+    if not API_KEY or not API_SECRET:
+        raise RuntimeError("TABDEAL_API_KEY / TABDEAL_API_SECRET تنظیم نشده است.")
+    params["timestamp"] = int(time.time() * 1000)
+    params["recvWindow"] = RECV_WINDOW
+    query = urlencode(params)
+    params["signature"] = hmac.new(
+        API_SECRET.encode(), query.encode(), hashlib.sha256
+    ).hexdigest()
+    headers = {"X-MBX-APIKEY": API_KEY}
+    r = SESSION.request(
+        method.upper(),
+        BASE.rstrip("/") + path,
+        params=params if method.upper() in {"GET", "DELETE"} else None,
+        data=params if method.upper() in {"POST", "PUT"} else None,
+        headers=headers,
+        timeout=TIMEOUT,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def spot_order(params):
+    return signed_request("POST", "/api/v1/order", params)
+
+
+def spot_oco(params):
+    return signed_request("POST", "/api/v1/order/oco", params)
+
+
+def spot_open_orders(tabdeal_symbol):
+    return signed_request(
+        "GET", "/r/api/v1/openOrders", {"tabdealSymbol": tabdeal_symbol}
+    )
+
+
+def account_info():
+    return api_get("/r/api/v1/account", signed=True)
+
+
+def extract_balances(data):
+    if isinstance(data, dict):
+        for key in ("balances", "balance", "assets"):
+            v = data.get(key)
+            if isinstance(v, list):
+                return v
+        for v in data.values():
+            if isinstance(v, dict):
+                b = extract_balances(v)
+                if b:
+                    return b
+            elif isinstance(v, list):
+                if any(isinstance(x, dict) and ("asset" in x or "currency" in x) for x in v):
+                    return v
+    elif isinstance(data, list):
+        return data
+    return []
+
+
+def free_balance(data, asset):
+    asset = asset.upper()
+    for b in extract_balances(data):
+        if not isinstance(b, dict):
+            continue
+        a = str(b.get("asset", b.get("currency", ""))).upper()
+        if a != asset:
+            continue
+        for key in ("free", "available", "availableBalance", "freeBalance", "balance"):
+            if b.get(key) is not None:
+                try:
+                    return float(b[key])
+                except Exception:
+                    pass
+    return 0.0
+
+
+def _find_filter_obj(market, filter_type):
+    if not isinstance(market, dict):
+        return None
+    filters = market.get("filters")
+    if isinstance(filters, list):
+        for f in filters:
+            if isinstance(f, dict) and str(f.get("filterType", "")).upper() == filter_type:
+                return f
+    return None
+
+
+def _decimal_places(step):
+    s = f"{float(step):.16f}".rstrip("0")
+    return len(s.split(".")[1]) if "." in s else 0
+
+
+def floor_step(value, step):
+    step = float(step or 0)
+    if step <= 0:
+        return float(value)
+    return float(np.floor(float(value) / step + 1e-12) * step)
+
+
+def format_step(value, step):
+    places = _decimal_places(step)
+    return f"{float(value):.{places}f}"
+
+
+def market_rules(market):
+    lot = _find_filter_obj(market, "LOT_SIZE") or {}
+    price = _find_filter_obj(market, "PRICE_FILTER") or {}
+    min_notional = _find_filter_obj(market, "MIN_NOTIONAL") or _find_filter_obj(market, "NOTIONAL") or {}
+    return {
+        "step": float(lot.get("stepSize", market.get("stepSize", 0)) or 0),
+        "min_qty": float(lot.get("minQty", market.get("minQty", 0)) or 0),
+        "tick": float(price.get("tickSize", market.get("tickSize", 0)) or 0),
+        "min_notional": float(min_notional.get("minNotional", min_notional.get("notional", 0)) or 0),
+    }
+
+
+def build_order_qty(symbol, market, price, usdt_amount, balance):
+    quote = str(market.get("quoteAsset", "USDT")).upper() or "USDT"
+    if quote != "USDT":
+        raise RuntimeError(f"بازار {symbol} جفت USDT نیست.")
+    spend = min(float(usdt_amount), float(balance))
+    rules = market_rules(market)
+    qty = spend / float(price)
+    qty = floor_step(qty, rules["step"])
+    if qty <= 0 or (rules["min_qty"] > 0 and qty < rules["min_qty"]):
+        raise RuntimeError("مقدار سفارش از حداقل quantity بازار کمتر است.")
+    if rules["min_notional"] > 0 and qty * price < rules["min_notional"]:
+        raise RuntimeError("ارزش سفارش از حداقل Notional بازار کمتر است.")
+    return qty, rules
+
+
+def place_protective_oco(symbol, market, qty, plan):
+    tabdeal_symbol = market.get("tabdealSymbol") or to_tabdeal_symbol(symbol)
+    rules = market_rules(market)
+    step = rules["step"]
+    tick = rules["tick"]
+    if tick <= 0:
+        tick = max(plan["entry"] * 1e-8, 1e-12)
+
+    # Split the filled position into three equal exit legs. Each leg has
+    # its own OCO so the remaining position stays protected after a TP fills.
+    q1 = floor_step(qty / 3.0, step)
+    q2 = floor_step(qty / 3.0, step)
+    q3 = floor_step(qty - q1 - q2, step)
+    legs = [(q1, plan["tp1"]), (q2, plan["tp2"]), (q3, plan["tp3"])]
+    placed = []
+
+    for idx, (leg_qty, tp) in enumerate(legs, 1):
+        if leg_qty <= 0:
+            continue
+        limit_price = floor_step(tp, tick)
+        stop_price = floor_step(plan["sl"], tick)
+        stop_limit = floor_step(stop_price * 0.998, tick)
+        if not (limit_price > stop_price > stop_limit > 0):
+            raise RuntimeError("قیمت‌های TP/SL برای OCO معتبر نیستند.")
+        params = {
+            "tabdealSymbol": tabdeal_symbol,
+            "symbol": symbol,
+            "listClientOrderId": f"auto_oco_{int(time.time())}_{idx}",
+            "limitClientOrderId": f"auto_tp_{int(time.time())}_{idx}",
+            "stopClientOrderId": f"auto_sl_{int(time.time())}_{idx}",
+            "side": "SELL",
+            "quantity": format_step(leg_qty, step),
+            "price": format_step(limit_price, tick),
+            "stopPrice": format_step(stop_price, tick),
+            "stopLimitPrice": format_step(stop_limit, tick),
+        }
+        placed.append(spot_oco(params))
+    return placed
+
+
+def execute_auto_trade(symbol, market, result, usdt_amount):
+    if result.get("decision") != "معامله":
+        return {"ok": False, "message": "سیگنال نهایی «معامله» نیست."}
+    if not result.get("plan"):
+        return {"ok": False, "message": "پلن ورود/خروج موجود نیست."}
+    if not API_KEY or not API_SECRET:
+        return {"ok": False, "message": "کلید API تنظیم نشده است."}
+
+    tabdeal_symbol = market.get("tabdealSymbol") or to_tabdeal_symbol(symbol)
+    try:
+        open_orders = spot_open_orders(tabdeal_symbol)
+        if isinstance(open_orders, list) and open_orders:
+            return {"ok": False, "message": "برای این ارز سفارش باز وجود دارد؛ معامله جدید ارسال نشد."}
+
+        account = account_info()
+        balance = free_balance(account, "USDT")
+        if balance < max(AUTO_MIN_USDT, 0.01):
+            return {"ok": False, "message": f"موجودی آزاد USDT کافی نیست: {balance:.4f}"}
+
+        entry = float(result["plan"]["entry"])
+        qty, rules = build_order_qty(symbol, market, entry, usdt_amount, balance)
+
+        order = spot_order({
+            "tabdealSymbol": tabdeal_symbol,
+            "symbol": symbol,
+            "side": "BUY",
+            "type": "MARKET",
+            "quantity": format_step(qty, rules["step"]),
+            "newClientOrderId": f"auto_buy_{int(time.time())}",
+        })
+
+        executed_qty = float(order.get("executedQty", 0) or 0)
+        if executed_qty <= 0:
+            return {"ok": False, "message": "سفارش خرید ارسال شد اما executedQty صفر است؛ سفارش‌های خروج ایجاد نشدند.", "order": order}
+
+        quote_qty = float(order.get("cummulativeQuoteQty", order.get("cumulativeQuoteQty", 0)) or 0)
+        avg_entry = quote_qty / executed_qty if quote_qty > 0 else entry
+        plan = dict(result["plan"])
+        if avg_entry > 0 and abs(avg_entry - entry) / entry > 0.0001:
+            risk = max(avg_entry - plan["sl"], avg_entry * 0.001)
+            plan = {
+                "entry": avg_entry,
+                "sl": avg_entry - risk,
+                "tp1": avg_entry + risk,
+                "tp2": avg_entry + 1.8 * risk,
+                "tp3": avg_entry + 2.6 * risk,
+            }
+
+        try:
+            oco = place_protective_oco(symbol, market, executed_qty, plan)
+        except Exception as protection_error:
+            return {
+                "ok": False,
+                "message": f"خرید انجام شد ولی ثبت سفارش‌های حفاظتی OCO ناموفق بود: {protection_error}",
+                "order": order,
+            }
+
+        return {
+            "ok": True,
+            "message": "خرید بازار انجام شد و سه OCO برای TP1/TP2/TP3 + SL ثبت شد.",
+            "order": order,
+            "oco": oco,
+            "plan": plan,
+            "qty": executed_qty,
+        }
+    except Exception as e:
+        return {"ok": False, "message": str(e)}
+
+
+def auto_trade_cycle(symbol, market, result, usdt_amount):
+    now = time.time()
+    key = f"auto_last_{symbol}"
+    last = float(st.session_state.get(key, 0))
+    if now - last < AUTO_COOLDOWN:
+        return {"ok": False, "message": f"Cooldown فعال است؛ {int(AUTO_COOLDOWN - (now-last))} ثانیه باقی مانده."}
+    out = execute_auto_trade(symbol, market, result, usdt_amount)
+    if out.get("ok"):
+        st.session_state[key] = now
+    return out
+
+
+# ============================================================
 # UI
 # ============================================================
 
 st.title("Tabdeal Crypto Signal Engine")
-st.caption("Tabdeal-only • Read-only • بدون سفارش واقعی • بدون داده ساختگی")
+st.caption("Tabdeal-only • Spot • سفارش خودکار با فعال‌سازی صریح • بدون داده ساختگی")
 
 try:
     markets = extract_markets(exchange_info())
@@ -633,6 +899,20 @@ symbols = sorted(markets.keys())
 if not symbols:
     st.error("هیچ بازار USDT فعالی از Tabdeal دریافت نشد.")
     st.stop()
+
+if "auto_enabled" not in st.session_state:
+    st.session_state.auto_enabled = False
+
+control1, control2, control3 = st.columns(3)
+with control1:
+    auto_enabled = st.toggle("فعال‌سازی معامله خودکار", value=st.session_state.auto_enabled, key="auto_enabled")
+with control2:
+    auto_usdt = st.number_input("مبلغ هر معامله (USDT)", min_value=max(1.0, AUTO_MIN_USDT), value=max(AUTO_DEFAULT_USDT, AUTO_MIN_USDT), step=1.0)
+with control3:
+    st.metric("حالت", "فعال" if auto_enabled else "خاموش")
+
+if auto_enabled:
+    st.warning("معامله خودکار فعال است؛ با هر اجرای صفحه، در صورت تصمیم نهایی «معامله» سفارش واقعی ارسال می‌شود. Cooldown از تکرار سریع جلوگیری می‌کند.")
 
 tab1, tab2, tab3 = st.tabs(["تحلیل ارز", "اسکن بازار", "وضعیت داده/API"])
 
@@ -670,6 +950,21 @@ with tab1:
             cols[2].metric("TP1", money(p["tp1"]))
             cols[3].metric("TP2", money(p["tp2"]))
             cols[4].metric("TP3", money(p["tp3"]))
+
+        st.subheader("معامله خودکار")
+        confirm = st.checkbox("ارسال سفارش واقعی را تأیید می‌کنم.", key=f"confirm_{selected}")
+        if result["decision"] == "معامله" and auto_enabled and confirm:
+            with st.spinner("در حال بررسی و اجرای معامله خودکار..."):
+                trade_result = auto_trade_cycle(selected, markets[selected], result, float(auto_usdt))
+            if trade_result.get("ok"):
+                st.success(trade_result["message"])
+                st.session_state[f"last_trade_message_{selected}"] = trade_result["message"]
+            elif "Cooldown" not in trade_result.get("message", ""):
+                st.error(trade_result.get("message", "خطای نامشخص"))
+        elif result["decision"] == "معامله" and not auto_enabled:
+            st.info("سیگنال آماده است، اما معامله خودکار خاموش است.")
+        else:
+            st.info("تا وقتی تصمیم نهایی «معامله» نباشد، سفارش واقعی ارسال نمی‌شود.")
 
         st.subheader("آمار OOS")
         o = result["oos_1h"]
@@ -757,7 +1052,7 @@ with tab2:
 with tab3:
     st.write("**منبع بازار:** فقط Tabdeal")
     st.write("**Fallback صرافی دیگر:** ندارد")
-    st.write("**ارسال سفارش:** غیرفعال")
+    st.write("**ارسال سفارش:** فقط با فعال‌سازی معامله خودکار و تأیید دستی")
     st.write("**کارمزد در بک‌تست:** لحاظ نمی‌شود")
 
     if API_KEY and API_SECRET:

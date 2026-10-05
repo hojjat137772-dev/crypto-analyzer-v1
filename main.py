@@ -597,32 +597,47 @@ def analyze_symbol(symbol, trades):
         else:
             live[tf] = None
 
-    oos_1h = oos_backtest(frames["1H"])
-    oos_4h = oos_backtest(frames["4H"])
+    # The Tabdeal public trades feed is recent-only, so higher timeframes
+    # often do not have enough real candles. Instead of requiring 1H/4H
+    # specifically, use the best available lower timeframe with >=180 real
+    # candles for OOS validation. No synthetic history is created.
+    stat_candidates = [
+        tf for tf in ("5m", "15m", "30m", "1H", "2H", "4H")
+        if len(frames[tf]) >= 180
+    ]
+    stat_tf = stat_candidates[0] if stat_candidates else None
+    oos_stats = oos_backtest(frames[stat_tf]) if stat_tf else {
+        "available": False,
+        "trades": 0,
+        "pf": np.nan,
+        "expectancy": np.nan,
+        "tp1": np.nan,
+        "dd": np.nan,
+        "reason": "هیچ تایم‌فریمی حداقل 180 کندل واقعی ندارد.",
+    }
 
-    confirmations = []
-    for tf in ("15m", "1H", "4H"):
-        s = live.get(tf)
-        if s is not None and s["score"] >= 55:
-            confirmations.append(tf)
-
-    available_mtf = [tf for tf in ("15m", "1H", "4H") if live.get(tf) is not None]
-    mtf_ok = len(available_mtf) == 3 and len(confirmations) >= 2
+    # Adaptive MTF: use available real timeframes among 5m/15m/30m/1H/2H.
+    # At least 3 must be available and at least 2 must confirm the setup.
+    mtf_pool = ("5m", "15m", "30m", "1H", "2H")
+    available_mtf = [tf for tf in mtf_pool if live.get(tf) is not None]
+    confirmations = [tf for tf in available_mtf if live[tf]["score"] >= 55]
+    mtf_ok = len(available_mtf) >= 3 and len(confirmations) >= 2
 
     stats_ok = (
-        oos_1h["available"]
-        and oos_1h["trades"] >= 30
-        and np.isfinite(oos_1h["pf"])
-        and oos_1h["pf"] > 1
-        and oos_1h["expectancy"] > 0
-        and oos_1h["tp1"] >= 50
+        oos_stats["available"]
+        and oos_stats["trades"] >= 30
+        and np.isfinite(oos_stats["pf"])
+        and oos_stats["pf"] > 1
+        and oos_stats["expectancy"] > 0
+        and oos_stats["tp1"] >= 50
     )
 
-    current = live.get("15m") or live.get("1H")
+    # Prefer 15m for the live trigger; fall back to 5m/30m/1H if unavailable.
+    current = next((live.get(tf) for tf in ("15m", "5m", "30m", "1H") if live.get(tf) is not None), None)
 
     if current is None:
         decision = "داده ناکافی"
-    elif not oos_1h["available"] or oos_1h["trades"] < 30:
+    elif not oos_stats["available"] or oos_stats["trades"] < 30:
         decision = "عدم معامله"
     elif not stats_ok:
         decision = "عدم معامله"
@@ -638,8 +653,13 @@ def analyze_symbol(symbol, trades):
     return {
         "frames": frames,
         "live": live,
-        "oos_1h": oos_1h,
-        "oos_4h": oos_4h,
+        "oos_1h": oos_stats,  # backward-compatible UI key
+        "stat_tf": stat_tf,
+        "oos_4h": oos_backtest(frames["4H"]) if len(frames["4H"]) >= 180 else {
+            "available": False, "trades": 0, "pf": np.nan,
+            "expectancy": np.nan, "tp1": np.nan, "dd": np.nan,
+            "reason": f"{len(frames["4H"])} کندل واقعی موجود است.",
+        },
         "stats_ok": stats_ok,
         "mtf_ok": mtf_ok,
         "decision": decision,
@@ -923,6 +943,7 @@ with tab1:
 
         st.subheader("آمار OOS")
         o = result["oos_1h"]
+        st.caption(f"تایم‌فریم آماری انتخاب‌شده: {result.get("stat_tf") or "ندارد"}")
         cols = st.columns(5)
         cols[0].metric("OOS معاملات", str(o["trades"]))
         cols[1].metric("Profit Factor", "-" if not np.isfinite(o["pf"]) else f"{o['pf']:.2f}")
@@ -1013,20 +1034,31 @@ with tab3:
 
     c1, c2, c3 = st.columns(3)
     c1.metric("Live Trading ENV", "فعال" if AUTO_LIVE_ENV else "خاموش")
-    c2.metric("بودجه هر معامله", f"{AUTO_TRADE_USDT:.2f} USDT")
     c3.metric("حداکثر پوزیشن", str(AUTO_MAX_POSITIONS))
 
-    if AUTO_TRADE_USDT <= 0:
-        st.error("برای جلوگیری از سفارش ناخواسته، AUTO_TRADE_USDT باید در Render تنظیم شود.")
+    default_amount = max(1.0, AUTO_TRADE_USDT)
+    trade_amount = st.number_input(
+        "مبلغ هر معامله (USDT)",
+        min_value=1.0,
+        max_value=100000.0,
+        value=float(default_amount),
+        step=1.0,
+        key="auto_trade_amount",
+        help="مبلغ هر خرید خودکار؛ قابل تغییر از داخل برنامه.",
+    )
+    c2.metric("مبلغ فعلی هر معامله", f"{trade_amount:.2f} USDT")
+
+    if trade_amount <= 0:
+        st.error("مبلغ معامله باید بیشتر از صفر باشد.")
     if not API_KEY or not API_SECRET:
         st.error("TABDEAL_API_KEY و TABDEAL_API_SECRET تنظیم نشده‌اند.")
     if not AUTO_LIVE_ENV:
         st.info("برای فعال‌سازی واقعی، TABDEAL_LIVE_TRADING=true را در Environment Variables قرار بده.")
 
-    st.write("منطق اجرا: اسکن تمام بازارهای USDT → انتخاب فقط «معامله» → خرید Market → ثبت OCO برای TP1 و SL.")
+    st.write("منطق اجرا: اسکن تمام بازارهای USDT → انتخاب فقط «معامله» → خرید Market → ثبت OCO برای TP1 و SL. مبلغ معامله از همین صفحه قابل تغییر است.")
     st.write("اگر OOS/گیت آماری/تأیید چندتایم‌فریمی رد شود، خرید انجام نمی‌شود.")
 
-    if live_ready and AUTO_TRADE_USDT > 0:
+    if live_ready and trade_amount > 0:
         @st.fragment(run_every=max(30, AUTO_SCAN_INTERVAL))
         def auto_engine():
             if not live_ready:
@@ -1043,7 +1075,7 @@ with tab3:
             best = candidates[0]
             st.success(f"کاندید تأییدشده: {best['symbol']} | امتیاز {best['score']:.1f} | قیمت {money(best['price'])}")
             try:
-                result = execute_auto_trade(best["symbol"], best["analysis"], markets[best["symbol"]], AUTO_TRADE_USDT)
+                result = execute_auto_trade(best["symbol"], best["analysis"], markets[best["symbol"]], trade_amount)
                 st.success(f"خرید خودکار و OCO ارسال شد: {best['symbol']}")
                 st.json(result)
             except Exception as e:

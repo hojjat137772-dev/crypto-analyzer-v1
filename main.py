@@ -665,12 +665,16 @@ def fast_scan_one(symbol):
             if snap is not None:
                 snaps[tf] = snap
 
-        if len(snaps) < 2:
+        # Fast scan is intentionally one-timeframe; 4H/1D are checked later
+        # during deep analysis of the shortlist.
+        if len(snaps) < len(SCAN_TFS):
             return None
 
-        weights = {"1H": 0.30, "4H": 0.35, "1D": 0.35}
-        total_w = sum(weights[k] for k in snaps)
-        score = sum(snaps[k]["score"] * weights[k] for k in snaps) / total_w
+        weights = {"1H": 1.0, "4H": 0.35, "1D": 0.35}
+        total_w = sum(weights.get(k, 0.0) for k in snaps)
+        if total_w <= 0:
+            return None
+        score = sum(snaps[k]["score"] * weights.get(k, 0.0) for k in snaps) / total_w
 
         trend_agreement = sum(
             1 for v in snaps.values() if v["score"] >= 62
@@ -1637,7 +1641,10 @@ if auto_scan:
 
     if fast.empty:
         progress.progress(100)
-        status.error("داده کافی برای اسکن بازار دریافت نشد.")
+        status.error(
+            f"از {len(symbols)} بازار USDT، هیچ بازار قابل‌تحلیلی در مرحله اسکن سریع دریافت نشد. "
+            "منابع OHLCV (والکس/بایننس) یا اتصال Render را بررسی کنید."
+        )
         st.stop()
 
     candidates = (

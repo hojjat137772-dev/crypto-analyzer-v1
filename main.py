@@ -48,7 +48,6 @@ st.set_page_config(
 
 TABDEAL = "https://api1.tabdeal.org"
 BINANCE_DATA = "https://data-api.binance.vision"
-BINANCE_API = "https://api.binance.com"
 WALLEX = "https://api.wallex.ir"
 
 TIMEFRAMES = {
@@ -347,22 +346,46 @@ def get_wallex_klines(symbol, interval, limit=700):
 
 
 def get_binance_klines(symbol, interval, limit=700):
-    params = {
-        "symbol": normalize_symbol(symbol),
-        "interval": interval,
+    data = public_json(BINANCE_DATA + "/api/v3/klines", {
+        "symbol": normalize_symbol(symbol), "interval": interval,
         "limit": min(int(limit), 1000),
-    }
-    for base in (BINANCE_DATA, BINANCE_API):
-        data = public_json(base + "/api/v3/klines", params, timeout=12)
-        df = rows_to_df(data)
-        if len(df) >= MIN_HISTORY:
-            return df
+    }, timeout=15)
+    return rows_to_df(data)
+
+
+@st.cache_data(ttl=25, show_spinner=False)
+def get_tabdeal_klines(symbol, interval, limit=700):
+    """Try Tabdeal public candle endpoints before external exchanges."""
+    sym = normalize_symbol(symbol)
+    candidates = [
+        "/r/api/v1/klines",
+        "/api/v1/klines",
+    ]
+    for ep in candidates:
+        for iv in (interval, interval.lower()):
+            try:
+                data = public_json(TABDEAL + ep, {
+                    "symbol": sym,
+                    "interval": iv,
+                    "limit": min(int(limit), 1000),
+                }, timeout=12)
+                rows = data
+                if isinstance(data, dict):
+                    rows = data.get("data") or data.get("result") or data.get("rows") or data.get("klines")
+                df = rows_to_df(rows)
+                if len(df) >= MIN_HISTORY:
+                    return df.tail(limit).reset_index(drop=True)
+            except Exception:
+                pass
     return pd.DataFrame()
 
 
 @st.cache_data(ttl=25, show_spinner=False)
 def get_klines_with_source(symbol, interval, limit=500):
-    # Local Iranian source first, global liquid source second.
+    # Prefer Tabdeal, then Wallex, then Binance.
+    t = get_tabdeal_klines(symbol, interval, limit)
+    if len(t) >= MIN_HISTORY:
+        return t, "Tabdeal"
     w = get_wallex_klines(symbol, interval, limit)
     if len(w) >= MIN_HISTORY:
         return w, "Wallex"
@@ -672,12 +695,10 @@ def fast_scan_one(symbol):
             if snap is not None:
                 snaps[tf] = snap
 
-        # SCAN_TFS may intentionally contain only one timeframe.
-        # Never reject every symbol just because one timeframe is configured.
-        if len(snaps) < max(1, min(len(SCAN_TFS), 1)):
+        if len(snaps) < 1:
             return None
 
-        weights = {"1H": 0.30, "4H": 0.35, "1D": 0.35}
+        weights = {"1H": 1.0, "4H": 0.35, "1D": 0.35}
         total_w = sum(weights.get(k, 1.0) for k in snaps)
         score = sum(snaps[k]["score"] * weights.get(k, 1.0) for k in snaps) / total_w
 
@@ -892,10 +913,7 @@ def deep_analyze(symbol):
         if snap:
             tf_rows[tf] = snap
 
-    # Deep analysis can continue with the available timeframe(s).
-    # Requiring 3 timeframes caused valid 1H candidates to be discarded as
-    # "insufficient data" when an exchange did not return every timeframe.
-    if not tf_rows:
+    if len(tf_rows) < 3:
         return None
 
     weights = {
@@ -931,34 +949,27 @@ def deep_analyze(symbol):
     momentum_ok = 50 <= base_snap.get("rsi", 50) <= 72 and base_snap.get("macd_hist", -1) > 0
     trend_alignment = all(tf_rows.get(k, {"score":0})["score"] >= 58 for k in ("1H","4H")) and tf_rows.get("1D", {"score":0})["score"] >= 55
 
-    # ------------------------------------------------------------
-    # DIRECTION-FIRST DECISION
-    # روند فعلی جهت معامله را تعیین می‌کند. فیلترهای قدیمی مثل OOS،
-    # Profit Factor، توافق همه تایم‌فریم‌ها و source consensus دیگر
-    # به‌تنهایی نمی‌توانند یک روند صعودی معتبر را به «صبر» تبدیل کنند.
-    # فقط دو گارد پایه برای خرید واقعی باقی می‌ماند: RR و ATR.
-    # ------------------------------------------------------------
-    strong_bull = trend_score >= 67
-    bull = trend_score >= 58
-    bear = trend_score <= 46
-
-    basic_risk_ok = (
-        plan["rr1"] >= MIN_RISK_REWARD
+    confirmed = (
+        plan["score"] >= MIN_SCORE
+        and agreement >= MIN_MTF_AGREEMENT
+        and trend_alignment
+        and trades >= OOS_MIN_TRADES
+        and np.isfinite(probability)
+        and probability >= MIN_PROBABILITY
+        and pf >= 1.20
+        and plan["rr1"] >= MIN_RISK_REWARD
         and base_snap["atr_pct"] <= MAX_ATR_PCT
+        and volume_ok
+        and pa_ok
+        and momentum_ok
+        and source_ok
+        and max_dd <= 12.0
     )
 
-    if strong_bull and basic_risk_ok:
-        confirmed = True
-        decision = "معامله"
-    elif bull and plan["score"] >= 65 and basic_risk_ok:
-        confirmed = True
-        decision = "معامله"
-    elif bear or plan["score"] < 55:
-        confirmed = False
+    decision = "معامله" if confirmed else "صبر"
+
+    if plan["score"] < 55 or agreement < 50:
         decision = "عدم معامله"
-    else:
-        confirmed = False
-        decision = "صبر"
 
     # Detect direction of current trend.
     if trend_score >= 67 and agreement >= 75:
@@ -986,7 +997,6 @@ def deep_analyze(symbol):
         "agreement": float(agreement),
         "volume_ratio": float(base_snap.get("volume_ratio",0)),
         "price_action_score": float(base_snap.get("price_action_score",0)),
-        "atr_pct": float(base_snap.get("atr_pct", np.nan)),
         "trend_alignment": bool(trend_alignment),
         "source_deviation": float(source_deviation),
         "source_ok": bool(source_ok),
@@ -1489,24 +1499,21 @@ def execute_trade(plan, trade_usdt, max_positions):
 # ----------------------------- DECISION EXPLANATION ------------
 
 def rejection_reasons(r):
-    # دلایل این بخش فقط باید با منطق جدید تصمیم‌گیری هم‌خوان باشند؛
-    # فیلترهای تحلیلی قدیمی دیگر مانع مستقیم BUY نیستند.
     reasons=[]
-    trend = str(r.get("trend", ""))
-    score = float(r.get("score", 0) or 0)
-    rr = float(r.get("rr1", 0) or 0)
-    atr = float(r.get("atr_pct", np.inf) or np.inf)
-
-    if trend in ("نزولی", "نزولی قوی"):
-        reasons.append("روند فعلی نزولی است")
-    if score < 55:
-        reasons.append("امتیاز نهایی پایین است")
-    if rr < MIN_RISK_REWARD:
-        reasons.append("RR برای ورود کافی نیست")
-    if atr > MAX_ATR_PCT:
-        reasons.append("نوسان ATR بیش از حد مجاز است")
-
-    return reasons
+    checks=[
+        (r.get("probability",0) >= MIN_PROBABILITY,"احتمال OOS پایین"),
+        (r.get("score",0) >= MIN_SCORE,"امتیاز نهایی پایین"),
+        (r.get("agreement",0) >= MIN_MTF_AGREEMENT,"هم‌جهتی MTF ناکافی"),
+        (r.get("oos_trades",0) >= OOS_MIN_TRADES,"نمونه OOS کم"),
+        (r.get("profit_factor",0) >= 1.20,"Profit Factor ضعیف"),
+        (r.get("rr1",0) >= MIN_RISK_REWARD,"RR پایین"),
+        (r.get("volume_ratio",0) >= MIN_VOLUME_RATIO,"حجم تأییدکننده نیست"),
+        (r.get("price_action_score",0) >= 58,"Price Action ضعیف"),
+        (r.get("trend_alignment",False),"روند 1H/4H/1D همسو نیست"),
+        (r.get("source_ok",False),"اختلاف منابع زیاد است"),
+        (r.get("max_dd_r",99) <= 12,"Drawdown بک‌تست زیاد است"),
+    ]
+    return [msg for ok,msg in checks if not ok]
 
 # ----------------------------- UI HELPERS ---------------------
 

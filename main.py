@@ -48,6 +48,7 @@ st.set_page_config(
 
 TABDEAL = "https://api1.tabdeal.org"
 BINANCE_DATA = "https://data-api.binance.vision"
+BINANCE_API = "https://api.binance.com"
 WALLEX = "https://api.wallex.ir"
 
 TIMEFRAMES = {
@@ -306,6 +307,26 @@ def resample_ohlcv(df, minutes):
     return out
 
 
+def get_tabdeal_klines(symbol, interval, limit=700):
+    """Primary OHLCV source: Tabdeal itself, using its Binance-compatible
+    public klines endpoint. Fail silently so the scanner can use fallbacks.
+    """
+    try:
+        data = public_json(
+            TABDEAL + "/api/v1/klines",
+            {
+                "symbol": normalize_symbol(symbol),
+                "interval": interval,
+                "limit": min(int(limit), 1000),
+            },
+            timeout=8,
+        )
+        df = rows_to_df(data)
+        return df.tail(limit).reset_index(drop=True) if len(df) else pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+
+
 def get_wallex_klines(symbol, interval, limit=700):
     ws = normalize_symbol(symbol)
     # Wallex documents BTCUSDT-style symbols and UDF OHLCV history.
@@ -346,22 +367,35 @@ def get_wallex_klines(symbol, interval, limit=700):
 
 
 def get_binance_klines(symbol, interval, limit=700):
-    data = public_json(BINANCE_DATA + "/api/v3/klines", {
-        "symbol": normalize_symbol(symbol), "interval": interval,
+    params = {
+        "symbol": normalize_symbol(symbol),
+        "interval": interval,
         "limit": min(int(limit), 1000),
-    }, timeout=15)
-    return rows_to_df(data)
+    }
+    # Try the public data host first, then the main Binance API.
+    for base in (BINANCE_DATA, BINANCE_API):
+        data = public_json(base + "/api/v3/klines", params, timeout=8)
+        df = rows_to_df(data)
+        if len(df) >= MIN_HISTORY:
+            return df.tail(limit).reset_index(drop=True)
+    return pd.DataFrame()
 
 
 @st.cache_data(ttl=25, show_spinner=False)
 def get_klines_with_source(symbol, interval, limit=500):
-    # Local Iranian source first, global liquid source second.
+    # IMPORTANT: use the same exchange that defines the 525-symbol universe first.
+    t = get_tabdeal_klines(symbol, interval, limit)
+    if len(t) >= MIN_HISTORY:
+        return t, "Tabdeal"
+
     w = get_wallex_klines(symbol, interval, limit)
     if len(w) >= MIN_HISTORY:
         return w, "Wallex"
+
     b = get_binance_klines(symbol, interval, limit)
     if len(b) >= MIN_HISTORY:
         return b, "Binance"
+
     return pd.DataFrame(), "NONE"
 
 
@@ -659,14 +693,15 @@ def tf_snapshot(df):
 def fast_scan_one(symbol):
     try:
         snaps = {}
+        source = "NONE"
         for tf in SCAN_TFS:
-            df = get_klines(symbol, TIMEFRAMES[tf], 240)
+            df, src = get_klines_with_source(symbol, TIMEFRAMES[tf], 240)
             snap = tf_snapshot(df)
             if snap is not None:
                 snaps[tf] = snap
+                source = src
 
-        # Fast scan is intentionally one-timeframe; 4H/1D are checked later
-        # during deep analysis of the shortlist.
+        # Fast scan has exactly one timeframe (1H). Do not require two.
         if len(snaps) < len(SCAN_TFS):
             return None
 
@@ -680,16 +715,16 @@ def fast_scan_one(symbol):
             1 for v in snaps.values() if v["score"] >= 62
         ) / len(snaps) * 100
 
-        # Penalize excessive volatility.
-        atr_pct = np.mean([v["atr_pct"] for v in snaps])
+        atr_pct = float(np.mean([v["atr_pct"] for v in snaps.values()]))
         if atr_pct > MAX_ATR_PCT:
             score -= 8
 
         return {
             "symbol": symbol,
+            "source": source,
             "fast_score": float(clamp(score, 0, 100)),
             "trend_agreement": float(trend_agreement),
-            "atr_pct": float(atr_pct),
+            "atr_pct": atr_pct,
             "volume_ratio": float(np.mean([v.get("volume_ratio",0) for v in snaps.values()])),
             "price_action": float(np.mean([v.get("price_action_score",50) for v in snaps.values()])),
             "1H": snaps.get("1H", {}).get("score", np.nan),
@@ -1642,8 +1677,11 @@ if auto_scan:
     if fast.empty:
         progress.progress(100)
         status.error(
-            f"از {len(symbols)} بازار USDT، هیچ بازار قابل‌تحلیلی در مرحله اسکن سریع دریافت نشد. "
-            "منابع OHLCV (والکس/بایننس) یا اتصال Render را بررسی کنید."
+            f"از {len(symbols)} بازار USDT هیچ بازار قابل تحلیل در مرحله Fast Scan پیدا نشد. "
+            "منابع OHLCV: تبدیل → والکس → بایننس."
+        )
+        st.warning(
+            "اگر این پیام باقی ماند، مشکل از شرط تحلیل نیست؛ اتصال OHLCV به منابع داده برقرار نشده است."
         )
         st.stop()
 

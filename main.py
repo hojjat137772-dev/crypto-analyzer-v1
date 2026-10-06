@@ -48,6 +48,7 @@ st.set_page_config(
 
 TABDEAL = "https://api1.tabdeal.org"
 BINANCE_DATA = "https://data-api.binance.vision"
+BINANCE_API = "https://api.binance.com"
 WALLEX = "https://api.wallex.ir"
 
 TIMEFRAMES = {
@@ -346,11 +347,17 @@ def get_wallex_klines(symbol, interval, limit=700):
 
 
 def get_binance_klines(symbol, interval, limit=700):
-    data = public_json(BINANCE_DATA + "/api/v3/klines", {
-        "symbol": normalize_symbol(symbol), "interval": interval,
+    params = {
+        "symbol": normalize_symbol(symbol),
+        "interval": interval,
         "limit": min(int(limit), 1000),
-    }, timeout=15)
-    return rows_to_df(data)
+    }
+    for base in (BINANCE_DATA, BINANCE_API):
+        data = public_json(base + "/api/v3/klines", params, timeout=12)
+        df = rows_to_df(data)
+        if len(df) >= MIN_HISTORY:
+            return df
+    return pd.DataFrame()
 
 
 @st.cache_data(ttl=25, show_spinner=False)
@@ -665,12 +672,14 @@ def fast_scan_one(symbol):
             if snap is not None:
                 snaps[tf] = snap
 
-        if len(snaps) < 2:
+        # SCAN_TFS may intentionally contain only one timeframe.
+        # Never reject every symbol just because one timeframe is configured.
+        if len(snaps) < max(1, min(len(SCAN_TFS), 1)):
             return None
 
         weights = {"1H": 0.30, "4H": 0.35, "1D": 0.35}
-        total_w = sum(weights[k] for k in snaps)
-        score = sum(snaps[k]["score"] * weights[k] for k in snaps) / total_w
+        total_w = sum(weights.get(k, 1.0) for k in snaps)
+        score = sum(snaps[k]["score"] * weights.get(k, 1.0) for k in snaps) / total_w
 
         trend_agreement = sum(
             1 for v in snaps.values() if v["score"] >= 62
@@ -883,7 +892,10 @@ def deep_analyze(symbol):
         if snap:
             tf_rows[tf] = snap
 
-    if len(tf_rows) < 3:
+    # Deep analysis can continue with the available timeframe(s).
+    # Requiring 3 timeframes caused valid 1H candidates to be discarded as
+    # "insufficient data" when an exchange did not return every timeframe.
+    if not tf_rows:
         return None
 
     weights = {

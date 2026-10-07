@@ -8,7 +8,7 @@ st.set_page_config(page_title='Crypto Analyzer Pro V6.3', page_icon='₿', layou
 
 TF={'5m':'5m','15m':'15m','30m':'30m','1H':'1h','2H':'2h','4H':'4h','6H':'6h','12H':'12h','1D':'1d','3D':'3d','1W':'1w'}
 BINANCE='https://api.binance.com'; OKX='https://www.okx.com'; TABDEAL='https://api.tabdeal.org'
-S=requests.Session(); S.headers.update({'User-Agent':'CryptoAnalyzerPro-V6.3/1.0'})
+S=requests.Session(); S.headers.update({'User-Agent':'CryptoAnalyzerPro-V6.6/1.0'})
 TIMEOUT=8; LIMIT=320
 
 # ---------- DATA ----------
@@ -85,6 +85,69 @@ def pa(df):
     pull_short=c<e50.iloc[-1] and abs(c-e20.iloc[-1])/c<.015
     return breakout_up,breakout_down,pull_long,pull_short,hi,lo
 
+
+# ---------- CANDLESTICK / HEIKIN-ASHI ----------
+def candle_features(df):
+    o,h,l,c = [df[x].astype(float) for x in ['open','high','low','close']]
+    body=(c-o).abs()
+    rng=(h-l).replace(0,np.nan)
+    upper=h-np.maximum(o,c)
+    lower=np.minimum(o,c)-l
+    doji=(body/rng <= 0.12)
+    hammer=(lower >= body*2) & (upper <= body*0.8) & (body/rng <= 0.45)
+    shooting=(upper >= body*2) & (lower <= body*0.8) & (body/rng <= 0.45)
+    bull_engulf=(c>o) & (c.shift(1)<o.shift(1)) & (c>=o.shift(1)) & (o<=c.shift(1))
+    bear_engulf=(c<o) & (c.shift(1)>o.shift(1)) & (o>=c.shift(1)) & (c<=o.shift(1))
+    return {
+        'bullish': bool((hammer | bull_engulf).iloc[-1]),
+        'bearish': bool((shooting | bear_engulf).iloc[-1]),
+        'doji': bool(doji.iloc[-1]),
+        'hammer': bool(hammer.iloc[-1]),
+        'shooting': bool(shooting.iloc[-1]),
+        'bull_engulf': bool(bull_engulf.iloc[-1]),
+        'bear_engulf': bool(bear_engulf.iloc[-1]),
+        'body_pct': float((body.iloc[-1]/rng.iloc[-1])*100) if pd.notna(rng.iloc[-1]) else 0
+    }
+
+def heikin_ashi(df):
+    ha=pd.DataFrame(index=df.index)
+    ha['close']=(df.open+df.high+df.low+df.close)/4
+    ha['open']=0.0
+    ha.iloc[0,ha.columns.get_loc('open')]=(df.open.iloc[0]+df.close.iloc[0])/2
+    for i in range(1,len(df)):
+        ha.iloc[i,ha.columns.get_loc('open')]=(ha.open.iloc[i-1]+ha.close.iloc[i-1])/2
+    ha['high']=pd.concat([df.high,ha.open,ha.close],axis=1).max(axis=1)
+    ha['low']=pd.concat([df.low,ha.open,ha.close],axis=1).min(axis=1)
+    ha['body']=(ha.close-ha.open).abs()
+    ha['range']=(ha.high-ha.low).replace(0,np.nan)
+    ha['upper']=ha.high-np.maximum(ha.open,ha.close)
+    ha['lower']=np.minimum(ha.open,ha.close)-ha.low
+    ha['bull']=ha.close>ha.open
+    ha['bear']=ha.close<ha.open
+    ha['strong_bull']=ha.bull & (ha.lower/ha.range<0.20)
+    ha['strong_bear']=ha.bear & (ha.upper/ha.range<0.20)
+    return ha
+
+def candle_decision(df):
+    cf=candle_features(df)
+    ha=heikin_ashi(df)
+    ha_bull=int(ha.bull.tail(3).sum())
+    ha_bear=int(ha.bear.tail(3).sum())
+    ha_strong_bull=bool(ha.strong_bull.iloc[-1])
+    ha_strong_bear=bool(ha.strong_bear.iloc[-1])
+    # +2 strong, +1 ordinary; opposite candles subtract.
+    candle_score=(2 if cf['bullish'] else 0) - (2 if cf['bearish'] else 0)
+    ha_score=(2 if ha_strong_bull else 0) - (2 if ha_strong_bear else 0)
+    ha_score += 1 if ha_bull>=2 else -1 if ha_bear>=2 else 0
+    return {
+        **cf,
+        'ha_bull':ha_bull,'ha_bear':ha_bear,
+        'ha_strong_bull':ha_strong_bull,'ha_strong_bear':ha_strong_bear,
+        'candle_score':candle_score,'ha_score':ha_score,
+        'combined_score':candle_score+ha_score,
+        'ha':ha
+    }
+
 # ---------- ANALYSIS ----------
 def analyze(symbol, entry_tf, capital, risk_pct):
     # Whole-market scan is resilient: only the decision TF is mandatory.
@@ -98,15 +161,16 @@ def analyze(symbol, entry_tf, capital, risk_pct):
 
     df=frames[entry_tf]; c=df.close; price=float(c.iloc[-1]); e20,e50,e200=ema(c,20),ema(c,50),ema(c,200); rv=float(rsi(c).iloc[-1]); mm,ms,_=macd(c); av=float(atr(df).iloc[-1]); ax=float(adx(df).iloc[-1]); mom=float((price/c.iloc[-6]-1)*100); vol=float(df.volume.iloc[-1]/max(df.volume.rolling(20).mean().iloc[-1],1e-12))
     bu,bd,pl,ps,rh,rl=pa(df)
+    cs=candle_decision(df)
     # Multi-timeframe context uses whatever is actually available.
     ts=[trend(frames[x]) for x in ['15m','1H','4H','1D'] if x in frames]
     bull=ts.count('صعودی'); bear=ts.count('نزولی');
-    long_score=50 + (20 if e20.iloc[-1]>e50.iloc[-1] else -10) + (15 if mm.iloc[-1]>ms.iloc[-1] else -10) + np.clip(mom*5,-15,15) + (12 if 48<=rv<=72 else -5) + (10 if vol>=1.15 else 0) + (15 if bu else 8 if pl else 0) + bull*4 - bear*3
-    short_score=50 + (20 if e20.iloc[-1]<e50.iloc[-1] else -10) + (15 if mm.iloc[-1]<ms.iloc[-1] else -10) - np.clip(mom*5,-15,15) + (12 if 28<=rv<=52 else -5) + (10 if vol>=1.15 else 0) + (15 if bd else 8 if ps else 0) + bear*4 - bull*3
+    long_score=50 + (20 if e20.iloc[-1]>e50.iloc[-1] else -10) + (15 if mm.iloc[-1]>ms.iloc[-1] else -10) + np.clip(mom*5,-15,15) + (12 if 48<=rv<=72 else -5) + (10 if vol>=1.15 else 0) + (15 if bu else 8 if pl else 0) + bull*4 - bear*3 + cs['candle_score']*3 + cs['ha_score']*3
+    short_score=50 + (20 if e20.iloc[-1]<e50.iloc[-1] else -10) + (15 if mm.iloc[-1]<ms.iloc[-1] else -10) - np.clip(mom*5,-15,15) + (12 if 28<=rv<=52 else -5) + (10 if vol>=1.15 else 0) + (15 if bd else 8 if ps else 0) + bear*4 - bull*3 - cs['candle_score']*3 - cs['ha_score']*3
     long_score=float(np.clip(long_score,0,100)); short_score=float(np.clip(short_score,0,100)); score=max(long_score,short_score)
     # Balanced trade gate: 4 confirmations out of 7, not all conditions simultaneously.
-    lc=sum([e20.iloc[-1]>e50.iloc[-1], mm.iloc[-1]>ms.iloc[-1], mom>0, 48<=rv<=72, vol>=1.05, bu or pl or bull>=2, bull>=bear])
-    sc=sum([e20.iloc[-1]<e50.iloc[-1], mm.iloc[-1]<ms.iloc[-1], mom<0, 28<=rv<=52, vol>=1.05, bd or ps or bear>=2, bear>=bull])
+    lc=sum([e20.iloc[-1]>e50.iloc[-1], mm.iloc[-1]>ms.iloc[-1], mom>0, 48<=rv<=72, vol>=1.05, bu or pl or bull>=2, bull>=bear, cs['combined_score']>0])
+    sc=sum([e20.iloc[-1]<e50.iloc[-1], mm.iloc[-1]<ms.iloc[-1], mom<0, 28<=rv<=52, vol>=1.05, bd or ps or bear>=2, bear>=bull, cs['combined_score']<0])
     direction='LONG' if lc>=4 and long_score>=52 and long_score>=short_score+2 else 'SHORT' if sc>=4 and short_score>=52 and short_score>=long_score+2 else 'WAIT'
     trade='خرید' if direction=='LONG' else 'فروش' if direction=='SHORT' else 'صبر'
     if direction=='LONG':
@@ -118,7 +182,7 @@ def analyze(symbol, entry_tf, capital, risk_pct):
     dollar_vol=float((df.close*df.volume).tail(20).mean()); liq=float(np.clip(50+math.log10(max(dollar_vol,1)/100000)*15,0,100))
     confirmations=max(lc,sc); confidence=float(np.clip(score*.72 + (confirmations/7)*28 - (12 if len(coverage)<3 else 0),0,100))
     pump=float((25 if vol>=1.8 else 15 if vol>=1.35 else 5 if vol>=1.1 else 0)+(25 if mom>=4 else 18 if mom>=2.5 else 10 if mom>=1 else 0)+(25 if bu else 12 if pl else 0)+(15 if 'صعودی' in ts[:2] else 0)+(10 if rv<72 else 0))
-    return {'symbol':symbol,'status':'OK','direction':direction,'trade':trade,'score':round(score,1),'confidence':round(confidence,1),'long_score':round(long_score,1),'short_score':round(short_score,1),'confirmations':confirmations,'coverage':len(coverage),'coverage_tfs':','.join(coverage),'price':price,'entry':entry,'sl':sl,'tp1':tp1,'tp2':tp2,'tp3':tp3,'rr':round(rr,2),'rsi':round(rv,1),'adx':round(ax,1),'momentum':round(mom,2),'volume':round(vol,2),'setup':'Breakout' if bu or bd else 'Pullback' if pl or ps else 'No setup','pump_score':round(pump,1),'liquidity':round(liq,1),'regime':'صعودی' if bull>bear else 'نزولی' if bear>bull else 'رنج','t15':trend(frames['15m']) if '15m' in frames else 'N/A','t1':trend(frames['1H']) if '1H' in frames else 'N/A','t4':trend(frames['4H']) if '4H' in frames else 'N/A','tD':trend(frames['1D']) if '1D' in frames else 'N/A','risk_money':capital*risk_pct/100,'qty':(capital*risk_pct/100)/abs(entry-sl) if abs(entry-sl)>0 else 0}
+    return {'symbol':symbol,'status':'OK','direction':direction,'trade':trade,'score':round(score,1),'confidence':round(confidence,1),'long_score':round(long_score,1),'short_score':round(short_score,1),'confirmations':confirmations,'coverage':len(coverage),'coverage_tfs':','.join(coverage),'price':price,'entry':entry,'sl':sl,'tp1':tp1,'tp2':tp2,'tp3':tp3,'rr':round(rr,2),'rsi':round(rv,1),'adx':round(ax,1),'momentum':round(mom,2),'volume':round(vol,2),'setup':'Breakout' if bu or bd else 'Pullback' if pl or ps else 'No setup','pump_score':round(pump,1),'liquidity':round(liq,1),'regime':'صعودی' if bull>bear else 'نزولی' if bear>bull else 'رنج','t15':trend(frames['15m']) if '15m' in frames else 'N/A','t1':trend(frames['1H']) if '1H' in frames else 'N/A','t4':trend(frames['4H']) if '4H' in frames else 'N/A','tD':trend(frames['1D']) if '1D' in frames else 'N/A','risk_money':capital*risk_pct/100,'qty':(capital*risk_pct/100)/abs(entry-sl) if abs(entry-sl)>0 else 0,'candle_signal':'صعودی' if cs['combined_score']>0 else 'نزولی' if cs['combined_score']<0 else 'خنثی','candle_score':cs['candle_score'],'ha_score':cs['ha_score'],'ha_bull':cs['ha_bull'],'ha_bear':cs['ha_bear']}
 
 # ---------- WHOLE MARKET SCANNER ----------
 @st.cache_data(ttl=90,show_spinner=False)
@@ -226,7 +290,7 @@ def detailed_plan(symbol, tf, row):
     if t24 and t24.get('price'): price=t24['price']
     rs,ss=levels(df,4)
     fib=fibonacci(df,120)
-    av=float(atr(df).iloc[-1]); e20=float(ema(df.close,20).iloc[-1]); e50=float(ema(df.close,50).iloc[-1]); rv=float(rsi(df.close).iloc[-1]); mm,ms,_=macd(df.close); mom=float((price/df.close.iloc[-6]-1)*100); vol=float(df.volume.iloc[-1]/max(df.volume.rolling(20).mean().iloc[-1],1e-12))
+    av=float(atr(df).iloc[-1]); e20=float(ema(df.close,20).iloc[-1]); e50=float(ema(df.close,50).iloc[-1]); rv=float(rsi(df.close).iloc[-1]); mm,ms,_=macd(df.close); mom=float((price/df.close.iloc[-6]-1)*100); vol=float(df.volume.iloc[-1]/max(df.volume.rolling(20).mean().iloc[-1],1e-12)); cs=candle_decision(df)
     direction=row.get('direction','WAIT')
     if direction=='LONG':
         sl=float(row.get('sl',max((ss[-1] if ss else price-av*2),price-av*2)))
@@ -285,17 +349,17 @@ def detailed_plan(symbol, tf, row):
     base=float(row.get('confidence',0) or 0)
     fib_bonus=8 if fib['distance_pct']<=0.8 else 5 if fib['distance_pct']<=1.5 else 0
     fib_alignment=1 if ((direction=='LONG' and fib['direction']=='صعودی') or (direction=='SHORT' and fib['direction']=='نزولی')) else 0
-    quality=(10 if vol>=1.15 else 0)+(8 if abs(mom)>=1 else 0)+(5 if 35<=rv<=70 else 0)+fib_bonus+(4 if fib_alignment else 0)
+    quality=(10 if vol>=1.15 else 0)+(8 if abs(mom)>=1 else 0)+(5 if 35<=rv<=70 else 0)+fib_bonus+(4 if fib_alignment else 0)+(6 if ((direction=='LONG' and cs['combined_score']>0) or (direction=='SHORT' and cs['combined_score']<0)) else -4 if ((direction=='LONG' and cs['combined_score']<0) or (direction=='SHORT' and cs['combined_score']>0)) else 0)
     if direction=='LONG' and fib['distance_pct']<=1.5 and fib['direction']=='صعودی':
         decision='خرید / تأیید فیبوناچی' if decision=='خرید / تأیید' else 'صبر برای پولبک به فیبوناچی / تأیید شکست'
     elif direction=='SHORT' and fib['distance_pct']<=1.5 and fib['direction']=='نزولی':
         decision='فروش / تأیید فیبوناچی' if decision=='فروش / تأیید' else 'صبر برای پولبک به فیبوناچی / تأیید شکست'
     est=float(np.clip(base+quality-(8 if len(rs)<2 or len(ss)<2 else 0),0,95))
     outlook=float(np.clip(mom*1.6 + (4 if direction=='LONG' else -4 if direction=='SHORT' else 0),-20,20))
-    return {'price':price,'t24':t24,'supports':ss,'resistances':rs,'rsi':rv,'momentum':mom,'volume':vol,'e20':e20,'e50':e50,'sl':sl,'tps':tps[:3],'safe_entry':safe,'aggressive_entry':aggressive,'decision':decision,'scenario':scenario,'downside':downside,'estimated_success':est,'outlook':outlook,'risk':risk,'fib':fib,'fib_bonus':fib_bonus,'fib_alignment':fib_alignment}
+    return {'price':price,'t24':t24,'supports':ss,'resistances':rs,'rsi':rv,'candle':cs,'momentum':mom,'volume':vol,'e20':e20,'e50':e50,'sl':sl,'tps':tps[:3],'safe_entry':safe,'aggressive_entry':aggressive,'decision':decision,'scenario':scenario,'downside':downside,'estimated_success':est,'outlook':outlook,'risk':risk,'fib':fib,'fib_bonus':fib_bonus,'fib_alignment':fib_alignment}
 
 # ---------- UI ----------
-st.title('₿ Crypto Analyzer Pro V6.4')
+st.title('₿ Crypto Analyzer Pro V6.6')
 st.caption('Whole-Market Scanner — بدون سقف مصنوعی تعداد ارز')
 symbols,source=universe()
 if not symbols: st.error('فهرست بازار دریافت نشد.'); st.stop()
@@ -333,6 +397,33 @@ if 'scan_df' in st.session_state:
         plan=detailed_plan(selected,tf,row)
         if plan:
             st.subheader(f'تحلیل کامل {selected}')
+            chart_mode=st.radio('نمودار', ['Candlestick','Heikin-Ashi'], horizontal=True, key=f'chart_mode_{selected}')
+            chart_df,_=candles(selected,TF[tf])
+            if chart_df is not None:
+                import altair as alt
+                if chart_mode=='Candlestick':
+                    base=alt.Chart(chart_df.tail(120)).encode(
+                        x=alt.X('time:T', title='زمان'),
+                        color=alt.condition('datum.close >= datum.open', alt.value('#16a34a'), alt.value('#dc2626'), legend=None)
+                    )
+                    w=base.mark_rule().encode(y='low:Q', y2='high:Q')
+                    b=base.mark_bar(size=6).encode(y='open:Q', y2='close:Q')
+                    st.altair_chart((w+b).interactive(), use_container_width=True)
+                else:
+                    ha=heikin_ashi(chart_df).tail(120).copy()
+                    ha['time']=chart_df.tail(120)['time'].values
+                    base=alt.Chart(ha).encode(
+                        x=alt.X('time:T', title='زمان'),
+                        color=alt.condition('datum.close >= datum.open', alt.value('#16a34a'), alt.value('#dc2626'), legend=None)
+                    )
+                    w=base.mark_rule().encode(y='low:Q', y2='high:Q')
+                    b=base.mark_bar(size=6).encode(y='open:Q', y2='close:Q')
+                    st.altair_chart((w+b).interactive(), use_container_width=True)
+            cndl=plan['candle']
+            candle_state='🟢 صعودی' if cndl['bullish'] else '🔴 نزولی' if cndl['bearish'] else '⚪ خنثی'
+            pattern='Bullish Engulfing' if cndl['bull_engulf'] else 'Bearish Engulfing' if cndl['bear_engulf'] else 'Hammer' if cndl['hammer'] else 'Shooting Star' if cndl['shooting'] else 'Doji' if cndl['doji'] else 'Normal'
+            ha_state='🟢 صعودی' if cndl['ha_strong_bull'] else '🔴 نزولی' if cndl['ha_strong_bear'] else '🟢' if cndl['ha_bull']>=2 else '🔴' if cndl['ha_bear']>=2 else '⚪ خنثی'
+            st.markdown(f'**کندل‌استیک:** {candle_state} | الگو: {pattern}<br>**Heikin-Ashi:** {ha_state} | 3 کندل اخیر: {cndl["ha_bull"]} صعودی / {cndl["ha_bear"]} نزولی', unsafe_allow_html=True)
             m=plan['t24'] or {}
             trend_txt=row.get('regime','رنج')
             st.markdown(f"**روند کوتاه‌مدت:** {'🟢 صعودی' if trend_txt=='صعودی' else '🔴 نزولی' if trend_txt=='نزولی' else '🟡 رنج'}")
@@ -397,4 +488,4 @@ if 'scan_df' in st.session_state:
     else:
         p=pump[['symbol','pump_score','confidence','momentum','volume','setup','direction','price']].copy(); p.columns=['ارز','Pump Score','Confidence','Momentum %','Volume x','ستاپ','جهت','قیمت']; p['قیمت']=p['قیمت'].map(fmt); p['Confidence']=p['Confidence'].map(lambda x:f'{x:.1f}%'); st.dataframe(p,use_container_width=True,hide_index=True)
 
-st.caption('V6.4: تحلیل سناریومحور، حمایت/مقاومت، دو نوع ورود، اهداف و تصمیم نهایی؛ کل Universe اسکن می‌شود.')
+st.caption('V6.6: کندل‌استیک و Heikin-Ashi علاوه بر فیبوناچی مستقیماً در امتیاز، تأیید ورود و تصمیم نهایی دخالت دارند.')

@@ -263,6 +263,22 @@ with st.sidebar:
 filtered=[s for s in symbols if q.upper() in s] if q else symbols
 st.metric('Universe قابل اسکن',len(filtered))
 
+# Full-market coin dropdown: available even before scanning.
+st.subheader('انتخاب ارز')
+coin_search=st.text_input('جستجوی سریع ارز', '', placeholder='مثلاً BTC یا ETH', key='coin_search')
+coin_options=sorted([s for s in symbols if coin_search.upper() in s] if coin_search else symbols)
+if coin_options:
+    selected_coin=st.selectbox('همه ارزهای USDT', coin_options, key='selected_coin_dropdown', help='تمام جفت‌های USDT موجود در Universe')
+    if 'selected_list' not in st.session_state:
+        st.session_state.selected_list=[]
+    if st.button('➕ افزودن ارز به تحلیل', key='add_coin'):
+        if selected_coin not in st.session_state.selected_list and len(st.session_state.selected_list)<5:
+            st.session_state.selected_list.append(selected_coin)
+    if st.session_state.get('selected_list'):
+        st.caption('ارزهای انتخاب‌شده: ' + ' | '.join(st.session_state.selected_list))
+        if st.button('پاک کردن انتخاب‌ها', key='clear_coins'):
+            st.session_state.selected_list=[]
+
 if st.button('اسکن کل بازار',type='primary',use_container_width=True):
     df=scan_all(tuple(filtered),tf,capital,risk)
     st.session_state['scan_df']=df
@@ -274,57 +290,47 @@ if 'scan_df' in st.session_state:
     c1,c2,c3,c4,c5=st.columns(5)
     c1.metric('کل بازار',total); c2.metric('بررسی‌شده',analyzed); c3.metric('داده ناقص/خطا',nodata); c4.metric('LONG',longs); c5.metric('SHORT',shorts)
 
-    # Detailed analysis card: the dropdown contains the FULL USDT universe, not only tradable/OK rows.
-    # This lets the user browse every available coin even when its scan result is WAIT/NO_DATA.
-    all_coin_choices=sorted(set(filtered))
-    if all_coin_choices:
-        default_symbol=(tradable.sort_values(['confidence','score'],ascending=False).iloc[0]['symbol'] if not tradable.empty else all_coin_choices[0])
-        default_index=all_coin_choices.index(default_symbol) if default_symbol in all_coin_choices else 0
-        selected=st.selectbox(
-            'ارز — همه جفت‌های USDT',
-            all_coin_choices,
-            index=default_index,
-            help='منوی کشویی شامل تمام ارزهای موجود در Universe است.'
-        )
-        matched=df[df.symbol==selected]
-        if not matched.empty and matched.iloc[0].get('status')=='OK':
-            row=matched.iloc[0].to_dict()
-        else:
-            # If the selected coin was not part of the current scan result, analyze it on demand.
-            row=analyze(selected,tf,capital,risk)
-        plan=detailed_plan(selected,tf,row)
-        if plan:
-            st.subheader(f'تحلیل کامل {selected}')
-            m=plan['t24'] or {}
-            trend_txt=row.get('regime','رنج')
-            st.markdown(f"**روند کوتاه‌مدت:** {'🟢 صعودی' if trend_txt=='صعودی' else '🔴 نزولی' if trend_txt=='نزولی' else '🟡 رنج'}")
-            a,b,c,d,e=st.columns(5)
-            a.metric('قیمت فعلی',fmt(plan['price']))
-            b.metric('رشد 24H',fmt_pct(m.get('change24',row.get('momentum',0))))
-            c.metric('سقف 24H',fmt(m.get('high24',0)))
-            d.metric('کف 24H',fmt(m.get('low24',0)))
-            e.metric('حجم 24H',f"${m.get('volume24',0)/1e6:.2f}M" if m.get('volume24') else '-')
-            st.markdown('**مقاومت‌ها**')
-            st.write(' • '.join('$'+fmt(x) for x in plan['resistances']) if plan['resistances'] else 'سطح مقاومت کافی شناسایی نشد')
-            st.markdown('**حمایت‌ها**')
-            st.write(' • '.join('$'+fmt(x) for x in plan['supports']) if plan['supports'] else 'سطح حمایت کافی شناسایی نشد')
-            st.markdown('### پوزیشن پیشنهادی من')
-            pos=st.columns(2)
-            with pos[0]:
-                st.markdown(f"**نوع:** {'Long / خرید' if row.get('direction')=='LONG' else 'Short / فروش' if row.get('direction')=='SHORT' else 'WAIT / صبر'}")
-                se=plan['safe_entry']
-                if isinstance(se,tuple): st.write(f"**ورود کم‌ریسک:** ${fmt(se[0])} — ${fmt(se[1])}")
-                else: st.write(f"**ورود کم‌ریسک:** ${fmt(se)}")
-                st.write(f"**ورود تهاجمی:** ${fmt(plan['aggressive_entry'])}")
-                st.write(f"**Stop Loss:** ${fmt(plan['sl'])}")
-            with pos[1]:
-                for i,x in enumerate(plan['tps'],1): st.write(f"**Target {i}:** ${fmt(x)}")
-                st.write(f"**احتمال موفقیت تخمینی:** {plan['estimated_success']:.0f}%")
-                st.write(f"**چشم‌انداز سناریویی:** {plan['outlook']:+.1f}%")
-                st.write(f"**تصمیم فعلی:** **{plan['decision']}**")
-            st.info(plan['scenario'])
-            st.warning(plan['downside'])
-            st.caption('احتمال موفقیت و چشم‌انداز، برآورد الگوریتمی بر اساس داده بازار هستند و تضمین نتیجه معامله نیستند.')
+    # Detailed analysis uses the full-market dropdown above.
+    selected=st.session_state.get('selected_coin_dropdown', coin_options[0] if coin_options else symbols[0])
+    matched=df[df.symbol==selected]
+    if not matched.empty and matched.iloc[0].get('status')=='OK':
+        row=matched.iloc[0].to_dict()
+    else:
+        # If the selected coin was not part of the current scan result, analyze it on demand.
+        row=analyze(selected,tf,capital,risk)
+    plan=detailed_plan(selected,tf,row)
+    if plan:
+        st.subheader(f'تحلیل کامل {selected}')
+        m=plan['t24'] or {}
+        trend_txt=row.get('regime','رنج')
+        st.markdown(f"**روند کوتاه‌مدت:** {'🟢 صعودی' if trend_txt=='صعودی' else '🔴 نزولی' if trend_txt=='نزولی' else '🟡 رنج'}")
+        a,b,c,d,e=st.columns(5)
+        a.metric('قیمت فعلی',fmt(plan['price']))
+        b.metric('رشد 24H',fmt_pct(m.get('change24',row.get('momentum',0))))
+        c.metric('سقف 24H',fmt(m.get('high24',0)))
+        d.metric('کف 24H',fmt(m.get('low24',0)))
+        e.metric('حجم 24H',f"${m.get('volume24',0)/1e6:.2f}M" if m.get('volume24') else '-')
+        st.markdown('**مقاومت‌ها**')
+        st.write(' • '.join('$'+fmt(x) for x in plan['resistances']) if plan['resistances'] else 'سطح مقاومت کافی شناسایی نشد')
+        st.markdown('**حمایت‌ها**')
+        st.write(' • '.join('$'+fmt(x) for x in plan['supports']) if plan['supports'] else 'سطح حمایت کافی شناسایی نشد')
+        st.markdown('### پوزیشن پیشنهادی من')
+        pos=st.columns(2)
+        with pos[0]:
+            st.markdown(f"**نوع:** {'Long / خرید' if row.get('direction')=='LONG' else 'Short / فروش' if row.get('direction')=='SHORT' else 'WAIT / صبر'}")
+            se=plan['safe_entry']
+            if isinstance(se,tuple): st.write(f"**ورود کم‌ریسک:** ${fmt(se[0])} — ${fmt(se[1])}")
+            else: st.write(f"**ورود کم‌ریسک:** ${fmt(se)}")
+            st.write(f"**ورود تهاجمی:** ${fmt(plan['aggressive_entry'])}")
+            st.write(f"**Stop Loss:** ${fmt(plan['sl'])}")
+        with pos[1]:
+            for i,x in enumerate(plan['tps'],1): st.write(f"**Target {i}:** ${fmt(x)}")
+            st.write(f"**احتمال موفقیت تخمینی:** {plan['estimated_success']:.0f}%")
+            st.write(f"**چشم‌انداز سناریویی:** {plan['outlook']:+.1f}%")
+            st.write(f"**تصمیم فعلی:** **{plan['decision']}**")
+        st.info(plan['scenario'])
+        st.warning(plan['downside'])
+        st.caption('احتمال موفقیت و چشم‌انداز، برآورد الگوریتمی بر اساس داده بازار هستند و تضمین نتیجه معامله نیستند.')
     st.subheader('فرصت‌های معاملاتی')
     if tradable.empty: st.warning('در کل بازار موقعیت با شرایط فعلی پیدا نشد؛ اما همه ارزها اسکن شده‌اند و جدول پایین وضعیت کامل را نشان می‌دهد.')
     else:

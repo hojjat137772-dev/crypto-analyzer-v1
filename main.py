@@ -4,11 +4,10 @@ import numpy as np
 import requests, math, time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-st.set_page_config(page_title='Crypto Analyzer Pro V6.3', page_icon='₿', layout='wide', initial_sidebar_state='collapsed')
 
 TF={'5m':'5m','15m':'15m','30m':'30m','1H':'1h','2H':'2h','4H':'4h','6H':'6h','12H':'12h','1D':'1d','3D':'3d','1W':'1w'}
 BINANCE='https://api.binance.com'; OKX='https://www.okx.com'; TABDEAL='https://api.tabdeal.org'
-S=requests.Session(); S.headers.update({'User-Agent':'CryptoAnalyzerPro-V6.6/1.0'})
+S=requests.Session(); S.headers.update({'User-Agent':'CryptoAnalyzerPro-V6.8/1.0'})
 TIMEOUT=8; LIMIT=320
 
 # ---------- DATA ----------
@@ -148,6 +147,85 @@ def candle_decision(df):
         'ha':ha
     }
 
+
+# ---------- CLASSIC CHART PATTERNS ----------
+def _pivots(df, left=3, right=3, lookback=140):
+    x=df.tail(lookback).reset_index(drop=True)
+    highs=[]; lows=[]
+    for i in range(left, len(x)-right):
+        h=float(x.high.iloc[i]); l=float(x.low.iloc[i])
+        if h>=float(x.high.iloc[i-left:i+right+1].max()): highs.append((i,h))
+        if l<=float(x.low.iloc[i-left:i+right+1].min()): lows.append((i,l))
+    return x, highs, lows
+
+def classic_patterns(df):
+    """Heuristic classical chart-pattern detector; only closed OHLC candles are used."""
+    x, highs, lows=_pivots(df)
+    price=float(x.close.iloc[-1])
+    result={
+        'name':'بدون الگوی کلاسیک معتبر','type':'NONE','score':0,
+        'bullish':False,'bearish':False,'confidence':0.0,'breakout':False,
+        'neckline':None,'target':None,'detail':'',
+    }
+    if len(highs)<2 or len(lows)<2: return result
+    H=highs[-8:]; L=lows[-8:]
+    def rel(a,b): return abs(a-b)/max(abs((a+b)/2),1e-12)
+    # Head & Shoulders: three peaks with middle higher, shoulders similar, troughs form neckline.
+    if len(H)>=3:
+        a,b,c=H[-3:]
+        if a[0]<b[0]<c[0] and b[1]>a[1]*1.015 and b[1]>c[1]*1.015 and rel(a[1],c[1])<0.045:
+            lows_between=[z for z in L if a[0]<z[0]<b[0] or b[0]<z[0]<c[0]]
+            if len(lows_between)>=2:
+                n1,n2=lows_between[-2:]; neckline=(n1[1]+n2[1])/2
+                broken=price<neckline*0.997
+                target=neckline-(b[1]-neckline)
+                result.update(name='سر و شانه',type='HEAD_SHOULDERS',score=-10 if broken else -6,bearish=True,confidence=78 if broken else 66,breakout=broken,neckline=neckline,target=target,detail='شانه چپ/سر/شانه راست شناسایی شد؛ شکست خط گردن تأیید نزولی است.')
+    # Inverse H&S
+    if len(L)>=3:
+        a,b,c=L[-3:]
+        if a[0]<b[0]<c[0] and b[1]<a[1]*0.985 and b[1]<c[1]*0.985 and rel(a[1],c[1])<0.045:
+            highs_between=[z for z in H if a[0]<z[0]<b[0] or b[0]<z[0]<c[0]]
+            if len(highs_between)>=2:
+                n1,n2=highs_between[-2:]; neckline=(n1[1]+n2[1])/2
+                broken=price>neckline*1.003
+                target=neckline+(neckline-b[1])
+                result.update(name='سر و شانه معکوس',type='INV_HEAD_SHOULDERS',score=10 if broken else 6,bullish=True,confidence=78 if broken else 66,breakout=broken,neckline=neckline,target=target,detail='سر و شانه معکوس شناسایی شد؛ شکست خط گردن تأیید صعودی است.')
+    # Double top / bottom
+    if len(H)>=2:
+        a,b=H[-2:]
+        troughs=[z for z in L if a[0]<z[0]<b[0]]
+        if rel(a[1],b[1])<0.025 and troughs:
+            neck=min(z[1] for z in troughs); broken=price<neck*0.997
+            result.update(name='دو قله',type='DOUBLE_TOP',score=-9 if broken else -5,bearish=True,confidence=74 if broken else 62,breakout=broken,neckline=neck,target=neck-(max(a[1],b[1])-neck),detail='دو سقف تقریباً هم‌سطح؛ شکست کف بین دو قله تأیید نزولی است.')
+    if len(L)>=2:
+        a,b=L[-2:]
+        peaks=[z for z in H if a[0]<z[0]<b[0]]
+        if rel(a[1],b[1])<0.025 and peaks:
+            neck=max(z[1] for z in peaks); broken=price>neck*1.003
+            result.update(name='دو کف',type='DOUBLE_BOTTOM',score=9 if broken else 5,bullish=True,confidence=74 if broken else 62,breakout=broken,neckline=neck,target=neck+(neck-min(a[1],b[1])),detail='دو کف تقریباً هم‌سطح؛ شکست سقف بین دو کف تأیید صعودی است.')
+    # Triangle detection from recent pivot trendlines.
+    if len(H)>=3 and len(L)>=3:
+        hh=np.array(H[-4:],float); ll=np.array(L[-4:],float)
+        hs=np.polyfit(hh[:,0],hh[:,1],1)[0]; ls=np.polyfit(ll[:,0],ll[:,1],1)[0]
+        hflat=abs(hs)/max(np.mean(hh[:,1]),1e-12)<0.0009
+        lflat=abs(ls)/max(np.mean(ll[:,1]),1e-12)<0.0009
+        narrowing=(hh[-1,1]-ll[-1,1]) < (hh[0,1]-ll[0,1])
+        if narrowing and hs<0 and ls>0:
+            # Symmetrical triangle; direction only after breakout, otherwise neutral.
+            up=price>hh[-1,1]*0.997; down=price<ll[-1,1]*1.003
+            if up or down:
+                bull=up and not down; sc=8 if bull else -8
+                result.update(name='مثلث متقارن',type='SYMMETRIC_TRIANGLE',score=sc,bullish=bull,bearish=not bull,confidence=72,breakout=True,target=price+(1 if bull else -1)*(hh[-1,1]-ll[-1,1]),detail='مثلث متقارن با شکست اخیر شناسایی شد.')
+            else:
+                result.update(name='مثلث متقارن',type='SYMMETRIC_TRIANGLE',score=2,confidence=58,detail='مثلث متقارن در حال فشردگی؛ جهت پس از شکست مشخص می‌شود.')
+        elif narrowing and hflat and ls>0:
+            broken=price>hh[-1,1]*0.997
+            result.update(name='مثلث صعودی',type='ASCENDING_TRIANGLE',score=8 if broken else 4,bullish=True,confidence=75 if broken else 60,breakout=broken,neckline=hh[-1,1],target=hh[-1,1]+(hh[-1,1]-ll[-1,1]),detail='سقف تقریباً افقی و کف‌های بالارونده؛ شکست سقف تأیید صعودی است.')
+        elif narrowing and hs<0 and lflat:
+            broken=price<ll[-1,1]*1.003
+            result.update(name='مثلث نزولی',type='DESCENDING_TRIANGLE',score=-8 if broken else -4,bearish=True,confidence=75 if broken else 60,breakout=broken,neckline=ll[-1,1],target=ll[-1,1]-(hh[-1,1]-ll[-1,1]),detail='کف تقریباً افقی و سقف‌های پایین‌رونده؛ شکست کف تأیید نزولی است.')
+    return result
+
 # ---------- ANALYSIS ----------
 def analyze(symbol, entry_tf, capital, risk_pct):
     # Whole-market scan is resilient: only the decision TF is mandatory.
@@ -162,15 +240,16 @@ def analyze(symbol, entry_tf, capital, risk_pct):
     df=frames[entry_tf]; c=df.close; price=float(c.iloc[-1]); e20,e50,e200=ema(c,20),ema(c,50),ema(c,200); rv=float(rsi(c).iloc[-1]); mm,ms,_=macd(c); av=float(atr(df).iloc[-1]); ax=float(adx(df).iloc[-1]); mom=float((price/c.iloc[-6]-1)*100); vol=float(df.volume.iloc[-1]/max(df.volume.rolling(20).mean().iloc[-1],1e-12))
     bu,bd,pl,ps,rh,rl=pa(df)
     cs=candle_decision(df)
+    cp=classic_patterns(df)
     # Multi-timeframe context uses whatever is actually available.
     ts=[trend(frames[x]) for x in ['15m','1H','4H','1D'] if x in frames]
     bull=ts.count('صعودی'); bear=ts.count('نزولی');
-    long_score=50 + (20 if e20.iloc[-1]>e50.iloc[-1] else -10) + (15 if mm.iloc[-1]>ms.iloc[-1] else -10) + np.clip(mom*5,-15,15) + (12 if 48<=rv<=72 else -5) + (10 if vol>=1.15 else 0) + (15 if bu else 8 if pl else 0) + bull*4 - bear*3 + cs['candle_score']*3 + cs['ha_score']*3
-    short_score=50 + (20 if e20.iloc[-1]<e50.iloc[-1] else -10) + (15 if mm.iloc[-1]<ms.iloc[-1] else -10) - np.clip(mom*5,-15,15) + (12 if 28<=rv<=52 else -5) + (10 if vol>=1.15 else 0) + (15 if bd else 8 if ps else 0) + bear*4 - bull*3 - cs['candle_score']*3 - cs['ha_score']*3
+    long_score=50 + (20 if e20.iloc[-1]>e50.iloc[-1] else -10) + (15 if mm.iloc[-1]>ms.iloc[-1] else -10) + np.clip(mom*5,-15,15) + (12 if 48<=rv<=72 else -5) + (10 if vol>=1.15 else 0) + (15 if bu else 8 if pl else 0) + bull*4 - bear*3 + cs['candle_score']*3 + cs['ha_score']*3 + cp['score']*2
+    short_score=50 + (20 if e20.iloc[-1]<e50.iloc[-1] else -10) + (15 if mm.iloc[-1]<ms.iloc[-1] else -10) - np.clip(mom*5,-15,15) + (12 if 28<=rv<=52 else -5) + (10 if vol>=1.15 else 0) + (15 if bd else 8 if ps else 0) + bear*4 - bull*3 - cs['candle_score']*3 - cs['ha_score']*3 - cp['score']*2
     long_score=float(np.clip(long_score,0,100)); short_score=float(np.clip(short_score,0,100)); score=max(long_score,short_score)
     # Balanced trade gate: 4 confirmations out of 7, not all conditions simultaneously.
-    lc=sum([e20.iloc[-1]>e50.iloc[-1], mm.iloc[-1]>ms.iloc[-1], mom>0, 48<=rv<=72, vol>=1.05, bu or pl or bull>=2, bull>=bear, cs['combined_score']>0])
-    sc=sum([e20.iloc[-1]<e50.iloc[-1], mm.iloc[-1]<ms.iloc[-1], mom<0, 28<=rv<=52, vol>=1.05, bd or ps or bear>=2, bear>=bull, cs['combined_score']<0])
+    lc=sum([e20.iloc[-1]>e50.iloc[-1], mm.iloc[-1]>ms.iloc[-1], mom>0, 48<=rv<=72, vol>=1.05, bu or pl or bull>=2, bull>=bear, cs['combined_score']>0, cp['score']>0])
+    sc=sum([e20.iloc[-1]<e50.iloc[-1], mm.iloc[-1]<ms.iloc[-1], mom<0, 28<=rv<=52, vol>=1.05, bd or ps or bear>=2, bear>=bull, cs['combined_score']<0, cp['score']<0])
     direction='LONG' if lc>=4 and long_score>=52 and long_score>=short_score+2 else 'SHORT' if sc>=4 and short_score>=52 and short_score>=long_score+2 else 'WAIT'
     trade='خرید' if direction=='LONG' else 'فروش' if direction=='SHORT' else 'صبر'
     if direction=='LONG':
@@ -182,7 +261,7 @@ def analyze(symbol, entry_tf, capital, risk_pct):
     dollar_vol=float((df.close*df.volume).tail(20).mean()); liq=float(np.clip(50+math.log10(max(dollar_vol,1)/100000)*15,0,100))
     confirmations=max(lc,sc); confidence=float(np.clip(score*.72 + (confirmations/7)*28 - (12 if len(coverage)<3 else 0),0,100))
     pump=float((25 if vol>=1.8 else 15 if vol>=1.35 else 5 if vol>=1.1 else 0)+(25 if mom>=4 else 18 if mom>=2.5 else 10 if mom>=1 else 0)+(25 if bu else 12 if pl else 0)+(15 if 'صعودی' in ts[:2] else 0)+(10 if rv<72 else 0))
-    return {'symbol':symbol,'status':'OK','direction':direction,'trade':trade,'score':round(score,1),'confidence':round(confidence,1),'long_score':round(long_score,1),'short_score':round(short_score,1),'confirmations':confirmations,'coverage':len(coverage),'coverage_tfs':','.join(coverage),'price':price,'entry':entry,'sl':sl,'tp1':tp1,'tp2':tp2,'tp3':tp3,'rr':round(rr,2),'rsi':round(rv,1),'adx':round(ax,1),'momentum':round(mom,2),'volume':round(vol,2),'setup':'Breakout' if bu or bd else 'Pullback' if pl or ps else 'No setup','pump_score':round(pump,1),'liquidity':round(liq,1),'regime':'صعودی' if bull>bear else 'نزولی' if bear>bull else 'رنج','t15':trend(frames['15m']) if '15m' in frames else 'N/A','t1':trend(frames['1H']) if '1H' in frames else 'N/A','t4':trend(frames['4H']) if '4H' in frames else 'N/A','tD':trend(frames['1D']) if '1D' in frames else 'N/A','risk_money':capital*risk_pct/100,'qty':(capital*risk_pct/100)/abs(entry-sl) if abs(entry-sl)>0 else 0,'candle_signal':'صعودی' if cs['combined_score']>0 else 'نزولی' if cs['combined_score']<0 else 'خنثی','candle_score':cs['candle_score'],'ha_score':cs['ha_score'],'ha_bull':cs['ha_bull'],'ha_bear':cs['ha_bear']}
+    return {'symbol':symbol,'status':'OK','direction':direction,'trade':trade,'score':round(score,1),'confidence':round(confidence,1),'long_score':round(long_score,1),'short_score':round(short_score,1),'confirmations':confirmations,'coverage':len(coverage),'coverage_tfs':','.join(coverage),'price':price,'entry':entry,'sl':sl,'tp1':tp1,'tp2':tp2,'tp3':tp3,'rr':round(rr,2),'rsi':round(rv,1),'adx':round(ax,1),'momentum':round(mom,2),'volume':round(vol,2),'setup':'Breakout' if bu or bd else 'Pullback' if pl or ps else 'No setup','pump_score':round(pump,1),'liquidity':round(liq,1),'regime':'صعودی' if bull>bear else 'نزولی' if bear>bull else 'رنج','t15':trend(frames['15m']) if '15m' in frames else 'N/A','t1':trend(frames['1H']) if '1H' in frames else 'N/A','t4':trend(frames['4H']) if '4H' in frames else 'N/A','tD':trend(frames['1D']) if '1D' in frames else 'N/A','risk_money':capital*risk_pct/100,'qty':(capital*risk_pct/100)/abs(entry-sl) if abs(entry-sl)>0 else 0,'candle_signal':'صعودی' if cs['combined_score']>0 else 'نزولی' if cs['combined_score']<0 else 'خنثی','candle_score':cs['candle_score'],'ha_score':cs['ha_score'],'ha_bull':cs['ha_bull'],'ha_bear':cs['ha_bear'],'classic_pattern':cp['name'],'classic_type':cp['type'],'classic_score':cp['score'],'classic_confidence':cp['confidence'],'classic_breakout':cp['breakout']}
 
 # ---------- WHOLE MARKET SCANNER ----------
 @st.cache_data(ttl=90,show_spinner=False)
@@ -291,6 +370,7 @@ def detailed_plan(symbol, tf, row):
     rs,ss=levels(df,4)
     fib=fibonacci(df,120)
     av=float(atr(df).iloc[-1]); e20=float(ema(df.close,20).iloc[-1]); e50=float(ema(df.close,50).iloc[-1]); rv=float(rsi(df.close).iloc[-1]); mm,ms,_=macd(df.close); mom=float((price/df.close.iloc[-6]-1)*100); vol=float(df.volume.iloc[-1]/max(df.volume.rolling(20).mean().iloc[-1],1e-12)); cs=candle_decision(df)
+    cp=classic_patterns(df)
     direction=row.get('direction','WAIT')
     if direction=='LONG':
         sl=float(row.get('sl',max((ss[-1] if ss else price-av*2),price-av*2)))
@@ -349,143 +429,187 @@ def detailed_plan(symbol, tf, row):
     base=float(row.get('confidence',0) or 0)
     fib_bonus=8 if fib['distance_pct']<=0.8 else 5 if fib['distance_pct']<=1.5 else 0
     fib_alignment=1 if ((direction=='LONG' and fib['direction']=='صعودی') or (direction=='SHORT' and fib['direction']=='نزولی')) else 0
-    quality=(10 if vol>=1.15 else 0)+(8 if abs(mom)>=1 else 0)+(5 if 35<=rv<=70 else 0)+fib_bonus+(4 if fib_alignment else 0)+(6 if ((direction=='LONG' and cs['combined_score']>0) or (direction=='SHORT' and cs['combined_score']<0)) else -4 if ((direction=='LONG' and cs['combined_score']<0) or (direction=='SHORT' and cs['combined_score']>0)) else 0)
+    quality=(10 if vol>=1.15 else 0)+(8 if abs(mom)>=1 else 0)+(5 if 35<=rv<=70 else 0)+fib_bonus+(4 if fib_alignment else 0)+(6 if ((direction=='LONG' and cs['combined_score']>0) or (direction=='SHORT' and cs['combined_score']<0)) else -4 if ((direction=='LONG' and cs['combined_score']<0) or (direction=='SHORT' and cs['combined_score']>0)) else 0)+(6 if ((direction=='LONG' and cp['score']>0) or (direction=='SHORT' and cp['score']<0)) else -6 if ((direction=='LONG' and cp['score']<0) or (direction=='SHORT' and cp['score']>0)) else 0)
     if direction=='LONG' and fib['distance_pct']<=1.5 and fib['direction']=='صعودی':
         decision='خرید / تأیید فیبوناچی' if decision=='خرید / تأیید' else 'صبر برای پولبک به فیبوناچی / تأیید شکست'
     elif direction=='SHORT' and fib['distance_pct']<=1.5 and fib['direction']=='نزولی':
         decision='فروش / تأیید فیبوناچی' if decision=='فروش / تأیید' else 'صبر برای پولبک به فیبوناچی / تأیید شکست'
     est=float(np.clip(base+quality-(8 if len(rs)<2 or len(ss)<2 else 0),0,95))
     outlook=float(np.clip(mom*1.6 + (4 if direction=='LONG' else -4 if direction=='SHORT' else 0),-20,20))
-    return {'price':price,'t24':t24,'supports':ss,'resistances':rs,'rsi':rv,'candle':cs,'momentum':mom,'volume':vol,'e20':e20,'e50':e50,'sl':sl,'tps':tps[:3],'safe_entry':safe,'aggressive_entry':aggressive,'decision':decision,'scenario':scenario,'downside':downside,'estimated_success':est,'outlook':outlook,'risk':risk,'fib':fib,'fib_bonus':fib_bonus,'fib_alignment':fib_alignment}
+    return {'price':price,'t24':t24,'supports':ss,'resistances':rs,'rsi':rv,'candle':cs,'momentum':mom,'volume':vol,'e20':e20,'e50':e50,'sl':sl,'tps':tps[:3],'safe_entry':safe,'aggressive_entry':aggressive,'decision':decision,'scenario':scenario,'downside':downside,'estimated_success':est,'outlook':outlook,'risk':risk,'fib':fib,'fib_bonus':fib_bonus,'fib_alignment':fib_alignment,'classic':cp}
 
 # ---------- UI ----------
-st.title('₿ Crypto Analyzer Pro V6.6')
-st.caption('Whole-Market Scanner — بدون سقف مصنوعی تعداد ارز')
+# V6.8 compact modern dashboard UI — analysis engine unchanged.
+st.set_page_config(page_title='Crypto Analyzer Pro V6.8', page_icon='₿', layout='wide', initial_sidebar_state='collapsed')
+
+st.markdown("""
+<style>
+:root{--bg:#06101f;--card:#0b1a2f;--card2:#0e2138;--line:#173b62;--txt:#eef5ff;--muted:#8ea6c2;--blue:#2563eb;--green:#16c784;--red:#ef476f;--yellow:#f5b942;}
+.stApp{background:radial-gradient(circle at 20% 0%,#102b4b 0,#06101f 42%,#040b15 100%);color:var(--txt)}
+[data-testid="stHeader"]{background:transparent}
+[data-testid="stSidebar"]{background:linear-gradient(180deg,#07152a,#06101f);border-right:1px solid #143555;width:220px!important}
+[data-testid="stSidebar"]>div:first-child{padding-top:1rem}
+.block-container{max-width:1500px;padding-top:1.1rem;padding-bottom:2rem}
+.brand{display:flex;align-items:center;gap:12px;margin-bottom:12px}.brandcoin{width:42px;height:42px;border-radius:50%;display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,#ffb21a,#ff7a00);font-size:25px;color:white;box-shadow:0 8px 24px #ff8b0028}.brandtitle{font-size:23px;font-weight:800;line-height:1.05}.brandsub{font-size:11px;color:var(--muted);margin-top:4px}
+.topbar{background:rgba(10,27,48,.82);border:1px solid #173d63;border-radius:16px;padding:10px 14px;margin-bottom:12px;backdrop-filter:blur(12px)}
+.card{background:linear-gradient(145deg,rgba(13,34,58,.97),rgba(7,22,39,.97));border:1px solid var(--line);border-radius:16px;padding:14px;box-shadow:0 10px 28px #00000020;margin-bottom:12px}
+.metriccard{min-height:92px;padding:13px 14px}.metriclabel{font-size:12px;color:var(--muted);display:flex;justify-content:space-between}.metricvalue{font-size:25px;font-weight:800;margin-top:8px}.metricnote{font-size:11px;color:var(--muted);margin-top:3px}.green{color:var(--green)}.red{color:var(--red)}.yellow{color:var(--yellow)}.blue{color:#62a0ff}
+.coinhead{display:flex;align-items:center;justify-content:space-between;gap:10px}.coinname{font-size:22px;font-weight:800}.badge{display:inline-block;padding:5px 10px;border-radius:999px;font-size:12px;font-weight:800;border:1px solid}.badge-long{color:#5ff0b0;background:#0c3a2a;border-color:#146b4a}.badge-short{color:#ff8da7;background:#3a1020;border-color:#70213a}.badge-wait{color:#ffd66b;background:#3a2c0b;border-color:#6f5612}
+.sectiontitle{font-size:16px;font-weight:800;margin:4px 0 10px}.mini{font-size:11px;color:var(--muted)}
+.level{display:flex;justify-content:space-between;padding:8px 10px;border-radius:10px;margin:5px 0;background:#09192b;border:1px solid #153652;font-size:12px}.level b{font-size:13px}.level-res{border-color:#5a2232}.level-sup{border-color:#174e40}
+.scenario{padding:10px 12px;border-radius:12px;border:1px solid #194a39;background:#09281f;margin:6px 0}.scenario-bear{border-color:#5a2435;background:#2a101a}.scenario-wait{border-color:#4e431e;background:#251f0b}
+.planrow{display:flex;justify-content:space-between;padding:7px 0;border-bottom:1px solid #14314d;font-size:12px}.planrow:last-child{border-bottom:0}.planrow b{font-size:13px}
+.smalltag{display:inline-block;padding:4px 7px;border-radius:8px;background:#0a2035;border:1px solid #173d5f;font-size:11px;margin:2px;color:#b9cee4}
+[data-testid="stMetric"]{background:transparent}.stButton>button{border-radius:11px;border:1px solid #20548a;background:#0d2b4a;font-weight:700}.stButton>button:hover{border-color:#3d83d8}
+div[data-baseweb="select"]>div{border-radius:11px;background:#081a2d;border-color:#214b74}
+[data-testid="stDataFrame"]{border:1px solid #173b62;border-radius:12px;overflow:hidden}
+hr{border-color:#153452}
+</style>
+""", unsafe_allow_html=True)
+
+st.markdown("""
+<div class='brand'><div class='brandcoin'>₿</div><div><div class='brandtitle'>Crypto Analyzer Pro</div><div class='brandsub'>Smart Analysis &nbsp;•&nbsp; Better Trades</div></div></div>
+""", unsafe_allow_html=True)
+
 symbols,source=universe()
-if not symbols: st.error('فهرست بازار دریافت نشد.'); st.stop()
+if not symbols:
+    st.error('فهرست بازار دریافت نشد.'); st.stop()
 
 with st.sidebar:
-    st.write(f'منبع Universe: **{source}**')
-    st.write(f'تعداد جفت‌های USDT: **{len(symbols)}**')
+    st.markdown("### ₿ Crypto Analyzer")
+    st.caption('پنل کنترل')
     tf=st.selectbox('تایم‌فریم ورود',list(TF.keys()),index=3)
-    q=st.text_input('فیلتر نماد اختیاری','')
+    q=st.text_input('جستجوی ارز','')
     capital=st.number_input('سرمایه USDT',100.0,1000000.0,1000.0,100.0)
     risk=st.slider('ریسک هر معامله %',0.25,2.0,1.0,0.25)
-    st.info('اسکن بازار همیشه کل Universe فیلترشده را بررسی می‌کند. هیچ max_scan=250 وجود ندارد.')
+    st.divider()
+    st.caption(f'منبع: {source}')
+    st.caption(f'جفت‌های USDT: {len(symbols):,}')
+    if st.button('↻ پاک‌سازی کش داده',use_container_width=True):
+        st.cache_data.clear(); st.rerun()
 
 filtered=[s for s in symbols if q.upper() in s] if q else symbols
-st.metric('Universe قابل اسکن',len(filtered))
 
-if st.button('اسکن کل بازار',type='primary',use_container_width=True):
-    df=scan_all(tuple(filtered),tf,capital,risk)
-    st.session_state['scan_df']=df
+st.markdown("<div class='topbar'><b>داشبورد بازار</b> <span class='mini'> &nbsp; • &nbsp; تحلیل چندلایه با Fibonacci + Candlestick + Heikin-Ashi + Classic Patterns</span></div>",unsafe_allow_html=True)
+
+colA,colB=st.columns([4,1])
+with colA:
+    selected_preview=st.selectbox('ارز برای تحلیل',filtered,index=0 if filtered else None,key='preview_symbol')
+with colB:
+    st.write('')
+    if st.button('اسکن کل بازار',type='primary',use_container_width=True):
+        st.session_state['scan_df']=scan_all(tuple(filtered),tf,capital,risk)
+
+st.caption(f'Universe قابل اسکن: **{len(filtered):,}** ارز')
 
 if 'scan_df' in st.session_state:
-    df=st.session_state['scan_df'].copy(); total=len(filtered); analyzed=int((df.status=='OK').sum()); nodata=int((df.status!='OK').sum())
+    df=st.session_state['scan_df'].copy()
+    total=len(filtered); analyzed=int((df.status=='OK').sum()); nodata=int((df.status!='OK').sum())
     tradable=df[(df.status=='OK')&(df.direction!='WAIT')&(df.confidence>=50)&(df.rr>=1.2)&(df.liquidity>=20)].copy()
     longs=int((tradable.direction=='LONG').sum()); shorts=int((tradable.direction=='SHORT').sum())
-    c1,c2,c3,c4,c5=st.columns(5)
-    c1.metric('کل بازار',total); c2.metric('بررسی‌شده',analyzed); c3.metric('داده ناقص/خطا',nodata); c4.metric('LONG',longs); c5.metric('SHORT',shorts)
+    waits=max(analyzed-longs-shorts,0)
 
-    # Detailed analysis card: follows the structure requested by the reference screenshots.
+    cards=st.columns(6)
+    metrics=[('کل بازار',total,'ارز','blue'),('بررسی‌شده',analyzed,'OK','green'),('داده ناقص',nodata,'NO DATA','yellow'),('LONG',longs,'فرصت خرید','green'),('SHORT',shorts,'فرصت فروش','red'),('WAIT',waits,'صبر','yellow')]
+    for c,(lab,val,note,cl) in zip(cards,metrics):
+        with c:
+            st.markdown(f"<div class='card metriccard'><div class='metriclabel'><span>{lab}</span><span class='{cl}'>●</span></div><div class='metricvalue {cl}'>{val:,}</div><div class='metricnote'>{note}</div></div>",unsafe_allow_html=True)
+
     ok_symbols=df.loc[df.status=='OK','symbol'].dropna().astype(str).tolist()
     if ok_symbols:
-        default_symbol=(tradable.sort_values(['confidence','score'],ascending=False).iloc[0]['symbol'] if not tradable.empty else ok_symbols[0])
+        default_symbol=(tradable.sort_values(['confidence','score'],ascending=False).iloc[0]['symbol'] if not tradable.empty else (selected_preview if selected_preview in ok_symbols else ok_symbols[0]))
         choices=[default_symbol]+[x for x in sorted(ok_symbols) if x!=default_symbol]
-        selected=st.selectbox('تحلیل کامل ارز',choices,index=0)
+        selected=st.selectbox('تحلیل کامل ارز',choices,index=0,key='analysis_symbol')
         row=df[df.symbol==selected].iloc[0].to_dict()
         plan=detailed_plan(selected,tf,row)
         if plan:
-            st.subheader(f'تحلیل کامل {selected}')
+            direction=row.get('direction','WAIT')
+            badge='badge-long' if direction=='LONG' else 'badge-short' if direction=='SHORT' else 'badge-wait'
+            badge_txt='LONG / خرید' if direction=='LONG' else 'SHORT / فروش' if direction=='SHORT' else 'WAIT / صبر'
+            cp=plan.get('classic',{})
+            pattern=cp.get('name','بدون الگوی واضح')
+            pscore=float(cp.get('score',0) or 0)
+            pconf=float(cp.get('confidence',0) or 0)
+            cndl=plan['candle']
+            candle_txt='صعودی' if cndl['combined_score']>0 else 'نزولی' if cndl['combined_score']<0 else 'خنثی'
+            ha_txt='صعودی' if cndl['ha_bull']>=2 else 'نزولی' if cndl['ha_bear']>=2 else 'خنثی'
+
+            st.markdown(f"<div class='card'><div class='coinhead'><div><span class='coinname'>{selected}</span><span class='mini'> &nbsp; • &nbsp; {tf}</span></div><div><span class='badge {badge}'>{badge_txt}</span> <b class='green' style='font-size:20px'>{plan['estimated_success']:.0f}%</b><span class='mini'> احتمال تخمینی</span></div></div></div>",unsafe_allow_html=True)
+
             chart_mode=st.radio('نمودار', ['Candlestick','Heikin-Ashi'], horizontal=True, key=f'chart_mode_{selected}')
             chart_df,_=candles(selected,TF[tf])
             if chart_df is not None:
                 import altair as alt
+                view=chart_df.tail(120)
                 if chart_mode=='Candlestick':
-                    base=alt.Chart(chart_df.tail(120)).encode(
-                        x=alt.X('time:T', title='زمان'),
-                        color=alt.condition('datum.close >= datum.open', alt.value('#16a34a'), alt.value('#dc2626'), legend=None)
-                    )
-                    w=base.mark_rule().encode(y='low:Q', y2='high:Q')
-                    b=base.mark_bar(size=6).encode(y='open:Q', y2='close:Q')
-                    st.altair_chart((w+b).interactive(), use_container_width=True)
+                    base=alt.Chart(view).encode(x=alt.X('time:T',title='زمان'),color=alt.condition('datum.close >= datum.open',alt.value('#16c784'),alt.value('#ef476f'),legend=None))
+                    w=base.mark_rule().encode(y='low:Q',y2='high:Q'); b=base.mark_bar(size=6).encode(y='open:Q',y2='close:Q')
                 else:
-                    ha=heikin_ashi(chart_df).tail(120).copy()
-                    ha['time']=chart_df.tail(120)['time'].values
-                    base=alt.Chart(ha).encode(
-                        x=alt.X('time:T', title='زمان'),
-                        color=alt.condition('datum.close >= datum.open', alt.value('#16a34a'), alt.value('#dc2626'), legend=None)
-                    )
-                    w=base.mark_rule().encode(y='low:Q', y2='high:Q')
-                    b=base.mark_bar(size=6).encode(y='open:Q', y2='close:Q')
-                    st.altair_chart((w+b).interactive(), use_container_width=True)
-            cndl=plan['candle']
-            candle_state='🟢 صعودی' if cndl['bullish'] else '🔴 نزولی' if cndl['bearish'] else '⚪ خنثی'
-            pattern='Bullish Engulfing' if cndl['bull_engulf'] else 'Bearish Engulfing' if cndl['bear_engulf'] else 'Hammer' if cndl['hammer'] else 'Shooting Star' if cndl['shooting'] else 'Doji' if cndl['doji'] else 'Normal'
-            ha_state='🟢 صعودی' if cndl['ha_strong_bull'] else '🔴 نزولی' if cndl['ha_strong_bear'] else '🟢' if cndl['ha_bull']>=2 else '🔴' if cndl['ha_bear']>=2 else '⚪ خنثی'
-            st.markdown(f'**کندل‌استیک:** {candle_state} | الگو: {pattern}<br>**Heikin-Ashi:** {ha_state} | 3 کندل اخیر: {cndl["ha_bull"]} صعودی / {cndl["ha_bear"]} نزولی', unsafe_allow_html=True)
-            m=plan['t24'] or {}
-            trend_txt=row.get('regime','رنج')
-            st.markdown(f"**روند کوتاه‌مدت:** {'🟢 صعودی' if trend_txt=='صعودی' else '🔴 نزولی' if trend_txt=='نزولی' else '🟡 رنج'}")
-            a,b,c,d,e=st.columns(5)
-            a.metric('قیمت فعلی',fmt(plan['price']))
-            b.metric('رشد 24H',fmt_pct(m.get('change24',row.get('momentum',0))))
-            c.metric('سقف 24H',fmt(m.get('high24',0)))
-            d.metric('کف 24H',fmt(m.get('low24',0)))
-            e.metric('حجم 24H',f"${m.get('volume24',0)/1e6:.2f}M" if m.get('volume24') else '-')
-            st.markdown('**مقاومت‌ها**')
-            st.write(' • '.join('$'+fmt(x) for x in plan['resistances']) if plan['resistances'] else 'سطح مقاومت کافی شناسایی نشد')
-            st.markdown('**حمایت‌ها**')
-            st.write(' • '.join('$'+fmt(x) for x in plan['supports']) if plan['supports'] else 'سطح حمایت کافی شناسایی نشد')
-            st.markdown('**فیبوناچی — دخیل در تحلیل**')
-            fib=plan['fib']
-            fr=' • '.join(f'{k}: ${fmt(v)}' for k,v in fib['retracement'].items())
-            fe=' • '.join(f'{k}: ${fmt(v)}' for k,v in fib['extensions'].items())
-            st.write(f"سوئینگ: {fib['direction']} | نزدیک‌ترین سطح: {fib['nearest_name']} (${fmt(fib['nearest'])}) | فاصله: {fib['distance_pct']:.2f}%")
-            st.caption(f"Retracement: {fr}")
-            st.caption(f"Extensions: {fe}")
-            st.markdown('### پوزیشن پیشنهادی من')
-            pos=st.columns(2)
-            with pos[0]:
-                st.markdown(f"**نوع:** {'Long / خرید' if row.get('direction')=='LONG' else 'Short / فروش' if row.get('direction')=='SHORT' else 'WAIT / صبر'}")
-                se=plan['safe_entry']
-                if isinstance(se,tuple): st.write(f"**ورود کم‌ریسک:** ${fmt(se[0])} — ${fmt(se[1])}")
-                else: st.write(f"**ورود کم‌ریسک:** ${fmt(se)}")
-                st.write(f"**ورود تهاجمی:** ${fmt(plan['aggressive_entry'])}")
-                st.write(f"**Stop Loss:** ${fmt(plan['sl'])}")
-            with pos[1]:
-                for i,x in enumerate(plan['tps'],1): st.write(f"**Target {i}:** ${fmt(x)}")
-                st.write(f"**احتمال موفقیت تخمینی:** {plan['estimated_success']:.0f}%")
-                st.write(f"**چشم‌انداز سناریویی:** {plan['outlook']:+.1f}%")
-                st.write(f"**تصمیم فعلی:** **{plan['decision']}**")
-            st.info(plan['scenario'])
-            st.warning(plan['downside'])
-            st.caption('احتمال موفقیت و چشم‌انداز، برآورد الگوریتمی بر اساس داده بازار هستند و تضمین نتیجه معامله نیستند.')
-    st.subheader('فرصت‌های معاملاتی')
-    if tradable.empty: st.warning('در کل بازار موقعیت با شرایط فعلی پیدا نشد؛ اما همه ارزها اسکن شده‌اند و جدول پایین وضعیت کامل را نشان می‌دهد.')
+                    ha=heikin_ashi(chart_df).tail(120).copy(); ha['time']=view['time'].values
+                    base=alt.Chart(ha).encode(x=alt.X('time:T',title='زمان'),color=alt.condition('datum.close >= datum.open',alt.value('#16c784'),alt.value('#ef476f'),legend=None))
+                    w=base.mark_rule().encode(y='low:Q',y2='high:Q'); b=base.mark_bar(size=6).encode(y='open:Q',y2='close:Q')
+                st.altair_chart((w+b).interactive(),use_container_width=True)
+
+            # Indicator cards
+            ic=st.columns(6)
+            indicator_cards=[('الگوی کلاسیک',pattern,f'قدرت {pconf:.0f}%','blue'),('کندل‌استیک',candle_txt,f"امتیاز {cndl['candle_score']:+.0f}",'green' if cndl['candle_score']>0 else 'red' if cndl['candle_score']<0 else 'yellow'),('Heikin-Ashi',ha_txt,f"{cndl['ha_bull']} صعودی / {cndl['ha_bear']} نزولی",'green' if cndl['ha_bull']>=2 else 'red' if cndl['ha_bear']>=2 else 'yellow'),('Fibonacci',plan['fib']['nearest_name'],f"فاصله {plan['fib']['distance_pct']:.2f}%",'blue'),('RSI',f"{plan['rsi']:.1f}",'Momentum / RSI','yellow'),('Volume',f"{plan['volume']:.2f}x",'نسبت به میانگین','green' if plan['volume']>=1.05 else 'yellow')]
+            for c,(lab,val,note,cl) in zip(ic,indicator_cards):
+                with c: st.markdown(f"<div class='card metriccard'><div class='metriclabel'><span>{lab}</span></div><div class='metricvalue {cl}' style='font-size:18px'>{val}</div><div class='metricnote'>{note}</div></div>",unsafe_allow_html=True)
+
+            left,mid,right=st.columns([1,1.15,1])
+            with left:
+                st.markdown("<div class='card'><div class='sectiontitle'>سطوح کلیدی</div>",unsafe_allow_html=True)
+                st.markdown('<div class="mini">مقاومت‌ها</div>',unsafe_allow_html=True)
+                for i,x in enumerate(plan['resistances'][:4],1): st.markdown(f"<div class='level level-res'><span>R{i}</span><b class='red'>${fmt(x)}</b></div>",unsafe_allow_html=True)
+                st.markdown('<div class="mini">حمایت‌ها</div>',unsafe_allow_html=True)
+                for i,x in enumerate(plan['supports'][:4],1): st.markdown(f"<div class='level level-sup'><span>S{i}</span><b class='green'>${fmt(x)}</b></div>",unsafe_allow_html=True)
+                st.markdown('</div>',unsafe_allow_html=True)
+            with mid:
+                st.markdown("<div class='card'><div class='sectiontitle'>الگوهای شناسایی‌شده</div>",unsafe_allow_html=True)
+                st.markdown(f"<div class='scenario'><b>{pattern}</b><br><span class='mini'>{cp.get('detail','الگوی معتبر کافی شناسایی نشد.')}</span><br><span class='smalltag'>امتیاز {pscore:+.0f}</span><span class='smalltag'>اعتماد {pconf:.0f}%</span>{'<span class=\"smalltag\">Breakout تأیید شد</span>' if cp.get('breakout') else ''}</div>",unsafe_allow_html=True)
+                fib=plan['fib']; st.markdown(f"<div class='scenario scenario-wait'><b>Fibonacci</b><br><span class='mini'>سوئینگ {fib['direction']} • نزدیک‌ترین سطح {fib['nearest_name']}</span><br><span class='smalltag'>${fmt(fib['nearest'])}</span><span class='smalltag'>فاصله {fib['distance_pct']:.2f}%</span></div>",unsafe_allow_html=True)
+                st.markdown('</div>',unsafe_allow_html=True)
+            with right:
+                st.markdown("<div class='card'><div class='sectiontitle'>طرح معامله</div>",unsafe_allow_html=True)
+                se=plan['safe_entry']; se_txt=f"${fmt(se[0])} — ${fmt(se[1])}" if isinstance(se,tuple) else f"${fmt(se)}"
+                rows=[('نوع معامله',badge_txt),('ورود کم‌ریسک',se_txt),('ورود تهاجمی',f"${fmt(plan['aggressive_entry'])}"),('Stop Loss',f"${fmt(plan['sl'])}")]
+                for lab,val in rows: st.markdown(f"<div class='planrow'><span>{lab}</span><b>{val}</b></div>",unsafe_allow_html=True)
+                for i,x in enumerate(plan['tps'],1): st.markdown(f"<div class='planrow'><span>Target {i}</span><b class='green'>${fmt(x)}</b></div>",unsafe_allow_html=True)
+                st.markdown(f"<div class='planrow'><span>موفقیت تخمینی</span><b class='green'>{plan['estimated_success']:.0f}%</b></div>",unsafe_allow_html=True)
+                st.markdown(f"<div class='planrow'><span>چشم‌انداز</span><b>{plan['outlook']:+.1f}%</b></div>",unsafe_allow_html=True)
+                st.markdown('</div>',unsafe_allow_html=True)
+
+            st.markdown(f"<div class='card'><b>تصمیم نهایی:</b> <span class='badge {badge}'>{plan['decision']}</span><div class='mini' style='margin-top:8px'>{plan['scenario']}</div><div class='mini' style='margin-top:4px;color:#ff9bb0'>{plan['downside']}</div></div>",unsafe_allow_html=True)
+
+    st.markdown("<div class='card'><div class='sectiontitle'>فرصت‌های معاملاتی</div>",unsafe_allow_html=True)
+    if tradable.empty:
+        st.warning('در کل بازار موقعیت با شرایط فعلی پیدا نشد؛ جدول پایین وضعیت کامل بازار را نشان می‌دهد.')
     else:
-        show=tradable.sort_values(['confidence','score','pump_score'],ascending=False)[['symbol','trade','direction','confidence','score','confirmations','coverage','setup','price','entry','sl','tp1','tp2','rr','pump_score','liquidity','t15','t1','t4','tD']].copy()
-        show.columns=['ارز','معامله','جهت','Confidence','Score','تأییدها','پوشش TF','ستاپ','قیمت','Entry','SL','TP1','TP2','R:R','Pump','Liquidity','15m','1H','4H','1D']
+        show=tradable.sort_values(['confidence','score','pump_score'],ascending=False)[['symbol','trade','direction','confidence','score','confirmations','classic_pattern','classic_score','setup','price','entry','sl','tp1','tp2','rr','pump_score','liquidity','t15','t1','t4','tD']].copy()
+        show.columns=['ارز','معامله','جهت','Confidence','Score','تأییدها','الگوی کلاسیک','امتیاز الگو','ستاپ','قیمت','Entry','SL','TP1','TP2','R:R','Pump','Liquidity','15m','1H','4H','1D']
         for c in ['قیمت','Entry','SL','TP1','TP2']: show[c]=show[c].map(fmt)
         show['Confidence']=show['Confidence'].map(lambda x:f'{x:.1f}%')
         st.dataframe(show,use_container_width=True,hide_index=True)
+    st.markdown('</div>',unsafe_allow_html=True)
 
-    st.subheader('کل بازار — بدون حذف نتایج')
-    allshow=df.copy()
-    allshow=allshow.sort_values(['status','confidence','score'],ascending=[True,False,False])
-    cols=['symbol','status','direction','trade','confidence','score','confirmations','coverage','coverage_tfs','regime','setup','price','momentum','volume','pump_score','reason']
+    st.markdown("<div class='card'><div class='sectiontitle'>کل بازار — بدون حذف نتایج</div>",unsafe_allow_html=True)
+    allshow=df.copy().sort_values(['status','confidence','score'],ascending=[True,False,False])
+    cols=['symbol','status','direction','trade','confidence','score','confirmations','coverage','coverage_tfs','classic_pattern','classic_score','regime','setup','price','momentum','volume','pump_score','reason']
     for c in cols:
         if c not in allshow.columns: allshow[c]='-'
-    allshow=allshow[cols]
-    allshow.columns=['ارز','وضعیت داده','جهت','معامله','Confidence','Score','تأییدها','پوشش TF','TFهای موجود','رژیم','ستاپ','قیمت','Momentum %','Volume x','Pump','علت']
+    allshow=allshow[cols]; allshow.columns=['ارز','وضعیت داده','جهت','معامله','Confidence','Score','تأییدها','پوشش TF','TFهای موجود','الگوی کلاسیک','امتیاز الگو','رژیم','ستاپ','قیمت','Momentum %','Volume x','Pump','علت']
     allshow['قیمت']=allshow['قیمت'].map(fmt)
     allshow['Confidence']=allshow['Confidence'].apply(lambda x:f'{float(x):.1f}%' if pd.notna(x) and str(x) not in ('-','nan') else '-')
     st.dataframe(allshow,use_container_width=True,hide_index=True)
+    st.markdown('</div>',unsafe_allow_html=True)
 
-    st.subheader('🚀 Pump Candidates')
+    st.markdown("<div class='card'><div class='sectiontitle'>🚀 Pump Candidates</div>",unsafe_allow_html=True)
     pump=df[(df.status=='OK')&(df.pump_score>=28)].sort_values(['pump_score','confidence'],ascending=False).head(30)
     if pump.empty: st.info('کاندید پامپ پیدا نشد.')
     else:
-        p=pump[['symbol','pump_score','confidence','momentum','volume','setup','direction','price']].copy(); p.columns=['ارز','Pump Score','Confidence','Momentum %','Volume x','ستاپ','جهت','قیمت']; p['قیمت']=p['قیمت'].map(fmt); p['Confidence']=p['Confidence'].map(lambda x:f'{x:.1f}%'); st.dataframe(p,use_container_width=True,hide_index=True)
+        p=pump[['symbol','pump_score','confidence','momentum','volume','classic_pattern','setup','direction','price']].copy(); p.columns=['ارز','Pump Score','Confidence','Momentum %','Volume x','الگوی کلاسیک','ستاپ','جهت','قیمت']; p['قیمت']=p['قیمت'].map(fmt); p['Confidence']=p['Confidence'].map(lambda x:f'{x:.1f}%'); st.dataframe(p,use_container_width=True,hide_index=True)
+    st.markdown('</div>',unsafe_allow_html=True)
+else:
+    st.markdown("<div class='card' style='text-align:center;padding:35px'><div style='font-size:28px'>₿</div><h3>برای شروع، اسکن کل بازار را اجرا کنید</h3><div class='mini'>پس از اسکن، کارت‌های LONG / SHORT / WAIT و تحلیل کامل ارز در همین صفحه نمایش داده می‌شوند.</div></div>",unsafe_allow_html=True)
 
-st.caption('V6.6: کندل‌استیک و Heikin-Ashi علاوه بر فیبوناچی مستقیماً در امتیاز، تأیید ورود و تصمیم نهایی دخالت دارند.')
+st.caption('V6.8 UI: داشبورد جمع‌وجور، کارت‌های نشانگر، منوی فشرده و ظاهر مدرن — موتور تحلیل V6.7 بدون حذف قابلیت‌ها حفظ شده است.')

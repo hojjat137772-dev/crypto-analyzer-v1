@@ -274,13 +274,24 @@ if 'scan_df' in st.session_state:
     c1,c2,c3,c4,c5=st.columns(5)
     c1.metric('کل بازار',total); c2.metric('بررسی‌شده',analyzed); c3.metric('داده ناقص/خطا',nodata); c4.metric('LONG',longs); c5.metric('SHORT',shorts)
 
-    # Detailed analysis card: follows the structure requested by the reference screenshots.
-    ok_symbols=df.loc[df.status=='OK','symbol'].dropna().astype(str).tolist()
-    if ok_symbols:
-        default_symbol=(tradable.sort_values(['confidence','score'],ascending=False).iloc[0]['symbol'] if not tradable.empty else ok_symbols[0])
-        choices=[default_symbol]+[x for x in sorted(ok_symbols) if x!=default_symbol]
-        selected=st.selectbox('تحلیل کامل ارز',choices,index=0)
-        row=df[df.symbol==selected].iloc[0].to_dict()
+    # Detailed analysis card: the dropdown contains the FULL USDT universe, not only tradable/OK rows.
+    # This lets the user browse every available coin even when its scan result is WAIT/NO_DATA.
+    all_coin_choices=sorted(set(filtered))
+    if all_coin_choices:
+        default_symbol=(tradable.sort_values(['confidence','score'],ascending=False).iloc[0]['symbol'] if not tradable.empty else all_coin_choices[0])
+        default_index=all_coin_choices.index(default_symbol) if default_symbol in all_coin_choices else 0
+        selected=st.selectbox(
+            'ارز — همه جفت‌های USDT',
+            all_coin_choices,
+            index=default_index,
+            help='منوی کشویی شامل تمام ارزهای موجود در Universe است.'
+        )
+        matched=df[df.symbol==selected]
+        if not matched.empty and matched.iloc[0].get('status')=='OK':
+            row=matched.iloc[0].to_dict()
+        else:
+            # If the selected coin was not part of the current scan result, analyze it on demand.
+            row=analyze(selected,tf,capital,risk)
         plan=detailed_plan(selected,tf,row)
         if plan:
             st.subheader(f'تحلیل کامل {selected}')

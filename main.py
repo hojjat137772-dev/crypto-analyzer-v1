@@ -187,6 +187,33 @@ def levels(df, n=4):
         if x<price*.998 and all(abs(x-y)/max(x,1e-12)>.012 for y in ss): ss.append(x)
     return sorted(rs)[:n], sorted(ss, reverse=True)[:n]
 
+
+
+def fibonacci(df, lookback=120):
+    """محاسبه فیبوناچی از سقف/کف سوئینگ اخیر و تبدیل آن به سطوح قابل استفاده در تصمیم."""
+    x=df.tail(lookback).copy()
+    hi=float(x.high.max()); lo=float(x.low.min()); span=max(hi-lo,1e-12); price=float(df.close.iloc[-1])
+    hi_i=x.high.idxmax(); lo_i=x.low.idxmin()
+    # Swing direction: low قبل از high => حرکت صعودی، در غیر این صورت نزولی
+    bullish=lo_i < hi_i
+    retr=[0.236,0.382,0.5,0.618,0.786]
+    ext=[1.0,1.272,1.618,2.0]
+    if bullish:
+        levels={f'R{int(r*1000)}':hi-span*r for r in retr}
+        extensions={f'E{int(r*1000)}':lo+span*r for r in ext}
+    else:
+        levels={f'R{int(r*1000)}':lo+span*r for r in retr}
+        extensions={f'E{int(r*1000)}':hi-span*r for r in ext}
+    # نزدیک‌ترین فیبوناچی به قیمت فعلی
+    all_levels={**levels,**extensions}
+    nearest_name,nearest=min(all_levels.items(),key=lambda kv:abs(kv[1]-price))
+    distance=abs(price-nearest)/max(price,1e-12)*100
+    return {
+        'swing_high':hi,'swing_low':lo,'direction':'صعودی' if bullish else 'نزولی',
+        'retracement':levels,'extensions':extensions,'nearest_name':nearest_name,
+        'nearest':nearest,'distance_pct':distance
+    }
+
 def fmt_pct(x):
     try: return f'{float(x):+.2f}%'
     except: return '-'
@@ -198,17 +225,25 @@ def detailed_plan(symbol, tf, row):
     price=float(df.close.iloc[-1])
     if t24 and t24.get('price'): price=t24['price']
     rs,ss=levels(df,4)
+    fib=fibonacci(df,120)
     av=float(atr(df).iloc[-1]); e20=float(ema(df.close,20).iloc[-1]); e50=float(ema(df.close,50).iloc[-1]); rv=float(rsi(df.close).iloc[-1]); mm,ms,_=macd(df.close); mom=float((price/df.close.iloc[-6]-1)*100); vol=float(df.volume.iloc[-1]/max(df.volume.rolling(20).mean().iloc[-1],1e-12))
     direction=row.get('direction','WAIT')
     if direction=='LONG':
         sl=float(row.get('sl',max((ss[-1] if ss else price-av*2),price-av*2)))
         risk=abs(price-sl)
         resistance=[x for x in rs if x>price]
-        tps=(resistance[:3] if len(resistance)>=3 else [price+1.5*risk,price+2.5*risk,price+3.5*risk])
+        fib_long=[v for v in fib['retracement'].values() if v<price]
+        fib_ext=[v for v in fib['extensions'].values() if v>price]
+        fib_targets=sorted(fib_ext)
+        tps=(sorted(set((resistance[:3] if len(resistance)>=3 else []) + fib_targets))[:3] if (resistance or fib_targets) else [price+1.5*risk,price+2.5*risk,price+3.5*risk])
+        fib_entry=sorted(fib_long)[-2:] if len(fib_long)>=2 else fib_long
         low_entry=max(ss[0] if ss else price-av, price-1.2*av)
         high_entry=min(e20 if e20<price else price, price)
+        if fib_entry:
+            low_entry=max(low_entry,min(fib_entry))
+            high_entry=min(high_entry,max(fib_entry))
         safe=(min(low_entry,price), max(high_entry,price)) if low_entry<price else (price,price)
-        aggressive=(resistance[0]*1.003 if resistance else price+0.8*av)
+        aggressive=(max([resistance[0]*1.003 if resistance else price+0.8*av] + ([fib_targets[0]*1.001] if fib_targets else [])))
         decision='خرید / تأیید' if price>e20 and mom>0 and vol>=1.05 else 'صبر برای پولبک / تأیید شکست'
         scenario='اگر مقاومت نزدیک شکسته و بالای آن تثبیت شود، سناریوی صعودی فعال‌تر می‌شود.'
         downside='از دست رفتن حمایت نزدیک و شکست SL سناریوی صعودی را باطل می‌کند.'
@@ -216,11 +251,17 @@ def detailed_plan(symbol, tf, row):
         sl=float(row.get('sl',min((rs[0] if rs else price+av*2),price+av*2)))
         risk=abs(sl-price)
         support=[x for x in ss if x<price]
-        tps=(support[:3] if len(support)>=3 else [price-1.5*risk,price-2.5*risk,price-3.5*risk])
+        fib_short=[v for v in fib['retracement'].values() if v>price]
+        fib_ext=[v for v in fib['extensions'].values() if v<price]
+        fib_targets=sorted(fib_ext, reverse=True)
+        tps=(sorted(set((support[:3] if len(support)>=3 else []) + fib_targets), reverse=True)[:3] if (support or fib_targets) else [price-1.5*risk,price-2.5*risk,price-3.5*risk])
         low_entry=max(price, e20 if e20>price else price)
         high_entry=min(rs[0] if rs else price+av, price+1.2*av)
+        if fib_short:
+            low_entry=max(low_entry,min(fib_short))
+            high_entry=min(high_entry,max(fib_short))
         safe=(price, max(low_entry,price))
-        aggressive=(support[0]*0.997 if support else price-0.8*av)
+        aggressive=(min([support[0]*0.997 if support else price-0.8*av] + ([fib_targets[0]*0.999] if fib_targets else [])))
         decision='فروش / تأیید' if price<e20 and mom<0 and vol>=1.05 else 'صبر برای پولبک / تأیید شکست'
         scenario='اگر حمایت نزدیک شکسته و زیر آن تثبیت شود، سناریوی نزولی فعال‌تر می‌شود.'
         downside='بازپس‌گیری مقاومت و شکست SL سناریوی نزولی را باطل می‌کند.'
@@ -231,19 +272,27 @@ def detailed_plan(symbol, tf, row):
         bullish_entry=nearest_r*1.003
         bearish_entry=nearest_s*0.997
         risk=abs(price-nearest_s)
-        tps=[x for x in rs[:3]] or [price+1.5*max(av,price*.01),price+2.5*max(av,price*.01),price+3.5*max(av,price*.01)]
+        fib_up=sorted([v for v in fib['extensions'].values() if v>price])
+        tps=sorted(set(rs[:3] + fib_up))[:3] or [price+1.5*max(av,price*.01),price+2.5*max(av,price*.01),price+3.5*max(av,price*.01)]
         sl=nearest_s
-        safe=(nearest_s, price)
+        fib_below=sorted([v for v in fib['retracement'].values() if v<price])
+        safe=(max(nearest_s, fib_below[-1] if fib_below else nearest_s), price)
         aggressive=bullish_entry
         decision='صبر / تأیید شکست'
         scenario=f'عبور و تثبیت بالای {fmt(bullish_entry)} سناریوی صعودی را فعال می‌کند.'
         downside=f'شکست {fmt(bearish_entry)} به پایین، سناریوی نزولی را تقویت می‌کند.'
     # Heuristic scenario confidence, explicitly treated as an estimate.
     base=float(row.get('confidence',0) or 0)
-    quality=(10 if vol>=1.15 else 0)+(8 if abs(mom)>=1 else 0)+(5 if 35<=rv<=70 else 0)
+    fib_bonus=8 if fib['distance_pct']<=0.8 else 5 if fib['distance_pct']<=1.5 else 0
+    fib_alignment=1 if ((direction=='LONG' and fib['direction']=='صعودی') or (direction=='SHORT' and fib['direction']=='نزولی')) else 0
+    quality=(10 if vol>=1.15 else 0)+(8 if abs(mom)>=1 else 0)+(5 if 35<=rv<=70 else 0)+fib_bonus+(4 if fib_alignment else 0)
+    if direction=='LONG' and fib['distance_pct']<=1.5 and fib['direction']=='صعودی':
+        decision='خرید / تأیید فیبوناچی' if decision=='خرید / تأیید' else 'صبر برای پولبک به فیبوناچی / تأیید شکست'
+    elif direction=='SHORT' and fib['distance_pct']<=1.5 and fib['direction']=='نزولی':
+        decision='فروش / تأیید فیبوناچی' if decision=='فروش / تأیید' else 'صبر برای پولبک به فیبوناچی / تأیید شکست'
     est=float(np.clip(base+quality-(8 if len(rs)<2 or len(ss)<2 else 0),0,95))
     outlook=float(np.clip(mom*1.6 + (4 if direction=='LONG' else -4 if direction=='SHORT' else 0),-20,20))
-    return {'price':price,'t24':t24,'supports':ss,'resistances':rs,'rsi':rv,'momentum':mom,'volume':vol,'e20':e20,'e50':e50,'sl':sl,'tps':tps[:3],'safe_entry':safe,'aggressive_entry':aggressive,'decision':decision,'scenario':scenario,'downside':downside,'estimated_success':est,'outlook':outlook,'risk':risk}
+    return {'price':price,'t24':t24,'supports':ss,'resistances':rs,'rsi':rv,'momentum':mom,'volume':vol,'e20':e20,'e50':e50,'sl':sl,'tps':tps[:3],'safe_entry':safe,'aggressive_entry':aggressive,'decision':decision,'scenario':scenario,'downside':downside,'estimated_success':est,'outlook':outlook,'risk':risk,'fib':fib,'fib_bonus':fib_bonus,'fib_alignment':fib_alignment}
 
 # ---------- UI ----------
 st.title('₿ Crypto Analyzer Pro V6.4')
@@ -263,22 +312,6 @@ with st.sidebar:
 filtered=[s for s in symbols if q.upper() in s] if q else symbols
 st.metric('Universe قابل اسکن',len(filtered))
 
-# Full-market coin dropdown: available even before scanning.
-st.subheader('انتخاب ارز')
-coin_search=st.text_input('جستجوی سریع ارز', '', placeholder='مثلاً BTC یا ETH', key='coin_search')
-coin_options=sorted([s for s in symbols if coin_search.upper() in s] if coin_search else symbols)
-if coin_options:
-    selected_coin=st.selectbox('همه ارزهای USDT', coin_options, key='selected_coin_dropdown', help='تمام جفت‌های USDT موجود در Universe')
-    if 'selected_list' not in st.session_state:
-        st.session_state.selected_list=[]
-    if st.button('➕ افزودن ارز به تحلیل', key='add_coin'):
-        if selected_coin not in st.session_state.selected_list and len(st.session_state.selected_list)<5:
-            st.session_state.selected_list.append(selected_coin)
-    if st.session_state.get('selected_list'):
-        st.caption('ارزهای انتخاب‌شده: ' + ' | '.join(st.session_state.selected_list))
-        if st.button('پاک کردن انتخاب‌ها', key='clear_coins'):
-            st.session_state.selected_list=[]
-
 if st.button('اسکن کل بازار',type='primary',use_container_width=True):
     df=scan_all(tuple(filtered),tf,capital,risk)
     st.session_state['scan_df']=df
@@ -290,47 +323,53 @@ if 'scan_df' in st.session_state:
     c1,c2,c3,c4,c5=st.columns(5)
     c1.metric('کل بازار',total); c2.metric('بررسی‌شده',analyzed); c3.metric('داده ناقص/خطا',nodata); c4.metric('LONG',longs); c5.metric('SHORT',shorts)
 
-    # Detailed analysis uses the full-market dropdown above.
-    selected=st.session_state.get('selected_coin_dropdown', coin_options[0] if coin_options else symbols[0])
-    matched=df[df.symbol==selected]
-    if not matched.empty and matched.iloc[0].get('status')=='OK':
-        row=matched.iloc[0].to_dict()
-    else:
-        # If the selected coin was not part of the current scan result, analyze it on demand.
-        row=analyze(selected,tf,capital,risk)
-    plan=detailed_plan(selected,tf,row)
-    if plan:
-        st.subheader(f'تحلیل کامل {selected}')
-        m=plan['t24'] or {}
-        trend_txt=row.get('regime','رنج')
-        st.markdown(f"**روند کوتاه‌مدت:** {'🟢 صعودی' if trend_txt=='صعودی' else '🔴 نزولی' if trend_txt=='نزولی' else '🟡 رنج'}")
-        a,b,c,d,e=st.columns(5)
-        a.metric('قیمت فعلی',fmt(plan['price']))
-        b.metric('رشد 24H',fmt_pct(m.get('change24',row.get('momentum',0))))
-        c.metric('سقف 24H',fmt(m.get('high24',0)))
-        d.metric('کف 24H',fmt(m.get('low24',0)))
-        e.metric('حجم 24H',f"${m.get('volume24',0)/1e6:.2f}M" if m.get('volume24') else '-')
-        st.markdown('**مقاومت‌ها**')
-        st.write(' • '.join('$'+fmt(x) for x in plan['resistances']) if plan['resistances'] else 'سطح مقاومت کافی شناسایی نشد')
-        st.markdown('**حمایت‌ها**')
-        st.write(' • '.join('$'+fmt(x) for x in plan['supports']) if plan['supports'] else 'سطح حمایت کافی شناسایی نشد')
-        st.markdown('### پوزیشن پیشنهادی من')
-        pos=st.columns(2)
-        with pos[0]:
-            st.markdown(f"**نوع:** {'Long / خرید' if row.get('direction')=='LONG' else 'Short / فروش' if row.get('direction')=='SHORT' else 'WAIT / صبر'}")
-            se=plan['safe_entry']
-            if isinstance(se,tuple): st.write(f"**ورود کم‌ریسک:** ${fmt(se[0])} — ${fmt(se[1])}")
-            else: st.write(f"**ورود کم‌ریسک:** ${fmt(se)}")
-            st.write(f"**ورود تهاجمی:** ${fmt(plan['aggressive_entry'])}")
-            st.write(f"**Stop Loss:** ${fmt(plan['sl'])}")
-        with pos[1]:
-            for i,x in enumerate(plan['tps'],1): st.write(f"**Target {i}:** ${fmt(x)}")
-            st.write(f"**احتمال موفقیت تخمینی:** {plan['estimated_success']:.0f}%")
-            st.write(f"**چشم‌انداز سناریویی:** {plan['outlook']:+.1f}%")
-            st.write(f"**تصمیم فعلی:** **{plan['decision']}**")
-        st.info(plan['scenario'])
-        st.warning(plan['downside'])
-        st.caption('احتمال موفقیت و چشم‌انداز، برآورد الگوریتمی بر اساس داده بازار هستند و تضمین نتیجه معامله نیستند.')
+    # Detailed analysis card: follows the structure requested by the reference screenshots.
+    ok_symbols=df.loc[df.status=='OK','symbol'].dropna().astype(str).tolist()
+    if ok_symbols:
+        default_symbol=(tradable.sort_values(['confidence','score'],ascending=False).iloc[0]['symbol'] if not tradable.empty else ok_symbols[0])
+        choices=[default_symbol]+[x for x in sorted(ok_symbols) if x!=default_symbol]
+        selected=st.selectbox('تحلیل کامل ارز',choices,index=0)
+        row=df[df.symbol==selected].iloc[0].to_dict()
+        plan=detailed_plan(selected,tf,row)
+        if plan:
+            st.subheader(f'تحلیل کامل {selected}')
+            m=plan['t24'] or {}
+            trend_txt=row.get('regime','رنج')
+            st.markdown(f"**روند کوتاه‌مدت:** {'🟢 صعودی' if trend_txt=='صعودی' else '🔴 نزولی' if trend_txt=='نزولی' else '🟡 رنج'}")
+            a,b,c,d,e=st.columns(5)
+            a.metric('قیمت فعلی',fmt(plan['price']))
+            b.metric('رشد 24H',fmt_pct(m.get('change24',row.get('momentum',0))))
+            c.metric('سقف 24H',fmt(m.get('high24',0)))
+            d.metric('کف 24H',fmt(m.get('low24',0)))
+            e.metric('حجم 24H',f"${m.get('volume24',0)/1e6:.2f}M" if m.get('volume24') else '-')
+            st.markdown('**مقاومت‌ها**')
+            st.write(' • '.join('$'+fmt(x) for x in plan['resistances']) if plan['resistances'] else 'سطح مقاومت کافی شناسایی نشد')
+            st.markdown('**حمایت‌ها**')
+            st.write(' • '.join('$'+fmt(x) for x in plan['supports']) if plan['supports'] else 'سطح حمایت کافی شناسایی نشد')
+            st.markdown('**فیبوناچی — دخیل در تحلیل**')
+            fib=plan['fib']
+            fr=' • '.join(f'{k}: ${fmt(v)}' for k,v in fib['retracement'].items())
+            fe=' • '.join(f'{k}: ${fmt(v)}' for k,v in fib['extensions'].items())
+            st.write(f"سوئینگ: {fib['direction']} | نزدیک‌ترین سطح: {fib['nearest_name']} (${fmt(fib['nearest'])}) | فاصله: {fib['distance_pct']:.2f}%")
+            st.caption(f"Retracement: {fr}")
+            st.caption(f"Extensions: {fe}")
+            st.markdown('### پوزیشن پیشنهادی من')
+            pos=st.columns(2)
+            with pos[0]:
+                st.markdown(f"**نوع:** {'Long / خرید' if row.get('direction')=='LONG' else 'Short / فروش' if row.get('direction')=='SHORT' else 'WAIT / صبر'}")
+                se=plan['safe_entry']
+                if isinstance(se,tuple): st.write(f"**ورود کم‌ریسک:** ${fmt(se[0])} — ${fmt(se[1])}")
+                else: st.write(f"**ورود کم‌ریسک:** ${fmt(se)}")
+                st.write(f"**ورود تهاجمی:** ${fmt(plan['aggressive_entry'])}")
+                st.write(f"**Stop Loss:** ${fmt(plan['sl'])}")
+            with pos[1]:
+                for i,x in enumerate(plan['tps'],1): st.write(f"**Target {i}:** ${fmt(x)}")
+                st.write(f"**احتمال موفقیت تخمینی:** {plan['estimated_success']:.0f}%")
+                st.write(f"**چشم‌انداز سناریویی:** {plan['outlook']:+.1f}%")
+                st.write(f"**تصمیم فعلی:** **{plan['decision']}**")
+            st.info(plan['scenario'])
+            st.warning(plan['downside'])
+            st.caption('احتمال موفقیت و چشم‌انداز، برآورد الگوریتمی بر اساس داده بازار هستند و تضمین نتیجه معامله نیستند.')
     st.subheader('فرصت‌های معاملاتی')
     if tradable.empty: st.warning('در کل بازار موقعیت با شرایط فعلی پیدا نشد؛ اما همه ارزها اسکن شده‌اند و جدول پایین وضعیت کامل را نشان می‌دهد.')
     else:

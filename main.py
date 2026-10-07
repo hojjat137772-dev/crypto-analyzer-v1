@@ -145,8 +145,108 @@ def fmt(x):
         return f'{x:.10f}'.rstrip('0').rstrip('.')
     except: return '-'
 
+# ---------- DETAILED TRADE PLAN ----------
+def market24(symbol):
+    s=norm(symbol)
+    try:
+        d=get_json(f'{BINANCE}/api/v3/ticker/24hr',{'symbol':s},timeout=6)
+        if isinstance(d,dict) and d.get('lastPrice'):
+            return {'price':float(d['lastPrice']),'change24':float(d.get('priceChangePercent',0)),'high24':float(d.get('highPrice',0)),'low24':float(d.get('lowPrice',0)),'volume24':float(d.get('quoteVolume',0)),'source':'Binance'}
+    except Exception: pass
+    try:
+        inst=s[:-4]+'-USDT'
+        d=get_json(f'{OKX}/api/v5/market/ticker',{'instId':inst},timeout=6)
+        row=(d.get('data') or [None])[0]
+        if row:
+            last=float(row[1]); open24=float(row[14]) if row[14] else last
+            return {'price':last,'change24':(last/open24-1)*100 if open24 else 0,'high24':float(row[6]),'low24':float(row[5]),'volume24':float(row[7]) if row[7] else 0,'source':'OKX'}
+    except Exception: pass
+    return None
+
+def levels(df, n=4):
+    c=df.close
+    hi=df.high.rolling(5,center=True).max()
+    lo=df.low.rolling(5,center=True).min()
+    highs=sorted([float(x) for x in hi.dropna()[hi.dropna()==df.high[hi.dropna().index]].tail(120).tolist() if np.isfinite(x)], reverse=True)
+    lows=sorted([float(x) for x in lo.dropna()[lo.dropna()==df.low[lo.dropna().index]].tail(120).tolist() if np.isfinite(x)])
+    price=float(c.iloc[-1])
+    def unique_near(vals, side, count):
+        out=[]
+        for x in vals:
+            if side=='above' and x<=price*1.002: continue
+            if side=='below' and x>=price*.998: continue
+            if not out or abs(x-out[-1])/max(abs(out[-1]),1e-12)>.012: out.append(x)
+            if len(out)>=count: break
+        return out
+    rs=unique_near(highs,'above',n)
+    ss=unique_near(list(reversed(lows)),'below',n)
+    # Fill with recent extrema if local pivots are sparse.
+    for x in sorted([float(df.high.tail(60).max()), float(df.high.tail(120).max())]):
+        if x>price*1.002 and all(abs(x-y)/x>.012 for y in rs): rs.append(x)
+    for x in sorted([float(df.low.tail(60).min()), float(df.low.tail(120).min())], reverse=True):
+        if x<price*.998 and all(abs(x-y)/max(x,1e-12)>.012 for y in ss): ss.append(x)
+    return sorted(rs)[:n], sorted(ss, reverse=True)[:n]
+
+def fmt_pct(x):
+    try: return f'{float(x):+.2f}%'
+    except: return '-'
+
+def detailed_plan(symbol, tf, row):
+    df,_=candles(symbol,TF[tf])
+    if df is None or len(df)<80: return None
+    t24=market24(symbol)
+    price=float(df.close.iloc[-1])
+    if t24 and t24.get('price'): price=t24['price']
+    rs,ss=levels(df,4)
+    av=float(atr(df).iloc[-1]); e20=float(ema(df.close,20).iloc[-1]); e50=float(ema(df.close,50).iloc[-1]); rv=float(rsi(df.close).iloc[-1]); mm,ms,_=macd(df.close); mom=float((price/df.close.iloc[-6]-1)*100); vol=float(df.volume.iloc[-1]/max(df.volume.rolling(20).mean().iloc[-1],1e-12))
+    direction=row.get('direction','WAIT')
+    if direction=='LONG':
+        sl=float(row.get('sl',max((ss[-1] if ss else price-av*2),price-av*2)))
+        risk=abs(price-sl)
+        resistance=[x for x in rs if x>price]
+        tps=(resistance[:3] if len(resistance)>=3 else [price+1.5*risk,price+2.5*risk,price+3.5*risk])
+        low_entry=max(ss[0] if ss else price-av, price-1.2*av)
+        high_entry=min(e20 if e20<price else price, price)
+        safe=(min(low_entry,price), max(high_entry,price)) if low_entry<price else (price,price)
+        aggressive=(resistance[0]*1.003 if resistance else price+0.8*av)
+        decision='خرید / تأیید' if price>e20 and mom>0 and vol>=1.05 else 'صبر برای پولبک / تأیید شکست'
+        scenario='اگر مقاومت نزدیک شکسته و بالای آن تثبیت شود، سناریوی صعودی فعال‌تر می‌شود.'
+        downside='از دست رفتن حمایت نزدیک و شکست SL سناریوی صعودی را باطل می‌کند.'
+    elif direction=='SHORT':
+        sl=float(row.get('sl',min((rs[0] if rs else price+av*2),price+av*2)))
+        risk=abs(sl-price)
+        support=[x for x in ss if x<price]
+        tps=(support[:3] if len(support)>=3 else [price-1.5*risk,price-2.5*risk,price-3.5*risk])
+        low_entry=max(price, e20 if e20>price else price)
+        high_entry=min(rs[0] if rs else price+av, price+1.2*av)
+        safe=(price, max(low_entry,price))
+        aggressive=(support[0]*0.997 if support else price-0.8*av)
+        decision='فروش / تأیید' if price<e20 and mom<0 and vol>=1.05 else 'صبر برای پولبک / تأیید شکست'
+        scenario='اگر حمایت نزدیک شکسته و زیر آن تثبیت شود، سناریوی نزولی فعال‌تر می‌شود.'
+        downside='بازپس‌گیری مقاومت و شکست SL سناریوی نزولی را باطل می‌کند.'
+    else:
+        # WAIT still gets a complete conditional plan.
+        nearest_r=rs[0] if rs else price+av
+        nearest_s=ss[0] if ss else price-av
+        bullish_entry=nearest_r*1.003
+        bearish_entry=nearest_s*0.997
+        risk=abs(price-nearest_s)
+        tps=[x for x in rs[:3]] or [price+1.5*max(av,price*.01),price+2.5*max(av,price*.01),price+3.5*max(av,price*.01)]
+        sl=nearest_s
+        safe=(nearest_s, price)
+        aggressive=bullish_entry
+        decision='صبر / تأیید شکست'
+        scenario=f'عبور و تثبیت بالای {fmt(bullish_entry)} سناریوی صعودی را فعال می‌کند.'
+        downside=f'شکست {fmt(bearish_entry)} به پایین، سناریوی نزولی را تقویت می‌کند.'
+    # Heuristic scenario confidence, explicitly treated as an estimate.
+    base=float(row.get('confidence',0) or 0)
+    quality=(10 if vol>=1.15 else 0)+(8 if abs(mom)>=1 else 0)+(5 if 35<=rv<=70 else 0)
+    est=float(np.clip(base+quality-(8 if len(rs)<2 or len(ss)<2 else 0),0,95))
+    outlook=float(np.clip(mom*1.6 + (4 if direction=='LONG' else -4 if direction=='SHORT' else 0),-20,20))
+    return {'price':price,'t24':t24,'supports':ss,'resistances':rs,'rsi':rv,'momentum':mom,'volume':vol,'e20':e20,'e50':e50,'sl':sl,'tps':tps[:3],'safe_entry':safe,'aggressive_entry':aggressive,'decision':decision,'scenario':scenario,'downside':downside,'estimated_success':est,'outlook':outlook,'risk':risk}
+
 # ---------- UI ----------
-st.title('₿ Crypto Analyzer Pro V6.3')
+st.title('₿ Crypto Analyzer Pro V6.4')
 st.caption('Whole-Market Scanner — بدون سقف مصنوعی تعداد ارز')
 symbols,source=universe()
 if not symbols: st.error('فهرست بازار دریافت نشد.'); st.stop()
@@ -173,6 +273,47 @@ if 'scan_df' in st.session_state:
     longs=int((tradable.direction=='LONG').sum()); shorts=int((tradable.direction=='SHORT').sum())
     c1,c2,c3,c4,c5=st.columns(5)
     c1.metric('کل بازار',total); c2.metric('بررسی‌شده',analyzed); c3.metric('داده ناقص/خطا',nodata); c4.metric('LONG',longs); c5.metric('SHORT',shorts)
+
+    # Detailed analysis card: follows the structure requested by the reference screenshots.
+    ok_symbols=df.loc[df.status=='OK','symbol'].dropna().astype(str).tolist()
+    if ok_symbols:
+        default_symbol=(tradable.sort_values(['confidence','score'],ascending=False).iloc[0]['symbol'] if not tradable.empty else ok_symbols[0])
+        choices=[default_symbol]+[x for x in sorted(ok_symbols) if x!=default_symbol]
+        selected=st.selectbox('تحلیل کامل ارز',choices,index=0)
+        row=df[df.symbol==selected].iloc[0].to_dict()
+        plan=detailed_plan(selected,tf,row)
+        if plan:
+            st.subheader(f'تحلیل کامل {selected}')
+            m=plan['t24'] or {}
+            trend_txt=row.get('regime','رنج')
+            st.markdown(f"**روند کوتاه‌مدت:** {'🟢 صعودی' if trend_txt=='صعودی' else '🔴 نزولی' if trend_txt=='نزولی' else '🟡 رنج'}")
+            a,b,c,d,e=st.columns(5)
+            a.metric('قیمت فعلی',fmt(plan['price']))
+            b.metric('رشد 24H',fmt_pct(m.get('change24',row.get('momentum',0))))
+            c.metric('سقف 24H',fmt(m.get('high24',0)))
+            d.metric('کف 24H',fmt(m.get('low24',0)))
+            e.metric('حجم 24H',f"${m.get('volume24',0)/1e6:.2f}M" if m.get('volume24') else '-')
+            st.markdown('**مقاومت‌ها**')
+            st.write(' • '.join('$'+fmt(x) for x in plan['resistances']) if plan['resistances'] else 'سطح مقاومت کافی شناسایی نشد')
+            st.markdown('**حمایت‌ها**')
+            st.write(' • '.join('$'+fmt(x) for x in plan['supports']) if plan['supports'] else 'سطح حمایت کافی شناسایی نشد')
+            st.markdown('### پوزیشن پیشنهادی من')
+            pos=st.columns(2)
+            with pos[0]:
+                st.markdown(f"**نوع:** {'Long / خرید' if row.get('direction')=='LONG' else 'Short / فروش' if row.get('direction')=='SHORT' else 'WAIT / صبر'}")
+                se=plan['safe_entry']
+                if isinstance(se,tuple): st.write(f"**ورود کم‌ریسک:** ${fmt(se[0])} — ${fmt(se[1])}")
+                else: st.write(f"**ورود کم‌ریسک:** ${fmt(se)}")
+                st.write(f"**ورود تهاجمی:** ${fmt(plan['aggressive_entry'])}")
+                st.write(f"**Stop Loss:** ${fmt(plan['sl'])}")
+            with pos[1]:
+                for i,x in enumerate(plan['tps'],1): st.write(f"**Target {i}:** ${fmt(x)}")
+                st.write(f"**احتمال موفقیت تخمینی:** {plan['estimated_success']:.0f}%")
+                st.write(f"**چشم‌انداز سناریویی:** {plan['outlook']:+.1f}%")
+                st.write(f"**تصمیم فعلی:** **{plan['decision']}**")
+            st.info(plan['scenario'])
+            st.warning(plan['downside'])
+            st.caption('احتمال موفقیت و چشم‌انداز، برآورد الگوریتمی بر اساس داده بازار هستند و تضمین نتیجه معامله نیستند.')
     st.subheader('فرصت‌های معاملاتی')
     if tradable.empty: st.warning('در کل بازار موقعیت با شرایط فعلی پیدا نشد؛ اما همه ارزها اسکن شده‌اند و جدول پایین وضعیت کامل را نشان می‌دهد.')
     else:
@@ -200,4 +341,4 @@ if 'scan_df' in st.session_state:
     else:
         p=pump[['symbol','pump_score','confidence','momentum','volume','setup','direction','price']].copy(); p.columns=['ارز','Pump Score','Confidence','Momentum %','Volume x','ستاپ','جهت','قیمت']; p['قیمت']=p['قیمت'].map(fmt); p['Confidence']=p['Confidence'].map(lambda x:f'{x:.1f}%'); st.dataframe(p,use_container_width=True,hide_index=True)
 
-st.caption('V6.3: کل Universe اسکن می‌شود؛ WAIT و داده ناقص حذف نمی‌شوند. «قابل معامله» فقط یک لایه فیلتر نهایی روی نتایج کامل است.')
+st.caption('V6.4: تحلیل سناریومحور، حمایت/مقاومت، دو نوع ورود، اهداف و تصمیم نهایی؛ کل Universe اسکن می‌شود.')

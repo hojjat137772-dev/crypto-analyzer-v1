@@ -438,6 +438,116 @@ def detailed_plan(symbol, tf, row):
     outlook=float(np.clip(mom*1.6 + (4 if direction=='LONG' else -4 if direction=='SHORT' else 0),-20,20))
     return {'price':price,'t24':t24,'supports':ss,'resistances':rs,'rsi':rv,'candle':cs,'momentum':mom,'volume':vol,'e20':e20,'e50':e50,'sl':sl,'tps':tps[:3],'safe_entry':safe,'aggressive_entry':aggressive,'decision':decision,'scenario':scenario,'downside':downside,'estimated_success':est,'outlook':outlook,'risk':risk,'fib':fib,'fib_bonus':fib_bonus,'fib_alignment':fib_alignment,'classic':cp}
 
+
+# ---------- LEVERAGED TRADING MODULE (ADDITIVE / DOES NOT CHANGE CORE ENGINE) ----------
+def structure_hh_hl(df, lookback=40):
+    x=df.tail(lookback).reset_index(drop=True)
+    highs=[]; lows=[]
+    for i in range(2,len(x)-2):
+        if x.high.iloc[i] >= x.high.iloc[i-2:i+3].max(): highs.append(float(x.high.iloc[i]))
+        if x.low.iloc[i] <= x.low.iloc[i-2:i+3].min(): lows.append(float(x.low.iloc[i]))
+    if len(highs)<2 or len(lows)<2: return 'نامشخص'
+    hh=highs[-1]>highs[-2]; hl=lows[-1]>lows[-2]
+    lh=highs[-1]<highs[-2]; ll=lows[-1]<lows[-2]
+    if hh and hl: return 'HH / HL'
+    if lh and ll: return 'LH / LL'
+    return 'مختلط'
+
+def leverage_module(symbol, main_fib=None):
+    """Strict multi-timeframe leveraged setup: 4H direction -> 1H confirmation -> 15M entry -> 5M trigger."""
+    frames={}
+    for name in ['4H','1H','15m','5m']:
+        d,_=candles(symbol,TF[name])
+        if d is not None and len(d)>=80: frames[name]=d
+    required=['4H','1H','15m','5m']
+    if any(x not in frames for x in required):
+        return {'status':'NO_DATA','reason':'برای معامله اهرمی هر چهار تایم‌فریم 4H / 1H / 15M / 5M لازم است.'}
+
+    d4,d1,d15,d5=[frames[x] for x in required]
+    price=float(d5.close.iloc[-1])
+    e20_4,e50_4,e200_4=[ema(d4.close,n).iloc[-1] for n in (20,50,200)]
+    e20_1,e50_1=[ema(d1.close,n).iloc[-1] for n in (20,50)]
+    r1=float(rsi(d1.close).iloc[-1]); m1,s1,_=macd(d1.close)
+    vol1=float(d1.volume.iloc[-1]/max(d1.volume.rolling(20).mean().iloc[-1],1e-12))
+    p4=float(d4.close.iloc[-1])
+    trend4='صعودی' if p4>e20_4 and e20_4>e50_4>e200_4 else 'نزولی' if p4<e20_4 and e20_4<e50_4<e200_4 else 'خنثی'
+    struct1=structure_hh_hl(d1)
+    ema1=(e20_1>e50_1)
+    macd1=(m1.iloc[-1]>s1.iloc[-1])
+    volume1=vol1>=1.05
+
+    # 15M entry area / price action
+    r15,s15=levels(d15,3)
+    c15=candle_decision(d15)
+    p15=pa(d15)
+    breakout_up,breakout_down,pull_long,pull_short,rh15,rl15=p15
+    pa_long=bool(breakout_up or pull_long or c15['combined_score']>0)
+    pa_short=bool(breakout_down or pull_short or c15['combined_score']<0)
+    near_support=bool(s15 and abs(price-s15[0])/max(price,1e-12)<=0.012)
+    near_resistance=bool(r15 and abs(price-r15[0])/max(price,1e-12)<=0.012)
+
+    # 5M trigger: latest short-term breakout + volume + entry candle confirmation.
+    c5=candle_decision(d5)
+    last_hi=float(d5.high.tail(12).iloc[:-1].max()); last_lo=float(d5.low.tail(12).iloc[:-1].min())
+    vol5=float(d5.volume.iloc[-1]/max(d5.volume.rolling(20).mean().iloc[-1],1e-12))
+    trigger_long=price>last_hi*1.001 and vol5>=1.10 and c5['combined_score']>0
+    trigger_short=price<last_lo*0.999 and vol5>=1.10 and c5['combined_score']<0
+
+    # Risk plan is always >= 2R for an actionable setup; otherwise no leveraged entry.
+    av15=float(atr(d15).iloc[-1]);
+    if trend4=='صعودی':
+        sl=min((s15[0] if s15 else price-av15),price-av15*0.8)
+        risk=price-sl
+        tp=price+2*risk
+        rr=(tp-price)/risk if risk>0 else 0
+    elif trend4=='نزولی':
+        sl=max((r15[0] if r15 else price+av15),price+av15*0.8)
+        risk=sl-price
+        tp=price-2*risk
+        rr=(price-tp)/risk if risk>0 else 0
+    else:
+        sl=tp=rr=0
+
+    # Strict gate: higher timeframe direction is mandatory; 1H confirms; 15M gives setup; 5M fires trigger.
+    setup15=False
+    if trend4=='خنثی':
+        decision='NO TRADE — 4H خنثی'
+        side='NONE'
+    elif trend4=='صعودی':
+        confirm1=(struct1=='HH / HL' and ema1 and macd1 and volume1)
+        setup15=bool(near_support or pull_long or breakout_up) and pa_long
+        side='LONG'
+        decision='LONG' if confirm1 and setup15 and trigger_long and rr>=2 else 'WAIT LONG'
+    else:
+        confirm1=(struct1=='LH / LL' and (not ema1) and (not macd1) and volume1)
+        setup15=bool(near_resistance or pull_short or breakout_down) and pa_short
+        side='SHORT'
+        decision='SHORT' if confirm1 and setup15 and trigger_short and rr>=2 else 'WAIT SHORT'
+
+    # Main-section Fibonacci levels are shown exactly as calculated by detailed_plan.
+    fib_display=main_fib if main_fib else fibonacci(d15,120)
+    fib_retr=fib_display.get('retracement',{})
+    fib_ext=fib_display.get('extensions',{})
+    relevant=[]
+    for name,val in {**fib_retr,**fib_ext}.items():
+        if np.isfinite(float(val)):
+            relevant.append((name,float(val),abs(price-float(val))/max(price,1e-12)*100))
+    relevant=sorted(relevant,key=lambda x:x[2])[:6]
+    confidence=0
+    if trend4!='خنثی': confidence+=25
+    if (trend4=='صعودی' and struct1=='HH / HL') or (trend4=='نزولی' and struct1=='LH / LL'): confidence+=20
+    if (trend4=='صعودی' and ema1 and macd1) or (trend4=='نزولی' and not ema1 and not macd1): confidence+=20
+    if volume1: confidence+=10
+    if (trend4=='صعودی' and setup15) or (trend4=='نزولی' and setup15): confidence+=15
+    if (trigger_long if side=='LONG' else trigger_short if side=='SHORT' else False): confidence+=10
+    return {
+        'status':'OK','trend4':trend4,'structure1':struct1,'ema1':ema1,'macd1':macd1,'volume1':volume1,'volume5':vol5,
+        'near_support':near_support,'near_resistance':near_resistance,'setup15':setup15,'trigger_long':trigger_long,'trigger_short':trigger_short,
+        'last_hi5':last_hi,'last_lo5':last_lo,'entry':price,'sl':sl,'tp':tp,'rr':rr,'side':side,'decision':decision,'confidence':min(confidence,100),
+        'fib':fib_display,'fib_near':relevant,'rsi1':r1,'candle5':c5,'atr15':av15,
+        'checklist':{'4H':trend4,'1H structure':struct1,'1H EMA': 'تأیید' if (trend4=='صعودی' and ema1) or (trend4=='نزولی' and not ema1) else 'عدم تأیید','1H MACD':'تأیید' if (trend4=='صعودی' and macd1) or (trend4=='نزولی' and not macd1) else 'عدم تأیید','1H Volume':'تأیید' if volume1 else 'عدم تأیید','15M setup':'تأیید' if setup15 else 'عدم تأیید','5M trigger':'تأیید' if ((side=='LONG' and trigger_long) or (side=='SHORT' and trigger_short)) else 'منتظر','R:R':f'{rr:.2f}'}
+    }
+
 # ---------- UI ----------
 # V6.8 compact modern dashboard UI — analysis engine unchanged.
 st.set_page_config(page_title='Crypto Analyzer Pro V6.8', page_icon='₿', layout='wide', initial_sidebar_state='collapsed')
@@ -580,6 +690,47 @@ if 'scan_df' in st.session_state:
                 st.markdown('</div>',unsafe_allow_html=True)
 
             st.markdown(f"<div class='card'><b>تصمیم نهایی:</b> <span class='badge {badge}'>{plan['decision']}</span><div class='mini' style='margin-top:8px'>{plan['scenario']}</div><div class='mini' style='margin-top:4px;color:#ff9bb0'>{plan['downside']}</div></div>",unsafe_allow_html=True)
+
+
+            # ---------- LEVERAGED TRADING CARD ----------
+            lev=leverage_module(selected, plan.get('fib'))
+            st.markdown("<div class='card'><div class='sectiontitle'>⚡ سیستم پیشنهادی معاملات اهرمی</div><div class='mini'>4H جهت اصلی → 1H تأیید → 15M نقطه ورود → 5M ماشه ورود</div>",unsafe_allow_html=True)
+            if lev.get('status')!='OK':
+                st.warning(lev.get('reason','داده کافی برای سیستم اهرمی وجود ندارد.'))
+            else:
+                lc=st.columns(8)
+                lcards=[
+                    ('4H',lev['trend4'],'جهت اصلی','green' if lev['trend4']=='صعودی' else 'red' if lev['trend4']=='نزولی' else 'yellow'),
+                    ('1H Structure',lev['structure1'],'HH/HL یا LH/LL','green' if lev['structure1'] in ('HH / HL','LH / LL') else 'yellow'),
+                    ('EMA',lev['checklist']['1H EMA'],'1H','green' if lev['checklist']['1H EMA']=='تأیید' else 'red'),
+                    ('MACD',lev['checklist']['1H MACD'],'1H','green' if lev['checklist']['1H MACD']=='تأیید' else 'red'),
+                    ('Volume',lev['volume5'].__format__('.2f')+'x','5M','green' if lev['volume5']>=1.10 else 'yellow'),
+                    ('15M Setup',lev['checklist']['15M setup'],'ورود','green' if lev['setup15'] else 'yellow'),
+                    ('5M Trigger',lev['checklist']['5M trigger'],'ماشه','green' if ((lev['side']=='LONG' and lev['trigger_long']) or (lev['side']=='SHORT' and lev['trigger_short'])) else 'yellow'),
+                    ('R:R',f"1:{lev['rr']:.1f}" if lev['rr'] else '—','حداقل 1:2','green' if lev['rr']>=2 else 'red')]
+                for c,(lab,val,note,cl) in zip(lc,lcards):
+                    with c: st.markdown(f"<div class='card metriccard'><div class='metriclabel'><span>{lab}</span></div><div class='metricvalue {cl}' style='font-size:16px'>{val}</div><div class='metricnote'>{note}</div></div>",unsafe_allow_html=True)
+
+                lev_left,lev_mid,lev_right=st.columns([1,1.25,1])
+                with lev_left:
+                    st.markdown("<div class='card'><div class='sectiontitle'>چک‌لیست ورود</div>",unsafe_allow_html=True)
+                    for k,v in lev['checklist'].items():
+                        cl='green' if v in ('تأیید','صعودی','نزولی') or (k=='R:R' and lev['rr']>=2) else 'yellow' if v in ('منتظر','خنثی') else 'red'
+                        st.markdown(f"<div class='planrow'><span>{k}</span><b class='{cl}'>{v}</b></div>",unsafe_allow_html=True)
+                    st.markdown('</div>',unsafe_allow_html=True)
+                with lev_mid:
+                    st.markdown("<div class='card'><div class='sectiontitle'>Fibonacci — سطوح استفاده‌شده در بخش اصلی</div>",unsafe_allow_html=True)
+                    st.markdown(f"<div class='mini'>جهت سوئینگ: <b>{lev['fib'].get('direction','-')}</b> • نزدیک‌ترین سطح: <b>{lev['fib'].get('nearest_name','-')}</b> در ${fmt(lev['fib'].get('nearest',0))}</div>",unsafe_allow_html=True)
+                    for name,val,dist in lev['fib_near']:
+                        st.markdown(f"<div class='level'><span>{name}</span><b>${fmt(val)}</b><span class='mini'>{dist:.2f}%</span></div>",unsafe_allow_html=True)
+                    st.markdown('</div>',unsafe_allow_html=True)
+                with lev_right:
+                    st.markdown("<div class='card'><div class='sectiontitle'>تصمیم اهرمی</div>",unsafe_allow_html=True)
+                    d=lev['decision']; dcl='green' if d in ('LONG','SHORT') else 'yellow' if d.startswith('WAIT') else 'red'
+                    st.markdown(f"<div class='metricvalue {dcl}' style='font-size:24px'>{d}</div>",unsafe_allow_html=True)
+                    st.markdown(f"<div class='planrow'><span>جهت</span><b>{lev['side']}</b></div><div class='planrow'><span>Confidence</span><b>{lev['confidence']}%</b></div><div class='planrow'><span>Entry</span><b>${fmt(lev['entry'])}</b></div><div class='planrow'><span>SL</span><b>${fmt(lev['sl'])}</b></div><div class='planrow'><span>TP 2R</span><b class='green'>${fmt(lev['tp'])}</b></div>",unsafe_allow_html=True)
+                    st.markdown('</div>',unsafe_allow_html=True)
+                st.markdown('</div>',unsafe_allow_html=True)
 
     st.markdown("<div class='card'><div class='sectiontitle'>فرصت‌های معاملاتی</div>",unsafe_allow_html=True)
     if tradable.empty:

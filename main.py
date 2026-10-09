@@ -97,14 +97,26 @@ def candle_features(df):
     shooting=(upper >= body*2) & (lower <= body*0.8) & (body/rng <= 0.45)
     bull_engulf=(c>o) & (c.shift(1)<o.shift(1)) & (c>=o.shift(1)) & (o<=c.shift(1))
     bear_engulf=(c<o) & (c.shift(1)>o.shift(1)) & (o>=c.shift(1)) & (c<=o.shift(1))
+    is_hammer=bool(hammer.iloc[-1]); is_shooting=bool(shooting.iloc[-1])
+    is_bull_engulf=bool(bull_engulf.iloc[-1]); is_bear_engulf=bool(bear_engulf.iloc[-1])
+    is_doji=bool(doji.iloc[-1])
+    if is_bull_engulf: pattern='پوشای صعودی'
+    elif is_bear_engulf: pattern='پوشای نزولی'
+    elif is_hammer: pattern='چکش صعودی احتمالی'
+    elif is_shooting: pattern='ستاره ثاقب نزولی احتمالی'
+    elif is_doji: pattern='دوجی؛ بلاتکلیفی'
+    else: pattern='الگوی کندلی تأییدشده‌ای نیست'
+    pattern_score=2 if (is_bull_engulf or is_hammer) else -2 if (is_bear_engulf or is_shooting) else 0
     return {
-        'bullish': bool((hammer | bull_engulf).iloc[-1]),
-        'bearish': bool((shooting | bear_engulf).iloc[-1]),
-        'doji': bool(doji.iloc[-1]),
-        'hammer': bool(hammer.iloc[-1]),
-        'shooting': bool(shooting.iloc[-1]),
-        'bull_engulf': bool(bull_engulf.iloc[-1]),
-        'bear_engulf': bool(bear_engulf.iloc[-1]),
+        'bullish': bool(is_hammer or is_bull_engulf),
+        'bearish': bool(is_shooting or is_bear_engulf),
+        'doji': is_doji,
+        'hammer': is_hammer,
+        'shooting': is_shooting,
+        'bull_engulf': is_bull_engulf,
+        'bear_engulf': is_bear_engulf,
+        'pattern_name': pattern,
+        'pattern_score': pattern_score,
         'body_pct': float((body.iloc[-1]/rng.iloc[-1])*100) if pd.notna(rng.iloc[-1]) else 0
     }
 
@@ -135,7 +147,7 @@ def candle_decision(df):
     ha_strong_bull=bool(ha.strong_bull.iloc[-1])
     ha_strong_bear=bool(ha.strong_bear.iloc[-1])
     # +2 strong, +1 ordinary; opposite candles subtract.
-    candle_score=(2 if cf['bullish'] else 0) - (2 if cf['bearish'] else 0)
+    candle_score=int(cf['pattern_score'])
     ha_score=(2 if ha_strong_bull else 0) - (2 if ha_strong_bear else 0)
     ha_score += 1 if ha_bull>=2 else -1 if ha_bear>=2 else 0
     return {
@@ -261,7 +273,7 @@ def analyze(symbol, entry_tf, capital, risk_pct):
     dollar_vol=float((df.close*df.volume).tail(20).mean()); liq=float(np.clip(50+math.log10(max(dollar_vol,1)/100000)*15,0,100))
     confirmations=max(lc,sc); confidence=float(np.clip(score*.72 + (confirmations/7)*28 - (12 if len(coverage)<3 else 0),0,100))
     pump=float((25 if vol>=1.8 else 15 if vol>=1.35 else 5 if vol>=1.1 else 0)+(25 if mom>=4 else 18 if mom>=2.5 else 10 if mom>=1 else 0)+(25 if bu else 12 if pl else 0)+(15 if 'صعودی' in ts[:2] else 0)+(10 if rv<72 else 0))
-    return {'symbol':symbol,'status':'OK','direction':direction,'trade':trade,'score':round(score,1),'confidence':round(confidence,1),'long_score':round(long_score,1),'short_score':round(short_score,1),'confirmations':confirmations,'coverage':len(coverage),'coverage_tfs':','.join(coverage),'price':price,'entry':entry,'sl':sl,'tp1':tp1,'tp2':tp2,'tp3':tp3,'rr':round(rr,2),'rsi':round(rv,1),'adx':round(ax,1),'momentum':round(mom,2),'volume':round(vol,2),'setup':'Breakout' if bu or bd else 'Pullback' if pl or ps else 'No setup','pump_score':round(pump,1),'liquidity':round(liq,1),'regime':'صعودی' if bull>bear else 'نزولی' if bear>bull else 'رنج','t15':trend(frames['15m']) if '15m' in frames else 'N/A','t1':trend(frames['1H']) if '1H' in frames else 'N/A','t4':trend(frames['4H']) if '4H' in frames else 'N/A','tD':trend(frames['1D']) if '1D' in frames else 'N/A','risk_money':capital*risk_pct/100,'qty':(capital*risk_pct/100)/abs(entry-sl) if abs(entry-sl)>0 else 0,'candle_signal':'صعودی' if cs['combined_score']>0 else 'نزولی' if cs['combined_score']<0 else 'خنثی','candle_score':cs['candle_score'],'ha_score':cs['ha_score'],'ha_bull':cs['ha_bull'],'ha_bear':cs['ha_bear'],'classic_pattern':cp['name'],'classic_type':cp['type'],'classic_score':cp['score'],'classic_confidence':cp['confidence'],'classic_breakout':cp['breakout']}
+    return {'symbol':symbol,'status':'OK','direction':direction,'trade':trade,'score':round(score,1),'confidence':round(confidence,1),'long_score':round(long_score,1),'short_score':round(short_score,1),'confirmations':confirmations,'coverage':len(coverage),'coverage_tfs':','.join(coverage),'price':price,'entry':entry,'sl':sl,'tp1':tp1,'tp2':tp2,'tp3':tp3,'rr':round(rr,2),'rsi':round(rv,1),'adx':round(ax,1),'momentum':round(mom,2),'volume':round(vol,2),'setup':'Breakout' if bu or bd else 'Pullback' if pl or ps else 'No setup','pump_score':round(pump,1),'liquidity':round(liq,1),'regime':'صعودی' if bull>bear else 'نزولی' if bear>bull else 'رنج','t15':trend(frames['15m']) if '15m' in frames else 'N/A','t1':trend(frames['1H']) if '1H' in frames else 'N/A','t4':trend(frames['4H']) if '4H' in frames else 'N/A','tD':trend(frames['1D']) if '1D' in frames else 'N/A','risk_money':capital*risk_pct/100,'qty':(capital*risk_pct/100)/abs(entry-sl) if abs(entry-sl)>0 else 0,'candle_signal':'صعودی' if cs['combined_score']>0 else 'نزولی' if cs['combined_score']<0 else 'خنثی','candle_pattern':cs['pattern_name'],'candle_score':cs['candle_score'],'ha_score':cs['ha_score'],'ha_bull':cs['ha_bull'],'ha_bear':cs['ha_bear'],'classic_pattern':cp['name'],'classic_type':cp['type'],'classic_score':cp['score'],'classic_confidence':cp['confidence'],'classic_breakout':cp['breakout']}
 
 # ---------- WHOLE MARKET SCANNER ----------
 @st.cache_data(ttl=90,show_spinner=False)
@@ -438,6 +450,33 @@ def detailed_plan(symbol, tf, row):
     outlook=float(np.clip(mom*1.6 + (4 if direction=='LONG' else -4 if direction=='SHORT' else 0),-20,20))
     return {'price':price,'t24':t24,'supports':ss,'resistances':rs,'rsi':rv,'candle':cs,'momentum':mom,'volume':vol,'e20':e20,'e50':e50,'sl':sl,'tps':tps[:3],'safe_entry':safe,'aggressive_entry':aggressive,'decision':decision,'scenario':scenario,'downside':downside,'estimated_success':est,'outlook':outlook,'risk':risk,'fib':fib,'fib_bonus':fib_bonus,'fib_alignment':fib_alignment,'classic':cp}
 
+
+# ---------- SHORT-TERM SCENARIOS (ADDITIVE) ----------
+def short_term_scenarios(symbol):
+    """Build conditional 1-6 hour scenarios from 1H context and 15M levels; not a guaranteed forecast."""
+    d15,_=candles(symbol,TF['15m']); d1,_=candles(symbol,TF['1H'])
+    if d15 is None or d1 is None or len(d15)<40 or len(d1)<40:
+        return {'status':'NO_DATA','reason':'برای سناریوی کوتاه‌مدت، داده کافی 15M و 1H در دسترس نیست.'}
+    price=float(d15.close.iloc[-1]); a=float(atr(d15).iloc[-1]);
+    if not np.isfinite(a) or a<=0: return {'status':'NO_DATA','reason':'محاسبه نوسان برای سناریوی کوتاه‌مدت ممکن نشد.'}
+    support=float(d15.low.tail(24).min()); resistance=float(d15.high.tail(24).max())
+    e20=float(ema(d1.close,20).iloc[-1]); e50=float(ema(d1.close,50).iloc[-1]); rv=float(rsi(d1.close).iloc[-1])
+    m,ms,_=macd(d1.close); macd_up=bool(m.iloc[-1]>ms.iloc[-1])
+    vol_ratio=float(d15.volume.iloc[-1]/max(float(d15.volume.rolling(20).mean().iloc[-1]),1e-12))
+    trend_up=price>e20 and e20>e50 and macd_up
+    trend_down=price<e20 and e20<e50 and not macd_up
+    # ATR buffers avoid treating tiny price touches as confirmed breakouts.
+    long_trigger=resistance+0.15*a; short_trigger=support-0.15*a
+    long_sl=min(support, price-1.0*a); short_sl=max(resistance, price+1.0*a)
+    long_risk=max(long_trigger-min(support,long_trigger-a),0.5*a)
+    short_risk=max(max(resistance,short_trigger+a)-short_trigger,0.5*a)
+    return {'status':'OK','price':price,'support':support,'resistance':resistance,'atr':a,'rsi1h':rv,'volume15':vol_ratio,
+      'trend_up':trend_up,'trend_down':trend_down,'macd_up':macd_up,'e20':e20,'e50':e50,
+      'long_trigger':long_trigger,'long_sl':long_trigger-long_risk,'long_tp1':long_trigger+long_risk,'long_tp2':long_trigger+2*long_risk,
+      'short_trigger':short_trigger,'short_sl':short_trigger+short_risk,'short_tp1':short_trigger-short_risk,'short_tp2':short_trigger-2*short_risk,
+      'bull_confirm':price>long_trigger and vol_ratio>=1.1 and trend_up and 45<=rv<=72,
+      'bear_confirm':price<short_trigger and vol_ratio>=1.1 and trend_down and 28<=rv<=55,
+      'range_low':support,'range_high':resistance}
 
 # ---------- LEVERAGED TRADING MODULE (ADDITIVE / DOES NOT CHANGE CORE ENGINE) ----------
 def structure_hh_hl(df, lookback=40):
@@ -646,23 +685,11 @@ if 'scan_df' in st.session_state:
 
             st.markdown(f"<div class='card'><div class='coinhead'><div><span class='coinname'>{selected}</span><span class='mini'> &nbsp; • &nbsp; {tf}</span></div><div><span class='badge {badge}'>{badge_txt}</span> <b class='green' style='font-size:20px'>{plan['estimated_success']:.0f}%</b><span class='mini'> احتمال تخمینی</span></div></div></div>",unsafe_allow_html=True)
 
-            chart_mode=st.radio('نمودار', ['Candlestick','Heikin-Ashi'], horizontal=True, key=f'chart_mode_{selected}')
-            chart_df,_=candles(selected,TF[tf])
-            if chart_df is not None:
-                import altair as alt
-                view=chart_df.tail(120)
-                if chart_mode=='Candlestick':
-                    base=alt.Chart(view).encode(x=alt.X('time:T',title='زمان'),color=alt.condition('datum.close >= datum.open',alt.value('#16c784'),alt.value('#ef476f'),legend=None))
-                    w=base.mark_rule().encode(y='low:Q',y2='high:Q'); b=base.mark_bar(size=6).encode(y='open:Q',y2='close:Q')
-                else:
-                    ha=heikin_ashi(chart_df).tail(120).copy(); ha['time']=view['time'].values
-                    base=alt.Chart(ha).encode(x=alt.X('time:T',title='زمان'),color=alt.condition('datum.close >= datum.open',alt.value('#16c784'),alt.value('#ef476f'),legend=None))
-                    w=base.mark_rule().encode(y='low:Q',y2='high:Q'); b=base.mark_bar(size=6).encode(y='open:Q',y2='close:Q')
-                st.altair_chart((w+b).interactive(),use_container_width=True)
+            # نمودارهای نمایشی Candlestick و Heikin-Ashi حذف شده‌اند؛ تحلیل آن‌ها در موتور فعال است.
 
             # Indicator cards
             ic=st.columns(6)
-            indicator_cards=[('الگوی کلاسیک',pattern,f'قدرت {pconf:.0f}%','blue'),('کندل‌استیک',candle_txt,f"امتیاز {cndl['candle_score']:+.0f}",'green' if cndl['candle_score']>0 else 'red' if cndl['candle_score']<0 else 'yellow'),('Heikin-Ashi',ha_txt,f"{cndl['ha_bull']} صعودی / {cndl['ha_bear']} نزولی",'green' if cndl['ha_bull']>=2 else 'red' if cndl['ha_bear']>=2 else 'yellow'),('Fibonacci',plan['fib']['nearest_name'],f"فاصله {plan['fib']['distance_pct']:.2f}%",'blue'),('RSI',f"{plan['rsi']:.1f}",'Momentum / RSI','yellow'),('Volume',f"{plan['volume']:.2f}x",'نسبت به میانگین','green' if plan['volume']>=1.05 else 'yellow')]
+            indicator_cards=[('الگوی کلاسیک',pattern,f'قدرت {pconf:.0f}%','blue'),('کندل‌استیک',cndl.get('pattern_name','بدون الگوی واضح'),f"{candle_txt} • امتیاز {cndl['candle_score']:+.0f}",'green' if cndl['candle_score']>0 else 'red' if cndl['candle_score']<0 else 'yellow'),('Heikin-Ashi',ha_txt,f"{cndl['ha_bull']} صعودی / {cndl['ha_bear']} نزولی",'green' if cndl['ha_bull']>=2 else 'red' if cndl['ha_bear']>=2 else 'yellow'),('Fibonacci',plan['fib']['nearest_name'],f"فاصله {plan['fib']['distance_pct']:.2f}%",'blue'),('RSI',f"{plan['rsi']:.1f}",'Momentum / RSI','yellow'),('Volume',f"{plan['volume']:.2f}x",'نسبت به میانگین','green' if plan['volume']>=1.05 else 'yellow')]
             for c,(lab,val,note,cl) in zip(ic,indicator_cards):
                 with c: st.markdown(f"<div class='card metriccard'><div class='metriclabel'><span>{lab}</span></div><div class='metricvalue {cl}' style='font-size:18px'>{val}</div><div class='metricnote'>{note}</div></div>",unsafe_allow_html=True)
 
@@ -691,6 +718,25 @@ if 'scan_df' in st.session_state:
 
             st.markdown(f"<div class='card'><b>تصمیم نهایی:</b> <span class='badge {badge}'>{plan['decision']}</span><div class='mini' style='margin-top:8px'>{plan['scenario']}</div><div class='mini' style='margin-top:4px;color:#ff9bb0'>{plan['downside']}</div></div>",unsafe_allow_html=True)
 
+
+            # ---------- SHORT-TERM SCENARIOS ----------
+            sts=short_term_scenarios(selected)
+            st.markdown("<div class='card'><div class='sectiontitle'>⏱ سناریوهای کوتاه‌مدت | حدود ۱ تا ۶ ساعت آینده</div><div class='mini'>سناریوها شرطی‌اند؛ تا تأیید شکست و حجم، ورود قطعی محسوب نمی‌شوند.</div>",unsafe_allow_html=True)
+            if sts.get('status')!='OK':
+                st.info(sts.get('reason','داده کافی برای سناریوها موجود نیست.'))
+            else:
+                scc=st.columns(3)
+                with scc[0]:
+                    st.markdown("<div class='scenario'><b class='green'>سناریوی صعودی</b>",unsafe_allow_html=True)
+                    st.markdown(f"<div class='planrow'><span>شرط فعال‌شدن</span><b>عبور از ${fmt(sts['long_trigger'])}</b></div><div class='planrow'><span>ورود پس از تأیید</span><b>${fmt(sts['long_trigger'])}</b></div><div class='planrow'><span>حد ضرر</span><b>${fmt(sts['long_sl'])}</b></div><div class='planrow'><span>هدف ۱ / ۲</span><b class='green'>${fmt(sts['long_tp1'])} / ${fmt(sts['long_tp2'])}</b></div><div class='mini'>{'تأیید شده؛ بررسی ورود با مدیریت ریسک' if sts['bull_confirm'] else 'هنوز تأیید نشده؛ منتظر شکست معتبر و حجم بالاتر'}</div></div>",unsafe_allow_html=True)
+                with scc[1]:
+                    st.markdown("<div class='scenario'><b class='red'>سناریوی نزولی</b>",unsafe_allow_html=True)
+                    st.markdown(f"<div class='planrow'><span>شرط فعال‌شدن</span><b>شکست ${fmt(sts['short_trigger'])}</b></div><div class='planrow'><span>ورود پس از تأیید</span><b>${fmt(sts['short_trigger'])}</b></div><div class='planrow'><span>حد ضرر</span><b>${fmt(sts['short_sl'])}</b></div><div class='planrow'><span>هدف ۱ / ۲</span><b class='green'>${fmt(sts['short_tp1'])} / ${fmt(sts['short_tp2'])}</b></div><div class='mini'>{'تأیید شده؛ بررسی ورود با مدیریت ریسک' if sts['bear_confirm'] else 'هنوز تأیید نشده؛ منتظر شکست معتبر و حجم بالاتر'}</div></div>",unsafe_allow_html=True)
+                with scc[2]:
+                    st.markdown("<div class='scenario scenario-wait'><b>سناریوی خنثی / نوسانی</b>",unsafe_allow_html=True)
+                    st.markdown(f"<div class='planrow'><span>حمایت محدوده</span><b>${fmt(sts['range_low'])}</b></div><div class='planrow'><span>مقاومت محدوده</span><b>${fmt(sts['range_high'])}</b></div><div class='planrow'><span>RSI تایم 1H</span><b>{sts['rsi1h']:.1f}</b></div><div class='planrow'><span>حجم 15M</span><b>{sts['volume15']:.2f}x</b></div><div class='mini'>اگر قیمت بین حمایت و مقاومت بماند، از تعقیب قیمت خودداری کن و منتظر شکست معتبر بمان.</div></div>",unsafe_allow_html=True)
+                st.caption(f"قیمت مرجع: ${fmt(sts['price'])} • حمایت/مقاومت از آخرین ۲۴ کندل 15M • جهت 1H: {'صعودی' if sts['trend_up'] else 'نزولی' if sts['trend_down'] else 'نامشخص/خنثی'}")
+            st.markdown('</div>',unsafe_allow_html=True)
 
             # ---------- LEVERAGED TRADING CARD ----------
             lev=leverage_module(selected, plan.get('fib'))

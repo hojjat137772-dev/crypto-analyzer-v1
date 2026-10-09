@@ -260,8 +260,8 @@ def analyze(symbol, entry_tf, capital, risk_pct):
     short_score=50 + (20 if e20.iloc[-1]<e50.iloc[-1] else -10) + (15 if mm.iloc[-1]<ms.iloc[-1] else -10) - np.clip(mom*5,-15,15) + (12 if 28<=rv<=52 else -5) + (10 if vol>=1.15 else 0) + (15 if bd else 8 if ps else 0) + bear*4 - bull*3 - cs['candle_score']*3 - cs['ha_score']*3 - cp['score']*2
     long_score=float(np.clip(long_score,0,100)); short_score=float(np.clip(short_score,0,100)); score=max(long_score,short_score)
     # Balanced trade gate: 4 confirmations out of 7, not all conditions simultaneously.
-    lc=sum([e20.iloc[-1]>e50.iloc[-1], mm.iloc[-1]>ms.iloc[-1], mom>0, 48<=rv<=72, vol>=1.05, bu or pl or bull>=2, bull>=bear, cs['combined_score']>0, cp['score']>0])
-    sc=sum([e20.iloc[-1]<e50.iloc[-1], mm.iloc[-1]<ms.iloc[-1], mom<0, 28<=rv<=52, vol>=1.05, bd or ps or bear>=2, bear>=bull, cs['combined_score']<0, cp['score']<0])
+    lc=sum([e20.iloc[-1]>e50.iloc[-1], mm.iloc[-1]>ms.iloc[-1], mom>0, 48<=rv<=72, vol>=1.05, bu or pl or bull>=2, bull>=bear, cs['combined_score']>0, cs['candle_score']>0, cp['score']>0])
+    sc=sum([e20.iloc[-1]<e50.iloc[-1], mm.iloc[-1]<ms.iloc[-1], mom<0, 28<=rv<=52, vol>=1.05, bd or ps or bear>=2, bear>=bull, cs['combined_score']<0, cs['candle_score']<0, cp['score']<0])
     direction='LONG' if lc>=4 and long_score>=52 and long_score>=short_score+2 else 'SHORT' if sc>=4 and short_score>=52 and short_score>=long_score+2 else 'WAIT'
     trade='خرید' if direction=='LONG' else 'فروش' if direction=='SHORT' else 'صبر'
     if direction=='LONG':
@@ -441,11 +441,18 @@ def detailed_plan(symbol, tf, row):
     base=float(row.get('confidence',0) or 0)
     fib_bonus=8 if fib['distance_pct']<=0.8 else 5 if fib['distance_pct']<=1.5 else 0
     fib_alignment=1 if ((direction=='LONG' and fib['direction']=='صعودی') or (direction=='SHORT' and fib['direction']=='نزولی')) else 0
-    quality=(10 if vol>=1.15 else 0)+(8 if abs(mom)>=1 else 0)+(5 if 35<=rv<=70 else 0)+fib_bonus+(4 if fib_alignment else 0)+(6 if ((direction=='LONG' and cs['combined_score']>0) or (direction=='SHORT' and cs['combined_score']<0)) else -4 if ((direction=='LONG' and cs['combined_score']<0) or (direction=='SHORT' and cs['combined_score']>0)) else 0)+(6 if ((direction=='LONG' and cp['score']>0) or (direction=='SHORT' and cp['score']<0)) else -6 if ((direction=='LONG' and cp['score']<0) or (direction=='SHORT' and cp['score']>0)) else 0)
+    quality=(10 if vol>=1.15 else 0)+(8 if abs(mom)>=1 else 0)+(5 if 35<=rv<=70 else 0)+fib_bonus+(4 if fib_alignment else 0)+(6 if ((direction=='LONG' and cs['combined_score']>0) or (direction=='SHORT' and cs['combined_score']<0)) else -4 if ((direction=='LONG' and cs['combined_score']<0) or (direction=='SHORT' and cs['combined_score']>0)) else 0)+(6 if ((direction=='LONG' and cs['candle_score']>0) or (direction=='SHORT' and cs['candle_score']<0)) else -6 if ((direction=='LONG' and cs['candle_score']<0) or (direction=='SHORT' and cs['candle_score']>0)) else 0)+(6 if ((direction=='LONG' and cp['score']>0) or (direction=='SHORT' and cp['score']<0)) else -6 if ((direction=='LONG' and cp['score']<0) or (direction=='SHORT' and cp['score']>0)) else 0)
     if direction=='LONG' and fib['distance_pct']<=1.5 and fib['direction']=='صعودی':
         decision='خرید / تأیید فیبوناچی' if decision=='خرید / تأیید' else 'صبر برای پولبک به فیبوناچی / تأیید شکست'
     elif direction=='SHORT' and fib['distance_pct']<=1.5 and fib['direction']=='نزولی':
         decision='فروش / تأیید فیبوناچی' if decision=='فروش / تأیید' else 'صبر برای پولبک به فیبوناچی / تأیید شکست'
+    # A clear opposite candlestick pattern weakens an otherwise directional plan.
+    if direction=='LONG' and cs['candle_score']<0:
+        decision='احتیاط / کندل نزولی مخالف؛ منتظر تأیید مجدد'
+        scenario += ' الگوی کندلی نزولی مخالف دیده شده؛ ورود تا تأیید مجدد ریسک بیشتری دارد.'
+    elif direction=='SHORT' and cs['candle_score']>0:
+        decision='احتیاط / کندل صعودی مخالف؛ منتظر تأیید مجدد'
+        scenario += ' الگوی کندلی صعودی مخالف دیده شده؛ ورود تا تأیید مجدد ریسک بیشتری دارد.'
     est=float(np.clip(base+quality-(8 if len(rs)<2 or len(ss)<2 else 0),0,95))
     outlook=float(np.clip(mom*1.6 + (4 if direction=='LONG' else -4 if direction=='SHORT' else 0),-20,20))
     return {'price':price,'t24':t24,'supports':ss,'resistances':rs,'rsi':rv,'candle':cs,'momentum':mom,'volume':vol,'e20':e20,'e50':e50,'sl':sl,'tps':tps[:3],'safe_entry':safe,'aggressive_entry':aggressive,'decision':decision,'scenario':scenario,'downside':downside,'estimated_success':est,'outlook':outlook,'risk':risk,'fib':fib,'fib_bonus':fib_bonus,'fib_alignment':fib_alignment,'classic':cp}

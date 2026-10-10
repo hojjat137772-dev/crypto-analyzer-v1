@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import requests, math, time
+import requests, math, time, os
 import streamlit.components.v1 as components
 from streamlit_autorefresh import st_autorefresh
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -22,24 +22,60 @@ def get_json(url, params=None, timeout=TIMEOUT):
 
 @st.cache_data(ttl=600, show_spinner=False)
 def universe():
-    urls=[f'{TABDEAL}{x}' for x in ['/r/api/v1/exchangeInfo','/api/v1/exchangeInfo','/v1/market/symbols','/v1/markets','/api/v1/markets']]
-    for u in urls:
-        d=get_json(u,timeout=12)
+    # Merge markets in priority order; keep Tabdeal first when the same symbol exists.
+    all_symbols=[]
+    sources=[]
+    def add(items, label):
+        found=[]
+        for item in items:
+            sym=norm(item)
+            if sym.endswith('USDT') and sym not in all_symbols:
+                all_symbols.append(sym); found.append(sym)
+        if found: sources.append(label)
+    for path in ['/r/api/v1/exchangeInfo','/api/v1/exchangeInfo','/v1/market/symbols','/v1/markets','/api/v1/markets','/r/api/v1/market/tickers','/api/v1/market/tickers','/v1/market/tickers']:
+        d=get_json(f'{TABDEAL}{path}',timeout=8)
         if not d: continue
         items=d.get('symbols') if isinstance(d,dict) else d
-        if items is None and isinstance(d,dict): items=d.get('data')
-        out=[]
+        if items is None and isinstance(d,dict): items=d.get('data',d.get('result',[]))
+        if isinstance(items,dict): items=list(items.values())
         if isinstance(items,list):
+            parsed=[]
             for x in items:
-                if isinstance(x,dict):
-                    s=norm(x.get('symbol') or x.get('name') or x.get('code') or '')
-                    if s.endswith('USDT'): out.append(s)
-        if out: return sorted(set(out)),'Tabdeal'
-    d=get_json(f'{BINANCE}/api/v3/exchangeInfo',timeout=12)
+                if isinstance(x,dict): parsed.append(x.get('symbol') or x.get('name') or x.get('code') or x.get('market') or '')
+                elif isinstance(x,str): parsed.append(x)
+            add(parsed,'Tabdeal')
+        if all_symbols: break
+    # Wallex public markets API
+    d=get_json('https://api.wallex.ir/v1/markets',timeout=8)
     try:
-        out=[x['symbol'] for x in d['symbols'] if x.get('quoteAsset')=='USDT' and x.get('status')=='TRADING']
-        return sorted(set(out)),'Binance fallback'
-    except Exception: return [],'Unavailable'
+        syms=d.get('result',{}).get('symbols',{})
+        add(list(syms.keys()) if isinstance(syms,dict) else [x.get('symbol','') for x in syms], 'Wallex')
+    except Exception: pass
+    # Bit24 markets endpoint requires API key in some configurations.
+    key=os.getenv('BIT24_API_KEY','').strip()
+    if key:
+        d=get_json('https://rest.bit24.cash/pro/capi/v1/markets?page=1',timeout=8)
+        try:
+            items=d.get('data',{}).get('results',[])
+            add([str(x.get('base_coin_symbol',''))+str(x.get('quote_coin_symbol','')) for x in items], 'Bit24')
+        except Exception: pass
+    # Bitpin public market metadata
+    for u in ['https://api.bitpin.ir/v1/mkt/markets/','https://api.bitpin.ir/v1/mkt/tickers/']:
+        d=get_json(u,timeout=8)
+        items=d.get('data',d.get('results',[])) if isinstance(d,dict) else d
+        if isinstance(items,dict): items=list(items.values())
+        if isinstance(items,list):
+            parsed=[]
+            for x in items:
+                if isinstance(x,dict): parsed.append(x.get('symbol') or x.get('code') or x.get('market') or x.get('currency_pair') or '')
+            add(parsed,'Bitpin')
+        if items: break
+    # Keep international fallbacks last.
+    d=get_json(f'{BINANCE}/api/v3/exchangeInfo',timeout=8)
+    try: add([x['symbol'] for x in d['symbols'] if x.get('quoteAsset')=='USDT' and x.get('status')=='TRADING'],'Binance')
+    except Exception: pass
+    if not all_symbols: return [],'Unavailable'
+    return sorted(all_symbols), ' → '.join(sources)
 
 def binance(symbol, interval):
     d=get_json(f'{BINANCE}/api/v3/klines',{'symbol':norm(symbol),'interval':interval,'limit':LIMIT})
@@ -64,48 +100,89 @@ def candles(symbol, interval):
 
 # ---------- LIVE MARKET TICKER ----------
 def live_tickers(symbols):
-    """Fetch uncached 24h prices; use OKX's full SPOT ticker list if Binance fails."""
+    """Priority per symbol: Tabdeal, Wallex, Bit24, Bitpin, Binance, then OKX.
+    Sources are merged without overwriting a quote from a higher-priority exchange.
+    """
     wanted=set(norm(x) for x in symbols)
-    rows=[]
-    data=get_json(f'{BINANCE}/api/v3/ticker/24hr', timeout=8)
+    rows_by_symbol={}
+    def add(sym, price, change=0, volume=0, high=0, low=0, source=''):
+        sym=norm(sym)
+        if sym not in wanted or sym in rows_by_symbol: return
+        try:
+            price=float(price or 0)
+            if price<=0: return
+            rows_by_symbol[sym]={'symbol':sym,'price':price,'change_pct':float(change or 0),
+                'quote_volume':float(volume or 0),'high_24h':float(high or 0),
+                'low_24h':float(low or 0),'source':source}
+        except (TypeError,ValueError): return
+
+    # 1) Tabdeal: try known public market/ticker routes and tolerate response-shape variants.
+    for path in ['/r/api/v1/market/tickers','/api/v1/market/tickers','/v1/market/tickers','/r/api/v1/ticker/24hr','/api/v1/ticker/24hr','/api/v1/ticker/24hr/']:
+        d=get_json(f'{TABDEAL}{path}',timeout=7)
+        items=d.get('data',d.get('result',d.get('tickers',d.get('symbols',[])))) if isinstance(d,dict) else d
+        if isinstance(items,dict): items=list(items.values())
+        if not isinstance(items,list): continue
+        for x in items:
+            if not isinstance(x,dict): continue
+            sym=x.get('symbol') or x.get('market') or x.get('name') or x.get('code') or ''
+            add(sym,x.get('lastPrice',x.get('last',x.get('price',x.get('close')))),
+                x.get('priceChangePercent',x.get('changePercent',x.get('change_pct',0))),
+                x.get('quoteVolume',x.get('volumeQuote',x.get('quote_volume',0))),
+                x.get('highPrice',x.get('high24h',x.get('high',0))),
+                x.get('lowPrice',x.get('low24h',x.get('low',0))),'Tabdeal')
+        if len(rows_by_symbol)>=len(wanted): break
+
+    # 2) Wallex official public markets endpoint.
+    d=get_json('https://api.wallex.ir/v1/markets',timeout=8)
+    try:
+        markets=d.get('result',{}).get('symbols',{})
+        if isinstance(markets,dict): markets=markets.values()
+        for x in markets:
+            if not isinstance(x,dict): continue
+            stats=x.get('stats',{}) or {}
+            add(x.get('symbol',''),stats.get('lastPrice'),stats.get('24h_ch',0),
+                stats.get('24h_quoteVolume',stats.get('24h_volume',0)),stats.get('24h_highPrice',0),stats.get('24h_lowPrice',0),'Wallex')
+    except Exception: pass
+
+    # 3) Bit24 (API key is optional at deployment; only call if configured).
+    key=os.getenv('BIT24_API_KEY','').strip()
+    if key:
+        try:
+            r=S.get('https://rest.bit24.cash/pro/capi/v1/markets?page=1',headers={'X-BIT24-APIKEY':key,'Accept':'application/json'},timeout=8)
+            d=r.json() if r.ok else None
+            items=(d or {}).get('data',{}).get('results',[])
+            for x in items:
+                sym=str(x.get('base_coin_symbol',''))+str(x.get('quote_coin_symbol',''))
+                stats=x.get('stats',{}) or x.get('ticker',{}) or {}
+                add(sym,x.get('last_price',x.get('price',stats.get('lastPrice',0))),x.get('change_percent',stats.get('changePercent',0)),x.get('quote_volume',stats.get('quoteVolume',0)),x.get('high_24h',stats.get('highPrice',0)),x.get('low_24h',stats.get('lowPrice',0)),'Bit24')
+        except Exception: pass
+
+    # 4) Bitpin public tickers.
+    for url in ['https://api.bitpin.ir/v1/mkt/tickers/','https://api.bitpin.ir/v1/mkt/markets/']:
+        d=get_json(url,timeout=8)
+        items=d.get('data',d.get('results',d.get('tickers',[]))) if isinstance(d,dict) else d
+        if isinstance(items,dict): items=list(items.values())
+        if not isinstance(items,list): continue
+        for x in items:
+            if not isinstance(x,dict): continue
+            sym=x.get('symbol') or x.get('code') or x.get('market') or x.get('currency_pair') or ''
+            add(sym,x.get('last',x.get('last_price',x.get('price',x.get('close')))),x.get('change',x.get('change_percent',0)),x.get('quote_volume',x.get('volume',0)),x.get('high',x.get('high_24h',0)),x.get('low',x.get('low_24h',0)),'Bitpin')
+        if len(rows_by_symbol)>=len(wanted): break
+
+    # 5) Binance public ticker; 6) OKX as last resort.
+    data=get_json(f'{BINANCE}/api/v3/ticker/24hr',timeout=7)
     if isinstance(data,list):
         for x in data:
-            sym=norm(x.get('symbol',''))
-            if sym not in wanted:
-                continue
-            try:
-                price=float(x.get('lastPrice',0))
-                if price > 0:
-                    rows.append({'symbol':sym,'price':price,
-                        'change_pct':float(x.get('priceChangePercent',0)),
-                        'quote_volume':float(x.get('quoteVolume',0)),
-                        'high_24h':float(x.get('highPrice',0)),
-                        'low_24h':float(x.get('lowPrice',0)),'source':'Binance'})
-            except (TypeError,ValueError):
-                continue
-    # If Binance is unavailable OR doesn't list the selected Tabdeal market, try OKX.
-    if not rows:
-        alt=get_json(f'{OKX}/api/v5/market/tickers', {'instType':'SPOT'}, timeout=10)
+            add(x.get('symbol',''),x.get('lastPrice'),x.get('priceChangePercent',0),x.get('quoteVolume',0),x.get('highPrice',0),x.get('lowPrice',0),'Binance')
+    if len(rows_by_symbol)<len(wanted):
+        alt=get_json(f'{OKX}/api/v5/market/tickers',{'instType':'SPOT'},timeout=8)
         items=alt.get('data',[]) if isinstance(alt,dict) and str(alt.get('code','0'))=='0' else []
         for x in items:
             inst=str(x.get('instId',''))
-            if not inst.endswith('-USDT'):
-                continue
-            sym=norm(inst.replace('-',''))
-            if sym not in wanted:
-                continue
-            try:
-                price=float(x.get('last',0)); op=float(x.get('open24h',0))
-                if price <= 0:
-                    continue
-                rows.append({'symbol':sym,'price':price,
-                    'change_pct':((price/op)-1)*100 if op>0 else 0.0,
-                    'quote_volume':float(x.get('volCcy24h',0) or 0),
-                    'high_24h':float(x.get('high24h',0) or 0),
-                    'low_24h':float(x.get('low24h',0) or 0),'source':'OKX'})
-            except (TypeError,ValueError):
-                continue
-    return pd.DataFrame(rows)
+            if inst.endswith('-USDT'):
+                sym=norm(inst.replace('-','')); last=float(x.get('last') or 0); op=float(x.get('open24h') or last or 0)
+                add(sym,last,((last/op)-1)*100 if op else 0,x.get('volCcy24h',0),x.get('high24h',0),x.get('low24h',0),'OKX')
+    return pd.DataFrame(list(rows_by_symbol.values()))
 
 # ---------- INDICATORS ----------
 def ema(x,n): return x.ewm(span=n,adjust=False).mean()
@@ -349,19 +426,14 @@ def fmt(x):
 
 # ---------- DETAILED TRADE PLAN ----------
 def market24(symbol):
-    s=norm(symbol)
+    """Return selected symbol's 24h ticker following configured exchange priority."""
     try:
-        d=get_json(f'{BINANCE}/api/v3/ticker/24hr',{'symbol':s},timeout=6)
-        if isinstance(d,dict) and d.get('lastPrice'):
-            return {'price':float(d['lastPrice']),'change24':float(d.get('priceChangePercent',0)),'high24':float(d.get('highPrice',0)),'low24':float(d.get('lowPrice',0)),'volume24':float(d.get('quoteVolume',0)),'source':'Binance'}
-    except Exception: pass
-    try:
-        inst=s[:-4]+'-USDT'
-        d=get_json(f'{OKX}/api/v5/market/ticker',{'instId':inst},timeout=6)
-        row=(d.get('data') or [None])[0]
-        if row:
-            last=float(row[1]); open24=float(row[14]) if row[14] else last
-            return {'price':last,'change24':(last/open24-1)*100 if open24 else 0,'high24':float(row[6]),'low24':float(row[5]),'volume24':float(row[7]) if row[7] else 0,'source':'OKX'}
+        df=live_tickers([symbol])
+        if not df.empty:
+            r=df.iloc[0]
+            return {'price':float(r['price']),'change24':float(r['change_pct']),
+                    'high24':float(r['high_24h']),'low24':float(r['low_24h']),
+                    'volume24':float(r['quote_volume']),'source':str(r['source'])}
     except Exception: pass
     return None
 
@@ -760,7 +832,7 @@ if live_enabled:
     st.markdown('### 🟢 قیمت‌های زنده بازار')
     live_df=live_tickers(tuple(filtered))
     if live_df.empty:
-        st.warning('قیمت زنده از Binance و OKX دریافت نشد. تحلیل قبلی حفظ شده است؛ اتصال اینترنت یا دسترسی صرافی‌ها را بررسی کن.')
+        st.warning('قیمت زنده از منابع تنظیم‌شده (تبدیل، والکس، بیت۲۴، بیت‌پین و منابع جایگزین) دریافت نشد. تحلیل قبلی حفظ شده است؛ اتصال شبکه یا دسترسی APIها را بررسی کن.')
     else:
         live_show=live_df.sort_values('quote_volume',ascending=False).head(100).copy()
         live_show.columns=['ارز','قیمت لحظه‌ای','تغییر ۲۴ساعته %','حجم ۲۴ساعته USDT','بیشترین ۲۴ساعت','کمترین ۲۴ساعت','منبع داده']
@@ -779,7 +851,7 @@ if live_enabled:
             live_show[col]=live_show[col].map(_format_live_number)
         live_show['تغییر ۲۴ساعته %']=live_show['تغییر ۲۴ساعته %'].map(lambda x:f'{x:+.2f}%')
         st.dataframe(live_show,use_container_width=True,hide_index=True)
-        st.caption('نمایش حداکثر ۱۰۰ جفت برتر بر اساس حجم. منبع هر ردیف در داده‌ها مشخص شده است؛ قیمت ممکن است با تبدیل اختلاف داشته باشد.')
+        st.caption('ترتیب اولویت داده‌ها: تبدیل ← والکس ← بیت۲۴ ← بیت‌پین ← بایننس ← OKX. برای هر جفت، اولین منبعی که قیمت معتبر برگرداند استفاده می‌شود؛ منبع هر ردیف در جدول مشخص است.')
 
 # Timed rescan: only the currently selected coin is analyzed.
 if auto_scan:

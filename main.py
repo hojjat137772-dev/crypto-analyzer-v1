@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import requests, math, time
+import streamlit.components.v1 as components
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
@@ -639,6 +640,10 @@ with st.sidebar:
     capital=st.number_input('سرمایه USDT',100.0,1000000.0,1000.0,100.0)
     risk=st.slider('ریسک هر معامله %',0.25,2.0,1.0,0.25)
     st.divider()
+    alert_enabled=st.checkbox('هشدار صوتی ورود', value=True, help='پس از اسکن، برای سیگنال‌های خرید/فروش تأییدشده هشدار می‌دهد.')
+    st.caption('برای شنیدن صدا، صدای مرورگر/گوشی روشن باشد؛ بعضی مرورگرها پخش خودکار را مسدود می‌کنند.')
+    if st.button('تست بوق هشدار', use_container_width=True):
+        components.html("""<button id='testtone' style='font-size:14px;padding:8px 14px'>پخش بوق آزمایشی</button><script>document.getElementById('testtone').addEventListener('click',()=>{try{const C=window.AudioContext||window.webkitAudioContext;const c=new C();const o=c.createOscillator(),g=c.createGain();o.frequency.value=880;g.gain.value=.18;o.connect(g);g.connect(c.destination);o.start();o.stop(c.currentTime+.35);o.onended=()=>c.close()}catch(e){}})</script>""",height=45)
     st.caption(f'منبع: {source}')
     st.caption(f'جفت‌های USDT: {len(symbols):,}')
     if st.button('↻ پاک‌سازی کش داده',use_container_width=True):
@@ -655,6 +660,14 @@ with colB:
     st.write('')
     if st.button('اسکن کل بازار',type='primary',use_container_width=True):
         st.session_state['scan_df']=scan_all(tuple(filtered),tf,capital,risk)
+        scan_result=st.session_state['scan_df']
+        eligible=scan_result[(scan_result.status=='OK')&(scan_result.direction.isin(['LONG','SHORT']))&(scan_result.confidence>=50)&(scan_result.rr>=1.2)&(scan_result.liquidity>=20)]
+        current_alerts={f"{r.symbol}:{r.direction}:{tf}" for r in eligible.itertuples()}
+        previous_alerts=st.session_state.get('active_entry_alerts',set())
+        st.session_state['new_entry_alerts']=sorted(current_alerts-previous_alerts)
+        st.session_state['active_entry_alerts']=current_alerts
+        st.session_state['entry_alert_tf']=tf
+        st.session_state['entry_alert_enabled']=alert_enabled
 
 st.caption(f'Universe قابل اسکن: **{len(filtered):,}** ارز')
 
@@ -662,6 +675,23 @@ if 'scan_df' in st.session_state:
     df=st.session_state['scan_df'].copy()
     total=len(filtered); analyzed=int((df.status=='OK').sum()); nodata=int((df.status!='OK').sum())
     tradable=df[(df.status=='OK')&(df.direction!='WAIT')&(df.confidence>=50)&(df.rr>=1.2)&(df.liquidity>=20)].copy()
+    # Entry alerts are triggered only when a qualifying signal first appears, not on every rerun.
+    fresh_alerts=st.session_state.get('new_entry_alerts',[])
+    if fresh_alerts and st.session_state.get('entry_alert_tf')==tf:
+        alert_items=[]
+        for sig in fresh_alerts:
+            parts=sig.split(':')
+            if len(parts)>=2:
+                sym,side=parts[0],parts[1]
+                alert_items.append(f"{sym} — {'خرید (LONG)' if side=='LONG' else 'فروش (SHORT)'}")
+        if alert_items:
+            st.success('🔔 شرایط ورود تأیید شد: ' + ' | '.join(alert_items[:12]) + (f' و {len(alert_items)-12} ارز دیگر' if len(alert_items)>12 else ''))
+            if st.session_state.get('entry_alert_enabled',True):
+                # Browser audio can be blocked by autoplay policy; the visual alert always remains.
+                components.html("""<div></div><script>(()=>{try{const C=window.AudioContext||window.webkitAudioContext;if(!C)return;const c=new C();const play=(f,t)=>{const o=c.createOscillator(),g=c.createGain();o.type='sine';o.frequency.value=f;g.gain.setValueAtTime(0.0001,c.currentTime+t);g.gain.exponentialRampToValueAtTime(0.18,c.currentTime+t+0.025);g.gain.exponentialRampToValueAtTime(0.0001,c.currentTime+t+0.22);o.connect(g);g.connect(c.destination);o.start(c.currentTime+t);o.stop(c.currentTime+t+0.24)};const go=()=>{play(880,0);play(1175,0.28);setTimeout(()=>c.close(),800)};if(c.state==='suspended')c.resume().then(go).catch(()=>{});else go()}catch(e){}})();</script>""",height=1)
+        st.session_state['new_entry_alerts']=[]
+    elif fresh_alerts:
+        st.session_state['new_entry_alerts']=[]
     longs=int((tradable.direction=='LONG').sum()); shorts=int((tradable.direction=='SHORT').sum())
     waits=max(analyzed-longs-shorts,0)
 

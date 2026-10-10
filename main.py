@@ -763,7 +763,7 @@ if live_enabled:
         st.warning('قیمت زنده از Binance و OKX دریافت نشد. تحلیل قبلی حفظ شده است؛ اتصال اینترنت یا دسترسی صرافی‌ها را بررسی کن.')
     else:
         live_show=live_df.sort_values('quote_volume',ascending=False).head(100).copy()
-        live_show.columns=['ارز','قیمت لحظه‌ای','تغییر ۲۴ساعته %','حجم ۲۴ساعته USDT','بیشترین ۲۴ساعت','کمترین ۲۴ساعت']
+        live_show.columns=['ارز','قیمت لحظه‌ای','تغییر ۲۴ساعته %','حجم ۲۴ساعته USDT','بیشترین ۲۴ساعت','کمترین ۲۴ساعت','منبع داده']
         live_show['قیمت لحظه‌ای']=live_show['قیمت لحظه‌ای'].map(fmt)
         for col in ['بیشترین ۲۴ساعت','کمترین ۲۴ساعت','حجم ۲۴ساعته USDT']:
             live_show[col]=live_show[col].map(fmt)

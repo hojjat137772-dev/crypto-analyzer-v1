@@ -8,8 +8,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 TF={'5m':'5m','15m':'15m','30m':'30m','1H':'1h','2H':'2h','4H':'4h','6H':'6h','12H':'12h','1D':'1d','3D':'3d','1W':'1w'}
-BINANCE='https://api.binance.com'; OKX='https://www.okx.com'; TABDEAL='https://api.tabdeal.org'
-S=requests.Session(); S.headers.update({'User-Agent':'CryptoAnalyzerPro-V6.8/1.0'})
+S=requests.Session(); S.headers.update({'User-Agent':'CryptoAnalyzerPro-WallexOnly/1.0'})
 TIMEOUT=8; LIMIT=320
 
 # ---------- DATA ----------
@@ -22,167 +21,68 @@ def get_json(url, params=None, timeout=TIMEOUT):
 
 @st.cache_data(ttl=600, show_spinner=False)
 def universe():
-    # Merge markets in priority order; keep Tabdeal first when the same symbol exists.
-    all_symbols=[]
-    sources=[]
-    def add(items, label):
-        found=[]
-        for item in items:
-            sym=norm(item)
-            if sym.endswith('USDT') and sym not in all_symbols:
-                all_symbols.append(sym); found.append(sym)
-        if found: sources.append(label)
-    for path in ['/r/api/v1/exchangeInfo','/api/v1/exchangeInfo','/v1/market/symbols','/v1/markets','/api/v1/markets','/r/api/v1/market/tickers','/api/v1/market/tickers','/v1/market/tickers']:
-        d=get_json(f'{TABDEAL}{path}',timeout=8)
-        if not d: continue
-        items=d.get('symbols') if isinstance(d,dict) else d
-        if items is None and isinstance(d,dict): items=d.get('data',d.get('result',[]))
-        if isinstance(items,dict): items=list(items.values())
-        if isinstance(items,list):
-            parsed=[]
-            for x in items:
-                if isinstance(x,dict): parsed.append(x.get('symbol') or x.get('name') or x.get('code') or x.get('market') or '')
-                elif isinstance(x,str): parsed.append(x)
-            add(parsed,'Tabdeal')
-        if all_symbols: break
-    # Wallex public markets API
-    d=get_json('https://api.wallex.ir/v1/markets',timeout=8)
-    try:
-        syms=d.get('result',{}).get('symbols',{})
-        add(list(syms.keys()) if isinstance(syms,dict) else [x.get('symbol','') for x in syms], 'Wallex')
-    except Exception: pass
-    # Bit24 markets endpoint requires API key in some configurations.
-    key=os.getenv('BIT24_API_KEY','').strip()
-    if key:
-        d=get_json('https://rest.bit24.cash/pro/capi/v1/markets?page=1',timeout=8)
-        try:
-            items=d.get('data',{}).get('results',[])
-            add([str(x.get('base_coin_symbol',''))+str(x.get('quote_coin_symbol','')) for x in items], 'Bit24')
-        except Exception: pass
-    # Bitpin public market metadata
-    for u in ['https://api.bitpin.ir/v1/mkt/markets/','https://api.bitpin.ir/v1/mkt/tickers/']:
-        d=get_json(u,timeout=8)
-        items=d.get('data',d.get('results',[])) if isinstance(d,dict) else d
-        if isinstance(items,dict): items=list(items.values())
-        if isinstance(items,list):
-            parsed=[]
-            for x in items:
-                if isinstance(x,dict): parsed.append(x.get('symbol') or x.get('code') or x.get('market') or x.get('currency_pair') or '')
-            add(parsed,'Bitpin')
-        if items: break
-    # Keep international fallbacks last.
-    d=get_json(f'{BINANCE}/api/v3/exchangeInfo',timeout=8)
-    try: add([x['symbol'] for x in d['symbols'] if x.get('quoteAsset')=='USDT' and x.get('status')=='TRADING'],'Binance')
-    except Exception: pass
-    if not all_symbols: return [],'Unavailable'
-    return sorted(all_symbols), ' → '.join(sources)
+    """Only use Wallex markets; no exchange fallback."""
+    d=get_json('https://api.wallex.ir/v1/markets',timeout=10)
+    if not isinstance(d,dict): return [],'Wallex (دریافت ناموفق)'
+    result=d.get('result',{}) or {}
+    markets=result.get('symbols',{}) if isinstance(result,dict) else {}
+    symbols=[]
+    if isinstance(markets,dict):
+        for key,value in markets.items():
+            sym=norm((value or {}).get('symbol') or key) if isinstance(value,dict) else norm(key)
+            if sym.endswith('USDT') and sym not in symbols: symbols.append(sym)
+    elif isinstance(markets,list):
+        for value in markets:
+            if isinstance(value,dict):
+                sym=norm(value.get('symbol') or value.get('name') or value.get('code') or '')
+                if sym.endswith('USDT') and sym not in symbols: symbols.append(sym)
+    return sorted(symbols),'Wallex فقط'
 
-def binance(symbol, interval):
-    d=get_json(f'{BINANCE}/api/v3/klines',{'symbol':norm(symbol),'interval':interval,'limit':LIMIT})
-    if not isinstance(d,list) or len(d)<80: raise ValueError('insufficient')
-    df=pd.DataFrame(d,columns=['t','o','h','l','c','v','ct','q','n','tb','tq','i'])
-    for c in ['o','h','l','c','v']: df[c]=pd.to_numeric(df[c],errors='coerce')
-    return df.rename(columns={'t':'time','o':'open','h':'high','l':'low','c':'close','v':'volume'})[['time','open','high','low','close','volume']].dropna()
-
-def okx(symbol, interval):
-    bars={'5m':'5m','15m':'15m','30m':'30m','1h':'1H','2h':'2H','4h':'4H','6h':'6H','12h':'12H','1d':'1D','3d':'3D','1w':'1W'}
-    inst=norm(symbol)[:-4]+'-USDT'; d=get_json(f'{OKX}/api/v5/market/candles',{'instId':inst,'bar':bars.get(interval,interval),'limit':'300'})
-    rows=d.get('data',[]) if isinstance(d,dict) else []
-    if len(rows)<80: raise ValueError('insufficient')
-    rows=list(reversed(rows))
-    return pd.DataFrame([[pd.to_datetime(int(x[0]),unit='ms'),float(x[1]),float(x[2]),float(x[3]),float(x[4]),float(x[5])] for x in rows],columns=['time','open','high','low','close','volume'])
+def wallex_candles(symbol, interval):
+    """Fetch OHLCV from Wallex UDF history endpoint only."""
+    resolutions={'5m':'5','15m':'15','30m':'30','1H':'60','2H':'120','4H':'240','6H':'360','12H':'720','1D':'D','3D':'3D','1W':'W'}
+    seconds={'5m':300,'15m':900,'30m':1800,'1H':3600,'2H':7200,'4H':14400,'6H':21600,'12H':43200,'1D':86400,'3D':259200,'1W':604800}
+    now=int(time.time()); res=resolutions.get(interval)
+    if not res: raise ValueError('unsupported interval')
+    params={'symbol':norm(symbol),'resolution':res,'from':now-seconds[interval]*LIMIT,'to':now}
+    d=get_json('https://api.wallex.ir/v1/udf/history',params=params,timeout=12)
+    if not isinstance(d,dict) or d.get('s')!='ok':
+        raise ValueError('Wallex candle data unavailable for this market/timeframe')
+    required=['t','o','h','l','c','v']
+    if any(k not in d for k in required): raise ValueError('invalid Wallex candle response')
+    df=pd.DataFrame({'time':pd.to_datetime(d['t'],unit='s',errors='coerce'),'open':d['o'],'high':d['h'],'low':d['l'],'close':d['c'],'volume':d['v']})
+    for col in ['open','high','low','close','volume']: df[col]=pd.to_numeric(df[col],errors='coerce')
+    df=df.dropna().drop_duplicates(subset=['time']).sort_values('time').reset_index(drop=True)
+    if len(df)<80: raise ValueError(f'Wallex returned only {len(df)} candles')
+    return df
 
 def candles(symbol, interval):
-    for f in (binance,okx):
-        try: return f(symbol,interval),f.__name__
-        except Exception: pass
-    return None,None
+    try: return wallex_candles(symbol,interval),'Wallex'
+    except Exception: return None,None
 
 # ---------- LIVE MARKET TICKER ----------
 def live_tickers(symbols):
-    """Priority per symbol: Tabdeal, Wallex, Bit24, Bitpin, Binance, then OKX.
-    Sources are merged without overwriting a quote from a higher-priority exchange.
-    """
-    wanted=set(norm(x) for x in symbols)
-    rows_by_symbol={}
-    def add(sym, price, change=0, volume=0, high=0, low=0, source=''):
-        sym=norm(sym)
-        if sym not in wanted or sym in rows_by_symbol: return
+    """Ticker data from Wallex only. No fallback to other exchanges."""
+    wanted={norm(x) for x in symbols}
+    d=get_json('https://api.wallex.ir/v1/markets',timeout=10)
+    if not isinstance(d,dict): return pd.DataFrame(columns=['symbol','price','change_pct','quote_volume','high_24h','low_24h','source'])
+    result=d.get('result',{}) or {}
+    markets=result.get('symbols',{}) if isinstance(result,dict) else {}
+    items=markets.items() if isinstance(markets,dict) else enumerate(markets) if isinstance(markets,list) else []
+    rows=[]
+    for key,value in items:
+        if not isinstance(value,dict): continue
+        sym=norm(value.get('symbol') or key)
+        if sym not in wanted: continue
+        stats=value.get('stats',{}) or {}
         try:
-            price=float(price or 0)
-            if price<=0: return
-            rows_by_symbol[sym]={'symbol':sym,'price':price,'change_pct':float(change or 0),
-                'quote_volume':float(volume or 0),'high_24h':float(high or 0),
-                'low_24h':float(low or 0),'source':source}
-        except (TypeError,ValueError): return
-
-    # 1) Tabdeal: try known public market/ticker routes and tolerate response-shape variants.
-    for path in ['/r/api/v1/market/tickers','/api/v1/market/tickers','/v1/market/tickers','/r/api/v1/ticker/24hr','/api/v1/ticker/24hr','/api/v1/ticker/24hr/']:
-        d=get_json(f'{TABDEAL}{path}',timeout=7)
-        items=d.get('data',d.get('result',d.get('tickers',d.get('symbols',[])))) if isinstance(d,dict) else d
-        if isinstance(items,dict): items=list(items.values())
-        if not isinstance(items,list): continue
-        for x in items:
-            if not isinstance(x,dict): continue
-            sym=x.get('symbol') or x.get('market') or x.get('name') or x.get('code') or ''
-            add(sym,x.get('lastPrice',x.get('last',x.get('price',x.get('close')))),
-                x.get('priceChangePercent',x.get('changePercent',x.get('change_pct',0))),
-                x.get('quoteVolume',x.get('volumeQuote',x.get('quote_volume',0))),
-                x.get('highPrice',x.get('high24h',x.get('high',0))),
-                x.get('lowPrice',x.get('low24h',x.get('low',0))),'Tabdeal')
-        if len(rows_by_symbol)>=len(wanted): break
-
-    # 2) Wallex official public markets endpoint.
-    d=get_json('https://api.wallex.ir/v1/markets',timeout=8)
-    try:
-        markets=d.get('result',{}).get('symbols',{})
-        if isinstance(markets,dict): markets=markets.values()
-        for x in markets:
-            if not isinstance(x,dict): continue
-            stats=x.get('stats',{}) or {}
-            add(x.get('symbol',''),stats.get('lastPrice'),stats.get('24h_ch',0),
-                stats.get('24h_quoteVolume',stats.get('24h_volume',0)),stats.get('24h_highPrice',0),stats.get('24h_lowPrice',0),'Wallex')
-    except Exception: pass
-
-    # 3) Bit24 (API key is optional at deployment; only call if configured).
-    key=os.getenv('BIT24_API_KEY','').strip()
-    if key:
-        try:
-            r=S.get('https://rest.bit24.cash/pro/capi/v1/markets?page=1',headers={'X-BIT24-APIKEY':key,'Accept':'application/json'},timeout=8)
-            d=r.json() if r.ok else None
-            items=(d or {}).get('data',{}).get('results',[])
-            for x in items:
-                sym=str(x.get('base_coin_symbol',''))+str(x.get('quote_coin_symbol',''))
-                stats=x.get('stats',{}) or x.get('ticker',{}) or {}
-                add(sym,x.get('last_price',x.get('price',stats.get('lastPrice',0))),x.get('change_percent',stats.get('changePercent',0)),x.get('quote_volume',stats.get('quoteVolume',0)),x.get('high_24h',stats.get('highPrice',0)),x.get('low_24h',stats.get('lowPrice',0)),'Bit24')
-        except Exception: pass
-
-    # 4) Bitpin public tickers.
-    for url in ['https://api.bitpin.ir/v1/mkt/tickers/','https://api.bitpin.ir/v1/mkt/markets/']:
-        d=get_json(url,timeout=8)
-        items=d.get('data',d.get('results',d.get('tickers',[]))) if isinstance(d,dict) else d
-        if isinstance(items,dict): items=list(items.values())
-        if not isinstance(items,list): continue
-        for x in items:
-            if not isinstance(x,dict): continue
-            sym=x.get('symbol') or x.get('code') or x.get('market') or x.get('currency_pair') or ''
-            add(sym,x.get('last',x.get('last_price',x.get('price',x.get('close')))),x.get('change',x.get('change_percent',0)),x.get('quote_volume',x.get('volume',0)),x.get('high',x.get('high_24h',0)),x.get('low',x.get('low_24h',0)),'Bitpin')
-        if len(rows_by_symbol)>=len(wanted): break
-
-    # 5) Binance public ticker; 6) OKX as last resort.
-    data=get_json(f'{BINANCE}/api/v3/ticker/24hr',timeout=7)
-    if isinstance(data,list):
-        for x in data:
-            add(x.get('symbol',''),x.get('lastPrice'),x.get('priceChangePercent',0),x.get('quoteVolume',0),x.get('highPrice',0),x.get('lowPrice',0),'Binance')
-    if len(rows_by_symbol)<len(wanted):
-        alt=get_json(f'{OKX}/api/v5/market/tickers',{'instType':'SPOT'},timeout=8)
-        items=alt.get('data',[]) if isinstance(alt,dict) and str(alt.get('code','0'))=='0' else []
-        for x in items:
-            inst=str(x.get('instId',''))
-            if inst.endswith('-USDT'):
-                sym=norm(inst.replace('-','')); last=float(x.get('last') or 0); op=float(x.get('open24h') or last or 0)
-                add(sym,last,((last/op)-1)*100 if op else 0,x.get('volCcy24h',0),x.get('high24h',0),x.get('low24h',0),'OKX')
-    return pd.DataFrame(list(rows_by_symbol.values()))
+            price=float(stats.get('lastPrice') or value.get('lastPrice') or 0)
+            if price<=0: continue
+            rows.append({'symbol':sym,'price':price,'change_pct':float(stats.get('24h_ch') or 0),
+                'quote_volume':float(stats.get('24h_quoteVolume') or stats.get('24h_volume') or 0),
+                'high_24h':float(stats.get('24h_highPrice') or 0),'low_24h':float(stats.get('24h_lowPrice') or 0),'source':'Wallex'})
+        except (TypeError,ValueError): continue
+    return pd.DataFrame(rows,columns=['symbol','price','change_pct','quote_volume','high_24h','low_24h','source'])
 
 # ---------- INDICATORS ----------
 def ema(x,n): return x.ewm(span=n,adjust=False).mean()
@@ -851,7 +751,7 @@ if live_enabled:
             live_show[col]=live_show[col].map(_format_live_number)
         live_show['تغییر ۲۴ساعته %']=live_show['تغییر ۲۴ساعته %'].map(lambda x:f'{x:+.2f}%')
         st.dataframe(live_show,use_container_width=True,hide_index=True)
-        st.caption('ترتیب اولویت داده‌ها: تبدیل ← والکس ← بیت۲۴ ← بیت‌پین ← بایننس ← OKX. برای هر جفت، اولین منبعی که قیمت معتبر برگرداند استفاده می‌شود؛ منبع هر ردیف در جدول مشخص است.')
+        st.caption('تمام داده‌های قیمت، بازار و کندل فقط از والکس دریافت می‌شوند؛ در صورت نبود داده از منبع دیگری جایگزین نمی‌شود.')
 
 # Timed rescan: only the currently selected coin is analyzed.
 if auto_scan:

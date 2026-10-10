@@ -64,21 +64,45 @@ def candles(symbol, interval):
 
 # ---------- LIVE MARKET TICKER ----------
 def live_tickers(symbols):
-    """Fetch current 24h ticker data from Binance; refresh is intentionally uncached."""
-    data=get_json(f'{BINANCE}/api/v3/ticker/24hr', timeout=10)
-    if not isinstance(data,list):
-        return pd.DataFrame()
-    wanted=set(symbols)
+    """Fetch uncached 24h prices; use OKX's full SPOT ticker list if Binance fails."""
+    wanted=set(norm(x) for x in symbols)
     rows=[]
-    for x in data:
-        sym=norm(x.get('symbol',''))
-        if sym in wanted:
+    data=get_json(f'{BINANCE}/api/v3/ticker/24hr', timeout=8)
+    if isinstance(data,list):
+        for x in data:
+            sym=norm(x.get('symbol',''))
+            if sym not in wanted:
+                continue
             try:
-                rows.append({'symbol':sym,'price':float(x.get('lastPrice',0)),
-                    'change_pct':float(x.get('priceChangePercent',0)),
-                    'quote_volume':float(x.get('quoteVolume',0)),
-                    'high_24h':float(x.get('highPrice',0)),
-                    'low_24h':float(x.get('lowPrice',0))})
+                price=float(x.get('lastPrice',0))
+                if price > 0:
+                    rows.append({'symbol':sym,'price':price,
+                        'change_pct':float(x.get('priceChangePercent',0)),
+                        'quote_volume':float(x.get('quoteVolume',0)),
+                        'high_24h':float(x.get('highPrice',0)),
+                        'low_24h':float(x.get('lowPrice',0)),'source':'Binance'})
+            except (TypeError,ValueError):
+                continue
+    # If Binance is unavailable OR doesn't list the selected Tabdeal market, try OKX.
+    if not rows:
+        alt=get_json(f'{OKX}/api/v5/market/tickers', {'instType':'SPOT'}, timeout=10)
+        items=alt.get('data',[]) if isinstance(alt,dict) and str(alt.get('code','0'))=='0' else []
+        for x in items:
+            inst=str(x.get('instId',''))
+            if not inst.endswith('-USDT'):
+                continue
+            sym=norm(inst.replace('-',''))
+            if sym not in wanted:
+                continue
+            try:
+                price=float(x.get('last',0)); op=float(x.get('open24h',0))
+                if price <= 0:
+                    continue
+                rows.append({'symbol':sym,'price':price,
+                    'change_pct':((price/op)-1)*100 if op>0 else 0.0,
+                    'quote_volume':float(x.get('volCcy24h',0) or 0),
+                    'high_24h':float(x.get('high24h',0) or 0),
+                    'low_24h':float(x.get('low24h',0) or 0),'source':'OKX'})
             except (TypeError,ValueError):
                 continue
     return pd.DataFrame(rows)
@@ -736,7 +760,7 @@ if live_enabled:
     st.markdown('### 🟢 قیمت‌های زنده بازار')
     live_df=live_tickers(tuple(filtered))
     if live_df.empty:
-        st.warning('دریافت قیمت زنده از منبع جایگزین ممکن نشد؛ تحلیل قبلی همچنان قابل مشاهده است.')
+        st.warning('قیمت زنده از Binance و OKX دریافت نشد. تحلیل قبلی حفظ شده است؛ اتصال اینترنت یا دسترسی صرافی‌ها را بررسی کن.')
     else:
         live_show=live_df.sort_values('quote_volume',ascending=False).head(100).copy()
         live_show.columns=['ارز','قیمت لحظه‌ای','تغییر ۲۴ساعته %','حجم ۲۴ساعته USDT','بیشترین ۲۴ساعت','کمترین ۲۴ساعت']
@@ -745,7 +769,7 @@ if live_enabled:
             live_show[col]=live_show[col].map(fmt)
         live_show['تغییر ۲۴ساعته %']=live_show['تغییر ۲۴ساعته %'].map(lambda x:f'{x:+.2f}%')
         st.dataframe(live_show,use_container_width=True,hide_index=True)
-        st.caption('نمایش حداکثر ۱۰۰ جفت برتر بر اساس حجم؛ منبع قیمت زنده Binance است و ممکن است با قیمت صرافی تبدیل اختلاف داشته باشد.')
+        st.caption('نمایش حداکثر ۱۰۰ جفت برتر بر اساس حجم. منبع هر ردیف در داده‌ها مشخص شده است؛ قیمت ممکن است با تبدیل اختلاف داشته باشد.')
 
 # Timed rescan: only the currently selected coin is analyzed.
 if auto_scan:

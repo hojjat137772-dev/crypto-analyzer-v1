@@ -19,27 +19,35 @@ def get_json(url, params=None, timeout=TIMEOUT):
         r=S.get(url,params=params,timeout=timeout); r.raise_for_status(); return r.json()
     except Exception: return None
 
-@st.cache_data(ttl=600, show_spinner=False)
+@st.cache_data(ttl=300, show_spinner=False)
 def universe():
-    """Only use Wallex markets; no exchange fallback."""
-    d=get_json('https://api.wallex.ir/v1/markets',timeout=10)
-    if not isinstance(d,dict): return [],'Wallex (دریافت ناموفق)'
-    result=d.get('result',{}) or {}
-    markets=result.get('symbols',{}) if isinstance(result,dict) else {}
+    """Combine USDT markets from Wallex and Nobitex; no global exchange fallback."""
     symbols=[]
-    if isinstance(markets,dict):
-        for key,value in markets.items():
+    # Wallex market universe
+    d=get_json('https://api.wallex.ir/v1/markets',timeout=10)
+    if isinstance(d,dict):
+        result=d.get('result',{}) or {}
+        markets=result.get('symbols',{}) if isinstance(result,dict) else {}
+        items=markets.items() if isinstance(markets,dict) else enumerate(markets) if isinstance(markets,list) else []
+        for key,value in items:
             sym=norm((value or {}).get('symbol') or key) if isinstance(value,dict) else norm(key)
             if sym.endswith('USDT') and sym not in symbols: symbols.append(sym)
-    elif isinstance(markets,list):
-        for value in markets:
-            if isinstance(value,dict):
-                sym=norm(value.get('symbol') or value.get('name') or value.get('code') or '')
-                if sym.endswith('USDT') and sym not in symbols: symbols.append(sym)
-    return sorted(symbols),'Wallex فقط'
+    # Nobitex market stats also exposes its live market list (including USDT pairs).
+    nd=get_json('https://apiv2.nobitex.ir/market/stats',timeout=10)
+    if not isinstance(nd,dict): nd=get_json('https://api.nobitex.ir/market/stats',timeout=10)
+    stats=nd.get('stats',{}) if isinstance(nd,dict) else {}
+    if isinstance(stats,dict):
+        for key,value in stats.items():
+            if not isinstance(value,dict): continue
+            sym=norm(key.replace('-',''))
+            if sym.endswith('USDT') and sym not in symbols: symbols.append(sym)
+    sources=[]
+    if symbols: sources.append('والکس + نوبیتکس')
+    else: sources.append('والکس و نوبیتکس (دریافت ناموفق)')
+    return sorted(symbols),sources[0]
 
 def wallex_candles(symbol, interval):
-    """Fetch OHLCV from Wallex UDF history endpoint only."""
+    """Fetch OHLCV from Wallex UDF history endpoint."""
     resolutions={'5m':'5','15m':'15','30m':'30','1H':'60','2H':'120','4H':'240','6H':'360','12H':'720','1D':'D','3D':'3D','1W':'W'}
     seconds={'5m':300,'15m':900,'30m':1800,'1H':3600,'2H':7200,'4H':14400,'6H':21600,'12H':43200,'1D':86400,'3D':259200,'1W':604800}
     now=int(time.time()); res=resolutions.get(interval)
@@ -47,7 +55,7 @@ def wallex_candles(symbol, interval):
     params={'symbol':norm(symbol),'resolution':res,'from':now-seconds[interval]*LIMIT,'to':now}
     d=get_json('https://api.wallex.ir/v1/udf/history',params=params,timeout=12)
     if not isinstance(d,dict) or d.get('s')!='ok':
-        raise ValueError('Wallex candle data unavailable for this market/timeframe')
+        raise ValueError('Wallex candle data unavailable')
     required=['t','o','h','l','c','v']
     if any(k not in d for k in required): raise ValueError('invalid Wallex candle response')
     df=pd.DataFrame({'time':pd.to_datetime(d['t'],unit='s',errors='coerce'),'open':d['o'],'high':d['h'],'low':d['l'],'close':d['c'],'volume':d['v']})
@@ -56,32 +64,75 @@ def wallex_candles(symbol, interval):
     if len(df)<80: raise ValueError(f'Wallex returned only {len(df)} candles')
     return df
 
+def nobitex_candles(symbol, interval):
+    """Fetch OHLCV from Nobitex UDF history. Public endpoint; no API key required."""
+    resolutions={'5m':'5','15m':'15','30m':'30','1H':'60','2H':'120','4H':'240','6H':'360','12H':'720','1D':'D','3D':'3D','1W':'W'}
+    seconds={'5m':300,'15m':900,'30m':1800,'1H':3600,'2H':7200,'4H':14400,'6H':21600,'12H':43200,'1D':86400,'3D':259200,'1W':604800}
+    res=resolutions.get(interval)
+    if not res: raise ValueError('unsupported interval')
+    now=int(time.time()); params={'symbol':norm(symbol),'resolution':res,'from':now-seconds[interval]*LIMIT,'to':now}
+    d=None
+    for base in ('https://apiv2.nobitex.ir','https://api.nobitex.ir'):
+        d=get_json(base+'/market/udf/history',params=params,timeout=12)
+        if isinstance(d,dict) and d.get('s')=='ok': break
+    if not isinstance(d,dict) or d.get('s')!='ok':
+        raise ValueError('Nobitex candle data unavailable for this market/timeframe')
+    required=['t','o','h','l','c','v']
+    if any(k not in d for k in required): raise ValueError('invalid Nobitex candle response')
+    df=pd.DataFrame({'time':pd.to_datetime(d['t'],unit='s',errors='coerce'),'open':d['o'],'high':d['h'],'low':d['l'],'close':d['c'],'volume':d['v']})
+    for col in ['open','high','low','close','volume']: df[col]=pd.to_numeric(df[col],errors='coerce')
+    df=df.dropna().drop_duplicates(subset=['time']).sort_values('time').reset_index(drop=True)
+    if len(df)<80: raise ValueError(f'Nobitex returned only {len(df)} candles')
+    return df
+
 def candles(symbol, interval):
+    """Try Wallex first, then Nobitex; report which source succeeded."""
     try: return wallex_candles(symbol,interval),'Wallex'
-    except Exception: return None,None
+    except Exception as wallex_error:
+        try: return nobitex_candles(symbol,interval),'Nobitex'
+        except Exception as nobitex_error:
+            return None,None
 
 # ---------- LIVE MARKET TICKER ----------
 def live_tickers(symbols):
-    """Ticker data from Wallex only. No fallback to other exchanges."""
+    """Use Wallex first; fill missing symbols from Nobitex market stats."""
     wanted={norm(x) for x in symbols}
+    rows=[]; found=set()
     d=get_json('https://api.wallex.ir/v1/markets',timeout=10)
-    if not isinstance(d,dict): return pd.DataFrame(columns=['symbol','price','change_pct','quote_volume','high_24h','low_24h','source'])
-    result=d.get('result',{}) or {}
-    markets=result.get('symbols',{}) if isinstance(result,dict) else {}
-    items=markets.items() if isinstance(markets,dict) else enumerate(markets) if isinstance(markets,list) else []
-    rows=[]
-    for key,value in items:
-        if not isinstance(value,dict): continue
-        sym=norm(value.get('symbol') or key)
-        if sym not in wanted: continue
-        stats=value.get('stats',{}) or {}
-        try:
-            price=float(stats.get('lastPrice') or value.get('lastPrice') or 0)
-            if price<=0: continue
-            rows.append({'symbol':sym,'price':price,'change_pct':float(stats.get('24h_ch') or 0),
-                'quote_volume':float(stats.get('24h_quoteVolume') or stats.get('24h_volume') or 0),
-                'high_24h':float(stats.get('24h_highPrice') or 0),'low_24h':float(stats.get('24h_lowPrice') or 0),'source':'Wallex'})
-        except (TypeError,ValueError): continue
+    if isinstance(d,dict):
+        result=d.get('result',{}) or {}; markets=result.get('symbols',{}) if isinstance(result,dict) else {}
+        items=markets.items() if isinstance(markets,dict) else enumerate(markets) if isinstance(markets,list) else []
+        for key,value in items:
+            if not isinstance(value,dict): continue
+            sym=norm(value.get('symbol') or key)
+            if sym not in wanted: continue
+            stats=value.get('stats',{}) or {}
+            try:
+                price=float(stats.get('lastPrice') or value.get('lastPrice') or 0)
+                if price<=0: continue
+                rows.append({'symbol':sym,'price':price,'change_pct':float(stats.get('24h_ch') or 0),
+                    'quote_volume':float(stats.get('24h_quoteVolume') or stats.get('24h_volume') or 0),
+                    'high_24h':float(stats.get('24h_highPrice') or 0),'low_24h':float(stats.get('24h_lowPrice') or 0),'source':'Wallex'})
+                found.add(sym)
+            except (TypeError,ValueError): continue
+    missing=wanted-found
+    if missing:
+        nd=get_json('https://apiv2.nobitex.ir/market/stats',timeout=10)
+        if not isinstance(nd,dict): nd=get_json('https://api.nobitex.ir/market/stats',timeout=10)
+        stats=nd.get('stats',{}) if isinstance(nd,dict) else {}
+        if isinstance(stats,dict):
+            for key,value in stats.items():
+                if not isinstance(value,dict): continue
+                sym=norm(key.replace('-',''))
+                if sym not in missing: continue
+                try:
+                    price=float(value.get('latest') or value.get('dayClose') or 0)
+                    if price<=0: continue
+                    rows.append({'symbol':sym,'price':price,'change_pct':float(value.get('dayChange') or 0),
+                        'quote_volume':float(value.get('volumeDst') or 0),'high_24h':float(value.get('dayHigh') or 0),
+                        'low_24h':float(value.get('dayLow') or 0),'source':'Nobitex'})
+                    found.add(sym)
+                except (TypeError,ValueError): continue
     return pd.DataFrame(rows,columns=['symbol','price','change_pct','quote_volume','high_24h','low_24h','source'])
 
 # ---------- INDICATORS ----------
@@ -271,7 +322,7 @@ def analyze(symbol, entry_tf, capital, risk_pct):
         if name in frames: continue
         df,_=candles(symbol,TF[name])
         if df is not None and len(df)>=80: frames[name]=df; coverage.append(name)
-    if entry_tf not in frames: return {'symbol':symbol,'status':'NO_DATA','reason':f'{entry_tf} unavailable','coverage':0}
+    if entry_tf not in frames: return {'symbol':symbol,'status':'NO_DATA','reason':f'{entry_tf} unavailable','coverage':0,'coverage_tfs':'','direction':'WAIT','trade':'داده ناکافی','score':0.0,'confidence':0.0,'confirmations':0,'price':0.0,'entry':0.0,'sl':0.0,'tp1':0.0,'tp2':0.0,'tp3':0.0,'rr':0.0,'momentum':0.0,'volume':0.0,'pump_score':0.0,'liquidity':0.0,'setup':'داده ناکافی','classic_pattern':'-','classic_score':0,'regime':'نامشخص','t15':'N/A','t1':'N/A','t4':'N/A','tD':'N/A'}
 
     df=frames[entry_tf]; c=df.close; price=float(c.iloc[-1]); e20,e50,e200=ema(c,20),ema(c,50),ema(c,200); rv=float(rsi(c).iloc[-1]); mm,ms,_=macd(c); av=float(atr(df).iloc[-1]); ax=float(adx(df).iloc[-1]); mom=float((price/c.iloc[-6]-1)*100); vol=float(df.volume.iloc[-1]/max(df.volume.rolling(20).mean().iloc[-1],1e-12))
     bu,bd,pl,ps,rh,rl=pa(df)
@@ -732,7 +783,7 @@ if live_enabled:
     st.markdown('### 🟢 قیمت‌های زنده بازار')
     live_df=live_tickers(tuple(filtered))
     if live_df.empty:
-        st.warning('قیمت زنده از منابع تنظیم‌شده (تبدیل، والکس، بیت۲۴، بیت‌پین و منابع جایگزین) دریافت نشد. تحلیل قبلی حفظ شده است؛ اتصال شبکه یا دسترسی APIها را بررسی کن.')
+        st.warning('قیمت زنده از والکس دریافت نشد. تحلیل قبلی حفظ شده است؛ اتصال شبکه یا دسترسی API والکس را بررسی کن.')
     else:
         live_show=live_df.sort_values('quote_volume',ascending=False).head(100).copy()
         live_show.columns=['ارز','قیمت لحظه‌ای','تغییر ۲۴ساعته %','حجم ۲۴ساعته USDT','بیشترین ۲۴ساعت','کمترین ۲۴ساعت','منبع داده']

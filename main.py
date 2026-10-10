@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 import requests, math, time
 import streamlit.components.v1 as components
+from streamlit_autorefresh import st_autorefresh
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
@@ -60,6 +61,27 @@ def candles(symbol, interval):
         try: return f(symbol,interval),f.__name__
         except Exception: pass
     return None,None
+
+# ---------- LIVE MARKET TICKER ----------
+def live_tickers(symbols):
+    """Fetch current 24h ticker data from Binance; refresh is intentionally uncached."""
+    data=get_json(f'{BINANCE}/api/v3/ticker/24hr', timeout=10)
+    if not isinstance(data,list):
+        return pd.DataFrame()
+    wanted=set(symbols)
+    rows=[]
+    for x in data:
+        sym=norm(x.get('symbol',''))
+        if sym in wanted:
+            try:
+                rows.append({'symbol':sym,'price':float(x.get('lastPrice',0)),
+                    'change_pct':float(x.get('priceChangePercent',0)),
+                    'quote_volume':float(x.get('quoteVolume',0)),
+                    'high_24h':float(x.get('highPrice',0)),
+                    'low_24h':float(x.get('lowPrice',0))})
+            except (TypeError,ValueError):
+                continue
+    return pd.DataFrame(rows)
 
 # ---------- INDICATORS ----------
 def ema(x,n): return x.ewm(span=n,adjust=False).mean()
@@ -624,6 +646,40 @@ hr{border-color:#153452}
 </style>
 """, unsafe_allow_html=True)
 
+def process_entry_alerts(scan_result, tf_value, alert_on):
+    """Track fresh qualifying setups after either manual or scheduled scans."""
+    if scan_result is None or scan_result.empty:
+        current_alerts = set()
+        eligible = pd.DataFrame()
+    else:
+        eligible = scan_result[(scan_result.status == 'OK') &
+            (scan_result.direction.isin(['LONG', 'SHORT'])) &
+            (scan_result.confidence >= 50) & (scan_result.rr >= 1.2) &
+            (scan_result.liquidity >= 20)].copy()
+        if not eligible.empty:
+            eligible = eligible.sort_values(['confidence', 'score', 'rr'], ascending=False)
+        current_alerts = {f"{r.symbol}:{r.direction}:{tf_value}" for r in eligible.itertuples()}
+    # A signal is considered fresh if it wasn't present at the previous scan.
+    previous = st.session_state.get('active_entry_alerts', set())
+    if st.session_state.get('entry_alert_tf') != tf_value:
+        previous = set()
+    fresh = current_alerts - previous
+    st.session_state['active_entry_alerts'] = current_alerts
+    st.session_state['new_entry_alerts'] = sorted(fresh)
+    st.session_state['entry_alert_tf'] = tf_value
+    st.session_state['entry_alert_enabled'] = bool(alert_on)
+    fresh_rows = eligible[[f"{r.symbol}:{r.direction}:{tf_value}" in fresh for r in eligible.itertuples()]] if not eligible.empty else eligible
+    if not fresh_rows.empty:
+        best = fresh_rows.iloc[0]
+        st.session_state['best_live_setup'] = {
+            'symbol': str(best.symbol), 'direction': str(best.direction),
+            'confidence': float(best.confidence), 'entry': float(best.entry),
+            'price': float(best.price), 'rr': float(best.rr),
+            'updated': time.strftime('%H:%M:%S')}
+    else:
+        st.session_state['best_live_setup'] = None
+
+
 st.markdown("""
 <div class='brand'><div class='brandcoin'>₿</div><div><div class='brandtitle'>Crypto Analyzer Pro</div><div class='brandsub'>Smart Analysis &nbsp;•&nbsp; Better Trades</div></div></div>
 """, unsafe_allow_html=True)
@@ -635,12 +691,17 @@ if not symbols:
 with st.sidebar:
     st.markdown("### ₿ Crypto Analyzer")
     st.caption('پنل کنترل')
+    live_enabled=st.checkbox('دریافت زنده داده‌ها', value=True, help='قیمت بازار تقریباً هر ۵ ثانیه تازه می‌شود؛ نیازمند باز بودن صفحه است.')
+    auto_scan=st.checkbox('اسکن خودکار سیگنال‌ها', value=False, help='تحلیل بازار را در بازه انتخابی دوباره اجرا می‌کند و ممکن است درخواست API زیادی مصرف کند.')
+    scan_interval=st.selectbox('فاصله اسکن خودکار', [30,60,120,300], index=1, format_func=lambda x:f'هر {x} ثانیه')
+    if live_enabled:
+        st_autorefresh(interval=5000, key='live_market_autorefresh')
     tf=st.selectbox('تایم‌فریم ورود',list(TF.keys()),index=3)
     q=st.text_input('جستجوی ارز','')
     capital=st.number_input('سرمایه USDT',100.0,1000000.0,1000.0,100.0)
     risk=st.slider('ریسک هر معامله %',0.25,2.0,1.0,0.25)
     st.divider()
-    alert_enabled=st.checkbox('هشدار صوتی ورود', value=True, help='پس از اسکن، برای سیگنال‌های خرید/فروش تأییدشده هشدار می‌دهد.')
+    alert_enabled=st.checkbox('هشدار صوتی ورود', value=True, help='پس از هر اسکن خودکار یا دستی، برای سیگنال تازه و تأییدشده هشدار می‌دهد.')
     st.caption('برای شنیدن صدا، صدای مرورگر/گوشی روشن باشد؛ بعضی مرورگرها پخش خودکار را مسدود می‌کنند.')
     if st.button('تست بوق هشدار', use_container_width=True):
         components.html("""<button id='testtone' style='font-size:14px;padding:8px 14px'>پخش بوق آزمایشی</button><script>document.getElementById('testtone').addEventListener('click',()=>{try{const C=window.AudioContext||window.webkitAudioContext;const c=new C();const o=c.createOscillator(),g=c.createGain();o.frequency.value=880;g.gain.value=.18;o.connect(g);g.connect(c.destination);o.start();o.stop(c.currentTime+.35);o.onended=()=>c.close()}catch(e){}})</script>""",height=45)
@@ -660,16 +721,37 @@ with colB:
     st.write('')
     if st.button('اسکن کل بازار',type='primary',use_container_width=True):
         st.session_state['scan_df']=scan_all(tuple(filtered),tf,capital,risk)
-        scan_result=st.session_state['scan_df']
-        eligible=scan_result[(scan_result.status=='OK')&(scan_result.direction.isin(['LONG','SHORT']))&(scan_result.confidence>=50)&(scan_result.rr>=1.2)&(scan_result.liquidity>=20)]
-        current_alerts={f"{r.symbol}:{r.direction}:{tf}" for r in eligible.itertuples()}
-        previous_alerts=st.session_state.get('active_entry_alerts',set())
-        st.session_state['new_entry_alerts']=sorted(current_alerts-previous_alerts)
-        st.session_state['active_entry_alerts']=current_alerts
-        st.session_state['entry_alert_tf']=tf
-        st.session_state['entry_alert_enabled']=alert_enabled
+        process_entry_alerts(st.session_state['scan_df'], tf, alert_enabled)
 
 st.caption(f'Universe قابل اسکن: **{len(filtered):,}** ارز')
+
+if live_enabled:
+    st.markdown('### 🟢 قیمت‌های زنده بازار')
+    live_df=live_tickers(tuple(filtered))
+    if live_df.empty:
+        st.warning('دریافت قیمت زنده از منبع جایگزین ممکن نشد؛ تحلیل قبلی همچنان قابل مشاهده است.')
+    else:
+        live_show=live_df.sort_values('quote_volume',ascending=False).head(100).copy()
+        live_show.columns=['ارز','قیمت لحظه‌ای','تغییر ۲۴ساعته %','حجم ۲۴ساعته USDT','بیشترین ۲۴ساعت','کمترین ۲۴ساعت']
+        live_show['قیمت لحظه‌ای']=live_show['قیمت لحظه‌ای'].map(fmt)
+        for col in ['بیشترین ۲۴ساعت','کمترین ۲۴ساعت','حجم ۲۴ساعته USDT']:
+            live_show[col]=live_show[col].map(fmt)
+        live_show['تغییر ۲۴ساعته %']=live_show['تغییر ۲۴ساعته %'].map(lambda x:f'{x:+.2f}%')
+        st.dataframe(live_show,use_container_width=True,hide_index=True)
+        st.caption('نمایش حداکثر ۱۰۰ جفت برتر بر اساس حجم؛ منبع قیمت زنده Binance است و ممکن است با قیمت صرافی تبدیل اختلاف داشته باشد.')
+
+# Optional timed rescan. Price table refreshes every 5 seconds; full analysis runs at chosen interval.
+if auto_scan:
+    now=time.time()
+    last=float(st.session_state.get('auto_scan_last',0))
+    if now-last >= scan_interval:
+        scan_all.clear()
+        st.session_state['scan_df']=scan_all(tuple(filtered),tf,capital,risk)
+        process_entry_alerts(st.session_state['scan_df'], tf, alert_enabled)
+        st.session_state['auto_scan_last']=now
+        st.session_state['auto_scan_time']=time.strftime('%H:%M:%S')
+    if st.session_state.get('auto_scan_time'):
+        st.caption(f"آخرین اسکن خودکار: {st.session_state['auto_scan_time']}")
 
 if 'scan_df' in st.session_state:
     df=st.session_state['scan_df'].copy()
@@ -685,7 +767,11 @@ if 'scan_df' in st.session_state:
                 sym,side=parts[0],parts[1]
                 alert_items.append(f"{sym} — {'خرید (LONG)' if side=='LONG' else 'فروش (SHORT)'}")
         if alert_items:
-            st.success('🔔 شرایط ورود تأیید شد: ' + ' | '.join(alert_items[:12]) + (f' و {len(alert_items)-12} ارز دیگر' if len(alert_items)>12 else ''))
+            best = st.session_state.get('best_live_setup')
+            if best:
+                side_fa = 'خرید / LONG' if best['direction'] == 'LONG' else 'فروش / SHORT'
+                st.success(f"🔔 بهترین فرصت تازه: {best['symbol']} | {side_fa} | اطمینان {best['confidence']:.1f}% | ورود حدود {fmt(best['entry'])} | R:R {best['rr']:.2f}")
+            st.info('سایر سیگنال‌های تازه: ' + ' | '.join(alert_items[:12]) + (f' و {len(alert_items)-12} ارز دیگر' if len(alert_items)>12 else ''))
             if st.session_state.get('entry_alert_enabled',True):
                 # Browser audio can be blocked by autoplay policy; the visual alert always remains.
                 components.html("""<div></div><script>(()=>{try{const C=window.AudioContext||window.webkitAudioContext;if(!C)return;const c=new C();const play=(f,t)=>{const o=c.createOscillator(),g=c.createGain();o.type='sine';o.frequency.value=f;g.gain.setValueAtTime(0.0001,c.currentTime+t);g.gain.exponentialRampToValueAtTime(0.18,c.currentTime+t+0.025);g.gain.exponentialRampToValueAtTime(0.0001,c.currentTime+t+0.22);o.connect(g);g.connect(c.destination);o.start(c.currentTime+t);o.stop(c.currentTime+t+0.24)};const go=()=>{play(880,0);play(1175,0.28);setTimeout(()=>c.close(),800)};if(c.state==='suspended')c.resume().then(go).catch(()=>{});else go()}catch(e){}})();</script>""",height=1)
@@ -844,6 +930,6 @@ if 'scan_df' in st.session_state:
         p=pump[['symbol','pump_score','confidence','momentum','volume','classic_pattern','setup','direction','price']].copy(); p.columns=['ارز','Pump Score','Confidence','Momentum %','Volume x','الگوی کلاسیک','ستاپ','جهت','قیمت']; p['قیمت']=p['قیمت'].map(fmt); p['Confidence']=p['Confidence'].map(lambda x:f'{x:.1f}%'); st.dataframe(p,use_container_width=True,hide_index=True)
     st.markdown('</div>',unsafe_allow_html=True)
 else:
-    st.markdown("<div class='card' style='text-align:center;padding:35px'><div style='font-size:28px'>₿</div><h3>برای شروع، اسکن کل بازار را اجرا کنید</h3><div class='mini'>پس از اسکن، کارت‌های LONG / SHORT / WAIT و تحلیل کامل ارز در همین صفحه نمایش داده می‌شوند.</div></div>",unsafe_allow_html=True)
+    st.markdown("<div class='card' style='text-align:center;padding:35px'><div style='font-size:28px'>₿</div><h3>برای شروع، اسکن کل بازار را اجرا کنید یا اسکن خودکار را از پنل کنترل روشن کنید</h3><div class='mini'>پس از اسکن، کارت‌های LONG / SHORT / WAIT و تحلیل کامل ارز در همین صفحه نمایش داده می‌شوند.</div></div>",unsafe_allow_html=True)
 
-st.caption('V6.8 UI: داشبورد جمع‌وجور، کارت‌های نشانگر، منوی فشرده و ظاهر مدرن — موتور تحلیل V6.7 بدون حذف قابلیت‌ها حفظ شده است.')
+st.caption('Crypto Analyzer Pro V6.9: دریافت زنده قیمت، اسکن دوره‌ای، تشخیص بهترین ستاپ تازه و هشدار دیداری/صوتی؛ صدای خودکار ممکن است با سیاست مرورگر مسدود شود.')

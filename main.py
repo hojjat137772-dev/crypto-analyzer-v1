@@ -74,7 +74,12 @@ def tabdeal_candles(symbol, interval):
     iv=intervals.get(interval)
     if not iv: raise ValueError('unsupported interval')
     params={'symbol':norm(symbol),'interval':iv,'limit':BAR_LIMIT.get(interval,80)}
-    d=get_json('https://api1.tabdeal.org/api/v1/klines',params=params,timeout=10)
+    d=get_json('https://api1.tabdeal.org/r/api/v1/klines',params=params,timeout=10)
+    # Some deployments expose market-data routes without the /r prefix; try both.
+    if not isinstance(d,list) or not d:
+        d=get_json('https://api1.tabdeal.org/api/v1/klines',params=params,timeout=10)
+    if isinstance(d,dict):
+        d=d.get('data', d.get('klines', d.get('result', [])))
     if not isinstance(d,list) or not d: raise ValueError('Tabdeal candle data unavailable')
     rows=[]
     for k in d:
@@ -122,10 +127,16 @@ def nobitex_candles(symbol, interval):
     return df
 
 def candles(symbol, interval):
-    """Source priority: Tabdeal, Wallex, then Nobitex."""
+    """Source priority: Tabdeal, Wallex, then Nobitex. Keep diagnostics for data failures."""
+    errors=[]
     for fn,label in ((tabdeal_candles,'Tabdeal'),(wallex_candles,'Wallex'),(nobitex_candles,'Nobitex')):
         try: return fn(symbol,interval),label
-        except Exception: continue
+        except Exception as exc: errors.append(f'{label}: {type(exc).__name__}: {exc}')
+    # Store a compact diagnostic for the UI instead of silently hiding every source failure.
+    try:
+        st.session_state['_last_candle_error']=f'{norm(symbol)} {interval} | ' + ' ; '.join(errors)
+    except Exception:
+        pass
     return None,None
 
 # ---------- LIVE MARKET TICKER ----------
@@ -372,7 +383,7 @@ def analyze(symbol, entry_tf, capital, risk_pct):
         if name in frames: continue
         df,_=candles(symbol,TF[name])
         if df is not None and len(df)>=MIN_BARS.get(name,12): frames[name]=df; coverage.append(name)
-    if entry_tf not in frames: return {'symbol':symbol,'status':'NO_DATA','reason':f'{entry_tf} unavailable','coverage':0,'coverage_tfs':'','direction':'WAIT','trade':'داده ناکافی','score':0.0,'confidence':0.0,'confirmations':0,'price':0.0,'entry':0.0,'sl':0.0,'tp1':0.0,'tp2':0.0,'tp3':0.0,'rr':0.0,'momentum':0.0,'volume':0.0,'pump_score':0.0,'liquidity':0.0,'setup':'داده ناکافی','classic_pattern':'-','classic_score':0,'regime':'نامشخص','t15':'N/A','t1':'N/A','t4':'N/A','tD':'N/A'}
+    if entry_tf not in frames: return {'symbol':symbol,'status':'NO_DATA','reason':f'{entry_tf} unavailable; '+str(st.session_state.get('_last_candle_error','هر سه منبع داده ناموفق بودند')),'coverage':0,'coverage_tfs':'','direction':'WAIT','trade':'داده ناکافی','score':0.0,'confidence':0.0,'confirmations':0,'price':0.0,'entry':0.0,'sl':0.0,'tp1':0.0,'tp2':0.0,'tp3':0.0,'rr':0.0,'momentum':0.0,'volume':0.0,'pump_score':0.0,'liquidity':0.0,'setup':'داده ناکافی','classic_pattern':'-','classic_score':0,'regime':'نامشخص','t15':'N/A','t1':'N/A','t4':'N/A','tD':'N/A'}
 
     df=frames[entry_tf]; c=df.close; price=float(c.iloc[-1]); e20,e50,e200=ema(c,20),ema(c,50),ema(c,200); rv=float(rsi(c).iloc[-1]); mm,ms,_=macd(c); av=float(atr(df).iloc[-1]); ax=float(adx(df).iloc[-1]); mom=float((price/c.iloc[max(0,len(c)-6)]-1)*100); vol=float(df.volume.iloc[-1]/max(df.volume.rolling(20).mean().iloc[-1],1e-12))
     bu,bd,pl,ps,rh,rl=pa(df)
@@ -582,8 +593,8 @@ def detailed_plan(symbol, tf, row):
 def short_term_scenarios(symbol):
     """Build conditional 1-6 hour scenarios from 1H context and 15M levels; not a guaranteed forecast."""
     d15,_=candles(symbol,TF['15m']); d1,_=candles(symbol,TF['1H'])
-    if d15 is None or d1 is None or len(d15)<40 or len(d1)<40:
-        return {'status':'NO_DATA','reason':'برای سناریوی کوتاه‌مدت، داده کافی 15M و 1H در دسترس نیست.'}
+    if d15 is None or d1 is None or len(d15)<MIN_BARS['15m'] or len(d1)<MIN_BARS['1H']:
+        return {'status':'NO_DATA','reason':'برای سناریوی کوتاه‌مدت حداقل ۲۰ کندل 15M و ۱۲ کندل 1H لازم است؛ اتصال/نماد و منبع داده را بررسی کنید.'}
     price=float(d15.close.iloc[-1]); a=float(atr(d15).iloc[-1]);
     if not np.isfinite(a) or a<=0: return {'status':'NO_DATA','reason':'محاسبه نوسان برای سناریوی کوتاه‌مدت ممکن نشد.'}
     support=float(d15.low.tail(24).min()); resistance=float(d15.high.tail(24).max())
@@ -689,6 +700,7 @@ def leverage_module(symbol, main_fib=None):
         setup15=bool(near_resistance or pull_short or breakout_down) and pa_short
         side='SHORT'
         decision='SHORT' if confirm1 and setup15 and trigger_short and rr>=2 else 'WAIT SHORT'
+
     # Main-section Fibonacci levels are shown exactly as calculated by detailed_plan.
     fib_display=main_fib if main_fib else fibonacci(d15,120)
     fib_retr=fib_display.get('retracement',{})
@@ -1051,4 +1063,3 @@ else:
     st.markdown("<div class='card' style='text-align:center;padding:35px'><div style='font-size:28px'>₿</div><h3>برای شروع، یک ارز انتخاب کنید و اسکن همان ارز را اجرا کنید یا اسکن خودکار را روشن کنید</h3><div class='mini'>پس از اسکن، کارت‌های LONG / SHORT / WAIT و تحلیل کامل ارز در همین صفحه نمایش داده می‌شوند.</div></div>",unsafe_allow_html=True)
 
 st.caption('Crypto Analyzer Pro V7.0: دریافت زنده قیمت، اسکن دوره‌ای ارز انتخاب‌شده و هشدار دیداری/صوتی؛ صدای خودکار ممکن است با سیاست مرورگر مسدود شود.')
-

@@ -8,8 +8,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 TF={'5m':'5m','15m':'15m','30m':'30m','1H':'1h','2H':'2h','4H':'4h','6H':'6h','12H':'12h','1D':'1d','3D':'3d','1W':'1w'}
-S=requests.Session(); S.headers.update({'User-Agent':'CryptoAnalyzerPro-WallexOnly/1.0'})
-TIMEOUT=8; LIMIT=320
+S=requests.Session(); S.headers.update({'User-Agent':'CryptoAnalyzerPro/7.0'})
+TIMEOUT=8
+# Short, timeframe-aware history windows: enough recent candles without fetching months of data.
+BAR_LIMIT={'5m':288,'15m':192,'30m':144,'1H':72,'2H':48,'4H':30,'6H':20,'12H':10,'1D':5,'3D':3,'1W':2}
+MIN_BARS={'5m':24,'15m':20,'30m':16,'1H':12,'2H':10,'4H':8,'6H':6,'12H':4,'1D':3,'3D':2,'1W':2}
 
 # ---------- DATA ----------
 def norm(s): return str(s).upper().replace('/','').replace('-','').replace('_','')
@@ -21,83 +24,130 @@ def get_json(url, params=None, timeout=TIMEOUT):
 
 @st.cache_data(ttl=300, show_spinner=False)
 def universe():
-    """Combine USDT markets from Wallex and Nobitex; no global exchange fallback."""
-    symbols=[]
-    # Wallex market universe
+    """Market universe priority: Tabdeal, then Wallex, then Nobitex."""
+    symbols=[]; labels=[]
+    # Official Tabdeal public market list.
+    td=get_json('https://api1.tabdeal.org/r/api/v1/exchangeInfo',timeout=10)
+    if isinstance(td,dict):
+        markets=td.get('symbols', td.get('data', []))
+        if isinstance(markets,dict): markets=list(markets.values())
+        if isinstance(markets,list):
+            for item in markets:
+                if not isinstance(item,dict): continue
+                sym=norm(item.get('symbol') or item.get('tabdealSymbol') or '')
+                quote=str(item.get('quoteAsset') or '').upper()
+                status=str(item.get('status') or 'TRADING').upper()
+                if sym.endswith('USDT') and (not quote or quote=='USDT') and status in ('TRADING','ENABLED','') and sym not in symbols: symbols.append(sym)
+        if symbols: labels.append('تبدیل')
+    # Wallex fallback / adds additional markets after Tabdeal.
     d=get_json('https://api.wallex.ir/v1/markets',timeout=10)
     if isinstance(d,dict):
-        result=d.get('result',{}) or {}
-        markets=result.get('symbols',{}) if isinstance(result,dict) else {}
+        result=d.get('result',{}) or {}; markets=result.get('symbols',{}) if isinstance(result,dict) else {}
         items=markets.items() if isinstance(markets,dict) else enumerate(markets) if isinstance(markets,list) else []
+        before=len(symbols)
         for key,value in items:
             sym=norm((value or {}).get('symbol') or key) if isinstance(value,dict) else norm(key)
             if sym.endswith('USDT') and sym not in symbols: symbols.append(sym)
-    # Nobitex market stats also exposes its live market list (including USDT pairs).
+        if len(symbols)>before: labels.append('والکس')
+    # Nobitex is the third and last fallback.
     nd=get_json('https://apiv2.nobitex.ir/market/stats',timeout=10)
     if not isinstance(nd,dict): nd=get_json('https://api.nobitex.ir/market/stats',timeout=10)
     stats=nd.get('stats',{}) if isinstance(nd,dict) else {}
     if isinstance(stats,dict):
+        before=len(symbols)
         for key,value in stats.items():
-            if not isinstance(value,dict): continue
-            sym=norm(key.replace('-',''))
-            if sym.endswith('USDT') and sym not in symbols: symbols.append(sym)
-    sources=[]
-    if symbols: sources.append('والکس + نوبیتکس')
-    else: sources.append('والکس و نوبیتکس (دریافت ناموفق)')
-    return sorted(symbols),sources[0]
+            if isinstance(value,dict):
+                sym=norm(key.replace('-',''))
+                if sym.endswith('USDT') and sym not in symbols: symbols.append(sym)
+        if len(symbols)>before: labels.append('نوبیتکس')
+    return sorted(symbols), (' + '.join(labels) if labels else 'دریافت بازارها از تبدیل، والکس و نوبیتکس ناموفق بود')
+
+def _clean_ohlcv(rows):
+    df=pd.DataFrame(rows,columns=['time','open','high','low','close','volume'])
+    df['time']=pd.to_datetime(df['time'],unit='ms',errors='coerce')
+    for col in ['open','high','low','close','volume']: df[col]=pd.to_numeric(df[col],errors='coerce')
+    return df.dropna().drop_duplicates(subset=['time']).sort_values('time').reset_index(drop=True)
+
+def tabdeal_candles(symbol, interval):
+    """Official Tabdeal public klines endpoint; no API key is required."""
+    intervals={'5m':'5m','15m':'15m','30m':'30m','1H':'1h','2H':'2h','4H':'4h','6H':'6h','12H':'12h','1D':'1d','3D':'3d','1W':'1w'}
+    iv=intervals.get(interval)
+    if not iv: raise ValueError('unsupported interval')
+    params={'symbol':norm(symbol),'interval':iv,'limit':BAR_LIMIT.get(interval,80)}
+    d=get_json('https://api1.tabdeal.org/api/v1/klines',params=params,timeout=10)
+    if not isinstance(d,list) or not d: raise ValueError('Tabdeal candle data unavailable')
+    rows=[]
+    for k in d:
+        if isinstance(k,(list,tuple)) and len(k)>=6: rows.append(k[:6])
+        elif isinstance(k,dict): rows.append([k.get('openTime') or k.get('time'),k.get('open'),k.get('high'),k.get('low'),k.get('close'),k.get('volume')])
+    df=_clean_ohlcv(rows)
+    if len(df)<MIN_BARS.get(interval,12): raise ValueError(f'Tabdeal returned only {len(df)} candles')
+    return df
 
 def wallex_candles(symbol, interval):
-    """Fetch OHLCV from Wallex UDF history endpoint."""
+    """Fetch recent OHLCV from Wallex UDF history endpoint."""
     resolutions={'5m':'5','15m':'15','30m':'30','1H':'60','2H':'120','4H':'240','6H':'360','12H':'720','1D':'D','3D':'3D','1W':'W'}
     seconds={'5m':300,'15m':900,'30m':1800,'1H':3600,'2H':7200,'4H':14400,'6H':21600,'12H':43200,'1D':86400,'3D':259200,'1W':604800}
     now=int(time.time()); res=resolutions.get(interval)
     if not res: raise ValueError('unsupported interval')
-    params={'symbol':norm(symbol),'resolution':res,'from':now-seconds[interval]*LIMIT,'to':now}
-    d=get_json('https://api.wallex.ir/v1/udf/history',params=params,timeout=12)
-    if not isinstance(d,dict) or d.get('s')!='ok':
-        raise ValueError('Wallex candle data unavailable')
+    count=BAR_LIMIT.get(interval,80); params={'symbol':norm(symbol),'resolution':res,'from':now-seconds[interval]*count,'to':now}
+    d=get_json('https://api.wallex.ir/v1/udf/history',params=params,timeout=10)
+    if not isinstance(d,dict) or d.get('s')!='ok': raise ValueError('Wallex candle data unavailable')
     required=['t','o','h','l','c','v']
     if any(k not in d for k in required): raise ValueError('invalid Wallex candle response')
     df=pd.DataFrame({'time':pd.to_datetime(d['t'],unit='s',errors='coerce'),'open':d['o'],'high':d['h'],'low':d['l'],'close':d['c'],'volume':d['v']})
     for col in ['open','high','low','close','volume']: df[col]=pd.to_numeric(df[col],errors='coerce')
     df=df.dropna().drop_duplicates(subset=['time']).sort_values('time').reset_index(drop=True)
-    if len(df)<80: raise ValueError(f'Wallex returned only {len(df)} candles')
+    if len(df)<MIN_BARS.get(interval,12): raise ValueError(f'Wallex returned only {len(df)} candles')
     return df
 
 def nobitex_candles(symbol, interval):
-    """Fetch OHLCV from Nobitex UDF history. Public endpoint; no API key required."""
+    """Fetch recent OHLCV from Nobitex UDF history."""
     resolutions={'5m':'5','15m':'15','30m':'30','1H':'60','2H':'120','4H':'240','6H':'360','12H':'720','1D':'D','3D':'3D','1W':'W'}
     seconds={'5m':300,'15m':900,'30m':1800,'1H':3600,'2H':7200,'4H':14400,'6H':21600,'12H':43200,'1D':86400,'3D':259200,'1W':604800}
     res=resolutions.get(interval)
     if not res: raise ValueError('unsupported interval')
-    now=int(time.time()); params={'symbol':norm(symbol),'resolution':res,'from':now-seconds[interval]*LIMIT,'to':now}
+    now=int(time.time()); count=BAR_LIMIT.get(interval,80); params={'symbol':norm(symbol),'resolution':res,'from':now-seconds[interval]*count,'to':now}
     d=None
     for base in ('https://apiv2.nobitex.ir','https://api.nobitex.ir'):
-        d=get_json(base+'/market/udf/history',params=params,timeout=12)
+        d=get_json(base+'/market/udf/history',params=params,timeout=10)
         if isinstance(d,dict) and d.get('s')=='ok': break
-    if not isinstance(d,dict) or d.get('s')!='ok':
-        raise ValueError('Nobitex candle data unavailable for this market/timeframe')
+    if not isinstance(d,dict) or d.get('s')!='ok': raise ValueError('Nobitex candle data unavailable')
     required=['t','o','h','l','c','v']
     if any(k not in d for k in required): raise ValueError('invalid Nobitex candle response')
     df=pd.DataFrame({'time':pd.to_datetime(d['t'],unit='s',errors='coerce'),'open':d['o'],'high':d['h'],'low':d['l'],'close':d['c'],'volume':d['v']})
     for col in ['open','high','low','close','volume']: df[col]=pd.to_numeric(df[col],errors='coerce')
     df=df.dropna().drop_duplicates(subset=['time']).sort_values('time').reset_index(drop=True)
-    if len(df)<80: raise ValueError(f'Nobitex returned only {len(df)} candles')
+    if len(df)<MIN_BARS.get(interval,12): raise ValueError(f'Nobitex returned only {len(df)} candles')
     return df
 
 def candles(symbol, interval):
-    """Try Wallex first, then Nobitex; report which source succeeded."""
-    try: return wallex_candles(symbol,interval),'Wallex'
-    except Exception as wallex_error:
-        try: return nobitex_candles(symbol,interval),'Nobitex'
-        except Exception as nobitex_error:
-            return None,None
+    """Source priority: Tabdeal, Wallex, then Nobitex."""
+    for fn,label in ((tabdeal_candles,'Tabdeal'),(wallex_candles,'Wallex'),(nobitex_candles,'Nobitex')):
+        try: return fn(symbol,interval),label
+        except Exception: continue
+    return None,None
 
 # ---------- LIVE MARKET TICKER ----------
 def live_tickers(symbols):
-    """Use Wallex first; fill missing symbols from Nobitex market stats."""
+    """Use Tabdeal first; fill missing symbols from Wallex, then Nobitex."""
     wanted={norm(x) for x in symbols}
     rows=[]; found=set()
+    td=get_json('https://api1.tabdeal.org/r/api/v1/ticker/24hr',timeout=10)
+    if isinstance(td,list):
+        for item in td:
+            if not isinstance(item,dict): continue
+            sym=norm(item.get('symbol') or '')
+            if sym not in wanted: continue
+            try:
+                price=float(item.get('lastPrice') or item.get('last') or 0)
+                if price<=0: continue
+                rows.append({'symbol':sym,'price':price,'change_pct':float(item.get('priceChangePercent') or 0),
+                    'quote_volume':float(item.get('quoteVolume') or 0),'high_24h':float(item.get('highPrice') or 0),
+                    'low_24h':float(item.get('lowPrice') or 0),'source':'Tabdeal'})
+                found.add(sym)
+            except (TypeError,ValueError): continue
+    missing=wanted-found
     d=get_json('https://api.wallex.ir/v1/markets',timeout=10)
     if isinstance(d,dict):
         result=d.get('result',{}) or {}; markets=result.get('symbols',{}) if isinstance(result,dict) else {}
@@ -105,7 +155,7 @@ def live_tickers(symbols):
         for key,value in items:
             if not isinstance(value,dict): continue
             sym=norm(value.get('symbol') or key)
-            if sym not in wanted: continue
+            if sym not in missing: continue
             stats=value.get('stats',{}) or {}
             try:
                 price=float(stats.get('lastPrice') or value.get('lastPrice') or 0)
@@ -321,10 +371,10 @@ def analyze(symbol, entry_tf, capital, risk_pct):
     for name in [entry_tf,'15m','1H','4H','1D']:
         if name in frames: continue
         df,_=candles(symbol,TF[name])
-        if df is not None and len(df)>=80: frames[name]=df; coverage.append(name)
+        if df is not None and len(df)>=MIN_BARS.get(name,12): frames[name]=df; coverage.append(name)
     if entry_tf not in frames: return {'symbol':symbol,'status':'NO_DATA','reason':f'{entry_tf} unavailable','coverage':0,'coverage_tfs':'','direction':'WAIT','trade':'داده ناکافی','score':0.0,'confidence':0.0,'confirmations':0,'price':0.0,'entry':0.0,'sl':0.0,'tp1':0.0,'tp2':0.0,'tp3':0.0,'rr':0.0,'momentum':0.0,'volume':0.0,'pump_score':0.0,'liquidity':0.0,'setup':'داده ناکافی','classic_pattern':'-','classic_score':0,'regime':'نامشخص','t15':'N/A','t1':'N/A','t4':'N/A','tD':'N/A'}
 
-    df=frames[entry_tf]; c=df.close; price=float(c.iloc[-1]); e20,e50,e200=ema(c,20),ema(c,50),ema(c,200); rv=float(rsi(c).iloc[-1]); mm,ms,_=macd(c); av=float(atr(df).iloc[-1]); ax=float(adx(df).iloc[-1]); mom=float((price/c.iloc[-6]-1)*100); vol=float(df.volume.iloc[-1]/max(df.volume.rolling(20).mean().iloc[-1],1e-12))
+    df=frames[entry_tf]; c=df.close; price=float(c.iloc[-1]); e20,e50,e200=ema(c,20),ema(c,50),ema(c,200); rv=float(rsi(c).iloc[-1]); mm,ms,_=macd(c); av=float(atr(df).iloc[-1]); ax=float(adx(df).iloc[-1]); mom=float((price/c.iloc[max(0,len(c)-6)]-1)*100); vol=float(df.volume.iloc[-1]/max(df.volume.rolling(20).mean().iloc[-1],1e-12))
     bu,bd,pl,ps,rh,rl=pa(df)
     cs=candle_decision(df)
     cp=classic_patterns(df)
@@ -445,7 +495,7 @@ def fmt_pct(x):
 
 def detailed_plan(symbol, tf, row):
     df,_=candles(symbol,TF[tf])
-    if df is None or len(df)<80: return None
+    if df is None or len(df)<MIN_BARS.get(tf,12): return None
     t24=market24(symbol)
     price=float(df.close.iloc[-1])
     if t24 and t24.get('price'): price=t24['price']
@@ -574,7 +624,7 @@ def leverage_module(symbol, main_fib=None):
     frames={}
     for name in ['4H','1H','15m','5m']:
         d,_=candles(symbol,TF[name])
-        if d is not None and len(d)>=80: frames[name]=d
+        if d is not None and len(d)>=MIN_BARS.get(name,12): frames[name]=d
     required=['4H','1H','15m','5m']
     if any(x not in frames for x in required):
         return {'status':'NO_DATA','reason':'برای معامله اهرمی هر چهار تایم‌فریم 4H / 1H / 15M / 5M لازم است.'}
@@ -639,7 +689,6 @@ def leverage_module(symbol, main_fib=None):
         setup15=bool(near_resistance or pull_short or breakout_down) and pa_short
         side='SHORT'
         decision='SHORT' if confirm1 and setup15 and trigger_short and rr>=2 else 'WAIT SHORT'
-
     # Main-section Fibonacci levels are shown exactly as calculated by detailed_plan.
     fib_display=main_fib if main_fib else fibonacci(d15,120)
     fib_retr=fib_display.get('retracement',{})
@@ -1001,4 +1050,5 @@ if 'scan_df' in st.session_state:
 else:
     st.markdown("<div class='card' style='text-align:center;padding:35px'><div style='font-size:28px'>₿</div><h3>برای شروع، یک ارز انتخاب کنید و اسکن همان ارز را اجرا کنید یا اسکن خودکار را روشن کنید</h3><div class='mini'>پس از اسکن، کارت‌های LONG / SHORT / WAIT و تحلیل کامل ارز در همین صفحه نمایش داده می‌شوند.</div></div>",unsafe_allow_html=True)
 
-st.caption('Crypto Analyzer Pro V6.9: دریافت زنده قیمت، اسکن دوره‌ای ارز انتخاب‌شده و هشدار دیداری/صوتی؛ صدای خودکار ممکن است با سیاست مرورگر مسدود شود.')
+st.caption('Crypto Analyzer Pro V7.0: دریافت زنده قیمت، اسکن دوره‌ای ارز انتخاب‌شده و هشدار دیداری/صوتی؛ صدای خودکار ممکن است با سیاست مرورگر مسدود شود.')
+
